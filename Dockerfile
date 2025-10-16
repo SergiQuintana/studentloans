@@ -26,7 +26,7 @@ RUN useradd -rm -d /home/ubuntu -s /bin/bash -u 1000 -G sudo ubuntu && \
     chown -R ubuntu:ubuntu /home/ubuntu
 
 # Set up SSH keys
-COPY id_rsa.pub /home/ubuntu/.ssh/authorized_keys
+COPY id_rsa_docker.pub /home/ubuntu/.ssh/authorized_keys
 RUN chmod 600 /home/ubuntu/.ssh/authorized_keys && \
     chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
