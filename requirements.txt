@@ -4,3 +4,10 @@ seaborn
 statsmodels
 matplotlib
 numba
+os
+sys
+json
+platform
+shutil
+subprocess
+textwrap
