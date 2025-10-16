@@ -27,7 +27,7 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
 
     - name: Build Docker Image
-      run: docker build -t SergiQuintana/studentloans .
+      run: docker build -t sergiquintana/studentloans .
 
     - name: Push Docker Image
-      run: docker push SergiQuintana/studentloans
+      run: docker push sergiquintana/studentloans
