@@ -1,8 +1,15 @@
+# core
 numpy
+scipy
 pandas
+numba
+matplotlib
 seaborn
 statsmodels
-matplotlib
-numba
-mkl
 
+# used in some scripts (e.g., logistic regression)
+scikit-learn
+joblib
+
+# optional: control thread pools programmatically
+threadpoolctl
