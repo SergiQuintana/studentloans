@@ -6,6 +6,7 @@ numba
 matplotlib
 seaborn
 statsmodels
+Jinja2
 
 # used in some scripts (e.g., logistic regression)
 scikit-learn
