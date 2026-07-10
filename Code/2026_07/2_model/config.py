@@ -5,9 +5,10 @@ from pathlib import Path
 # Root: change once, affects all
 # -----------------------------
 # Default root: <repo>/Model
-REPL_ROOT = os.environ.get(
-    "REPL_ROOT",
-    str(Path(__file__).resolve().parents[3] / "Model")
+REPL_ROOT = (
+    os.environ.get("MODEL_ROOT")
+    or os.environ.get("REPL_ROOT")
+    or str(Path(__file__).resolve().parents[3] / "Model")
 )
 #REPL_ROOT = r"C:\Users\S.Quintana\Dropbox\PhD\Projects\Papers\1_financial_constraints\Model"
 # -----------------------------
