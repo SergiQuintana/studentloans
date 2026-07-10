@@ -8,7 +8,15 @@ ENV SSH_PORT=888
 # Install required packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    openssh-server sudo nano python3 python3-venv python3-pip libcurl4 libcurl4-openssl-dev && \
+    openssh-server \
+    sudo \
+    nano \
+    git \
+    python3 \
+    python3-venv \
+    python3-pip \
+    libcurl4 \
+    libcurl4-openssl-dev && \
     apt-get install -y onedrive && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
