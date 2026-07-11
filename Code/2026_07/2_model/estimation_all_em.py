@@ -31,7 +31,18 @@ from os import environ
 import warnings
 from pathlib import Path
 import sys
+import builtins
 from numba.core.errors import NumbaPendingDeprecationWarning,NumbaDeprecationWarning
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    return builtins.print(*args, **kwargs)
 
 warnings.simplefilter('ignore',category=NumbaDeprecationWarning)
 warnings.simplefilter('ignore',category=NumbaPendingDeprecationWarning)
