@@ -1,0 +1,90 @@
+
+This document describes the organization of the programs used for the estimation of the model of the paper. 
+
+potential code structure is: 
+
+estimation_all_em: 
+This program performs the aguirregabira mira estimation
+algorithm of the paper. 
+
+It calls: model_solution_em, model_em_algorithm, model_continuation_final
+
+Modification 2026: After the estimation of the auxiliary model, I will
+build the parts needed to estimate the budget shock distribution using the sequence of ccp sums. 
+
+simulation_fit_counterfactual_em: 
+This program performs the simulation of the model to
+generate statistics about model fit and counterfactual
+simulations.  
+
+It calls: model_solution_em, model_simulation_em, model_solution_nodebt, model_simulation_nodebt
+
+--------------------------------
+Now there are other things going on. 
+At some point debt was not fitting in counterfactual,
+so I adjusted debt decisions using the already established choices. In that sense I used the budget shock distribution
+to identify that. This is done at: 
+
+
+simulation_fit_counterfactual_adjusted: does that with the adjusted data. 
+
+Where is estimation of the budget shock taking place?
+
+model_fitdebt_new2: the idea was to do SMM to fit debt distribution
+
+Does not call any code. 
+
+-----
+What is left to identify? 
+	- Tables and Figures
+	- X?
+
+------
+Figures.py: Performs 100million figures estimates and tables?
+Tables.py: not so much. 
+
+''''''''''''''
+ROADMAP TO FIX THIS PAPER:
+
+Model wise:
+
+1st. Organize output code. Make sure the outputs are more organized and clearler. For now they suck. 
+
+
+2nd. Technical modifications: 
+	
+	Clean the data properly, using loans limits. 
+	Use real CCPS estimation, not the shit I do now.
+	Do the proper gaussain quadrature in consumption. Forget about the budget shock.  
+	Remove time fixed effects so that the model mechanisms are enough (well, that is what I call learning process right)
+	 
+
+3rd. Forget about budget shock, and make sure I fit debt through other things. 
+
+Estimate risk aversion/ risk aversion types. 
+How can I fit debt properly?
+
+
+
+Parental Resources Types
+Include how good you are type: Graduation probability. 
+Labor market unobserved het. (permanent income shocks)
+
+Data wise:
+
+- Clear data properly, for now it is not properly cleaned. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
