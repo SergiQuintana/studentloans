@@ -4,12 +4,32 @@ from pathlib import Path
 # -----------------------------
 # Root: change once, affects all
 # -----------------------------
-# Default root: <repo>/Model
-REPL_ROOT = (
-    os.environ.get("MODEL_ROOT")
-    or os.environ.get("REPL_ROOT")
-    or str(Path(__file__).resolve().parents[3] / "Model")
-)
+# Default roots:
+# - runner/server: MODEL_ROOT or REPL_ROOT, set by runinserver.py
+# - manual server run: sibling /home/ubuntu/work/Model, outside studentloans
+# - local laptop run: project-local Model folder
+def _resolve_model_root() -> str:
+    explicit_root = os.environ.get("MODEL_ROOT") or os.environ.get("REPL_ROOT")
+    if explicit_root:
+        return str(Path(explicit_root).expanduser())
+
+    project_root = Path(__file__).resolve().parents[3]
+    project_model = project_root / "Model"
+    sibling_model = project_root.parent / "Model"
+
+    if project_root.name.lower() == "studentloans" and sibling_model.exists():
+        return str(sibling_model)
+
+    if project_model.exists():
+        return str(project_model)
+
+    if sibling_model.exists():
+        return str(sibling_model)
+
+    return str(project_model)
+
+
+REPL_ROOT = _resolve_model_root()
 #REPL_ROOT = r"C:\Users\S.Quintana\Dropbox\PhD\Projects\Papers\1_financial_constraints\Model"
 # -----------------------------
 # Canonical directories
