@@ -1,4 +1,4 @@
-"""Read-only real-data validation for the auxiliary exact Hessian."""
+"""Unused read-only real-data validation for the auxiliary exact Hessian."""
 
 import argparse
 import time

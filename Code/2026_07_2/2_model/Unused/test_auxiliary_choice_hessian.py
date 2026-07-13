@@ -1,4 +1,4 @@
-"""Deterministic checks for the auxiliary multinomial-logit Hessian."""
+"""Unused deterministic checks for the auxiliary multinomial-logit Hessian."""
 
 import numpy as np
 

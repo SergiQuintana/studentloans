@@ -39,8 +39,6 @@ from scipy.optimize import approx_fprime
 #import mkl
 import warnings
 from scipy.special import expit, logsumexp
-from scipy.sparse import csc_matrix
-from concurrent.futures import ThreadPoolExecutor
 
 warnings.simplefilter('ignore',category=NumbaDeprecationWarning)
 warnings.simplefilter('ignore',category=NumbaPendingDeprecationWarning)
@@ -73,6 +71,7 @@ T = 10
 
 
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST,LIK
+from tables import write_auxiliary_em_tables
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathout = DIR["MODEL_OUTPUT"]
@@ -3058,163 +3057,6 @@ TYPE_FINANCIAL = np.array([0, 1, 0, 1], dtype=int)
 MONEY_SCALE = 1000.0
 
 
-def _legacy_individual_parameter_factors(period_data):
-    """Individual part of each separable legacy choice regressor.
-
-    Combined with ``map_param_to_choice``, these factors reproduce exactly the
-    derivatives used by ``jacobian_likelihood``.  Keeping this mapping in one
-    place lets the score and the closed-form Hessian use the same
-    parameterization.
-    """
-    n = period_data["x1"].shape[0]
-    factors = np.zeros((n, total_n_choice_legacy), dtype=float)
-    parameter = 0
-
-    # Individual characteristics: 18 alternative groups, 9 coefficients each.
-    n_x1_groups = 1 + fields + 1 + occupations
-    for _ in range(n_x1_groups):
-        factors[:, parameter:parameter + 9] = period_data["x1"]
-        parameter += 9
-
-    # Part/full-time and other alternative intercepts.
-    n_work = 2 + 2 * fields + occupations + 2
-    factors[:, parameter:parameter + n_work] = 1.0
-    parameter += n_work
-
-    # Previous-choice effects.
-    previous_affects = period_data.get("previous_affects")
-    if previous_affects is None:
-        previous_affects = build_previous_affects(period_data["x_change"])
-        period_data["previous_affects"] = previous_affects
-    n_last = 1 + fields + occupations
-    factors[:, parameter:parameter + n_last] = previous_affects
-    parameter += n_last
-
-    # Education/occupation complementarities, in the exact legacy ordering.
-    x_educ = period_data["x_educ"]
-    education_columns = (
-        list(range(9))
-        + [0, 2, 7, 8]
-        + [4, 5, 7, 8]
-        + [3, 4, 5, 6, 8]
-        + [0, 5, 8]
-        + [0, 2, 6, 8]
-        + list(range(9))
-        + list(range(9))
-    )
-    factors[:, parameter:parameter + len(education_columns)] = x_educ[:, education_columns]
-    parameter += len(education_columns)
-
-    # Period effects. Only the coefficient for the current period is active.
-    n_period_base = T - 2
-    for _ in range(1 + fields + occupations):
-        if period_data["period"] > 1:
-            factors[:, parameter + period_data["period"] - 2] = 1.0
-        parameter += n_period_base
-    n_grad_period = max(T - 5 - 1, 0)
-    if period_data["period"] > 5:
-        factors[:, parameter + period_data["period"] - 6] = 1.0
-    parameter += n_grad_period
-
-    # Period-specific work effects: education PT/FT and occupation FT.
-    for _ in range(3):
-        if period_data["period"] > 1:
-            factors[:, parameter + period_data["period"] - 2] = 1.0
-        parameter += n_period_base
-    for _ in range(2):
-        if period_data["period"] > 5:
-            factors[:, parameter + period_data["period"] - 6] = 1.0
-        parameter += n_grad_period
-
-    # First enrollment effects.
-    factors[:, parameter] = period_data["x_first2"][:, 0]
-    parameter += 1
-    factors[:, parameter:parameter + 4] = period_data["x_first4"]
-    parameter += 4
-    if period_data["period"] > 5:
-        factors[:, parameter] = period_data["x_firstgrad"][:, 0]
-    parameter += 1
-
-    # Experience/ability interactions: seven field blocks, 24 columns each.
-    for _ in range(fields - 1):
-        factors[:, parameter:parameter + 24] = period_data["x_exp"]
-        parameter += 24
-
-    # The two schooling-type effects are active only for the high-school type.
-    factors[:, parameter:parameter + 2] = 1.0
-    parameter += 2
-
-    if parameter != total_n_choice_legacy:
-        raise RuntimeError(
-            f"Choice-design mapping produced {parameter} legacy parameters; "
-            f"expected {total_n_choice_legacy}."
-        )
-    return factors
-
-
-def _separable_sparse_design(individual_factors, alternative_factors):
-    """Construct a CSC design without forming an N x J x P dense tensor."""
-    n, n_parameters = individual_factors.shape
-    n_alternatives = alternative_factors.shape[1]
-    individual_nonzero = [np.flatnonzero(individual_factors[:, p]) for p in range(n_parameters)]
-    alternative_nonzero = [np.flatnonzero(alternative_factors[p]) for p in range(n_parameters)]
-    counts = np.fromiter(
-        (
-            len(individual_nonzero[p]) * len(alternative_nonzero[p])
-            for p in range(n_parameters)
-        ),
-        dtype=np.int64,
-        count=n_parameters,
-    )
-    indptr = np.empty(n_parameters + 1, dtype=np.int64)
-    indptr[0] = 0
-    np.cumsum(counts, out=indptr[1:])
-    indices = np.empty(indptr[-1], dtype=np.int32)
-    data = np.empty(indptr[-1], dtype=float)
-
-    for p in range(n_parameters):
-        start, stop = indptr[p], indptr[p + 1]
-        if start == stop:
-            continue
-        individual = individual_nonzero[p]
-        alternative = alternative_nonzero[p]
-        indices[start:stop] = (
-            individual[:, None] * n_alternatives + alternative[None, :]
-        ).ravel()
-        data[start:stop] = (
-            individual_factors[individual, p, None]
-            * alternative_factors[p, alternative][None, :]
-        ).ravel()
-
-    return csc_matrix(
-        (data, indices, indptr),
-        shape=(n * n_alternatives, n_parameters),
-    )
-
-
-def prepare_auxiliary_choice_design(auxiliary_data):
-    """Cache sparse legacy designs and monetary regressors for every period."""
-    affected = map_param_to_choice(fields, occupations)
-    if affected.shape[0] != total_n_choice_legacy:
-        raise RuntimeError("Legacy alternative map and parameter count disagree.")
-
-    for period_data in auxiliary_data["periods"]:
-        factors = _legacy_individual_parameter_factors(period_data)
-        design = _separable_sparse_design(factors, affected)
-        period_data["choice_design_base"] = design[:, :-2]
-        period_data["choice_design_school_type"] = design[:, -2:]
-        period_data["choice_rows"] = np.arange(auxiliary_data["n_individuals"])
-        period_data["debt_regressor"] = (
-            period_data["debt_dollars"][:, None]
-            * auxiliary_data["nonhome"][None, :]
-            / MONEY_SCALE
-        )
-        del design, factors
-
-    auxiliary_data["choice_design_ready"] = True
-    return auxiliary_data
-
-
 def _financial_alt_features(choices):
     """Alternative-level controls: four-year, graduate, part-time, full-time."""
     choices = np.asarray(choices)
@@ -3800,331 +3642,6 @@ def auxiliary_choice_objective(choice_parameters, auxiliary_data, expected_consu
     return -float(loglike), -gradient
 
 
-class AuxiliaryChoiceNewtonEvaluator:
-    """Joint likelihood, score, and exact Hessian for the choice M-step.
-
-    The negative-log-likelihood Hessian is assembled from the standard
-    multinomial-logit covariance, X'[diag(P)-PP']X.  Sparse cached designs keep
-    the parameterization identical to the legacy analytic score without storing
-    an N x J x P dense tensor.  Full-Hessian column blocks can be evaluated in
-    parallel; ``hessp`` exposes the same closed form without materializing H.
-    """
-
-    def __init__(
-        self,
-        auxiliary_data,
-        expected_consumption,
-        q,
-        hessian_workers=None,
-        hessian_block_size=None,
-        progress_callback=None,
-    ):
-        if not auxiliary_data.get("choice_design_ready", False):
-            prepare_auxiliary_choice_design(auxiliary_data)
-        self.data = auxiliary_data
-        self.expected_consumption = expected_consumption
-        self.q = np.asarray(q, dtype=float)
-        self.n_parameters = total_n_multi
-        available_cpus = os.cpu_count() or 1
-        # Full-Hessian columns are independent. By default use every CPU made
-        # available to the process (the server currently exposes 120); the
-        # environment variable remains available for memory-limited machines.
-        default_workers = available_cpus
-        self.hessian_workers = max(
-            1,
-            int(
-                hessian_workers
-                if hessian_workers is not None
-                else os.environ.get("AUXILIARY_HESSIAN_WORKERS", default_workers)
-            ),
-        )
-        default_block = max(
-            4,
-            int(np.ceil(self.n_parameters / (4 * self.hessian_workers))),
-        )
-        self.hessian_block_size = int(
-            hessian_block_size
-            if hessian_block_size is not None
-            else os.environ.get("AUXILIARY_HESSIAN_BLOCK_SIZE", default_block)
-        )
-        self.progress_callback = progress_callback
-        self._theta = None
-        self._objective = None
-        self._gradient = None
-        self._probabilities = None
-        self._hessian_theta = None
-        self._hessian = None
-        self.function_evaluations = 0
-        self.hessian_evaluations = 0
-        self.hessian_vector_evaluations = 0
-
-    @staticmethod
-    def _same_parameters(left, right):
-        return left is not None and left.shape == right.shape and np.array_equal(left, right)
-
-    def _evaluate_likelihood_and_gradient(self, parameters):
-        parameters = np.asarray(parameters, dtype=float)
-        if self._same_parameters(self._theta, parameters):
-            return self._objective, self._gradient
-
-        legacy_base = parameters[:total_n_choice_legacy - 2]
-        school_type_parameters = parameters[
-            total_n_choice_legacy - 2:total_n_choice_legacy
-        ]
-        alpha_consumption = parameters[total_n_choice_legacy]
-        alpha_debt = parameters[total_n_choice_legacy + 1]
-        n = self.data["n_individuals"]
-        j = len(self.data["total_choices"])
-        score = np.zeros(self.n_parameters, dtype=float)
-        loglike = 0.0
-        probabilities = []
-
-        for period_index, period_data in enumerate(self.data["periods"]):
-            base_design = period_data["choice_design_base"]
-            type_design = period_data["choice_design_school_type"]
-            base_utility = np.asarray(base_design @ legacy_base).reshape(n, j)
-            school_shift = np.asarray(type_design @ school_type_parameters).reshape(n, j)
-            debt = period_data["debt_regressor"]
-            chosen = period_data["chosen_index"]
-            rows = period_data["choice_rows"]
-            period_probabilities = []
-
-            for latent_type in range(4):
-                financial_type = TYPE_FINANCIAL[latent_type]
-                consumption = (
-                    self.expected_consumption[0][period_index]
-                    if financial_type == 0
-                    else self.expected_consumption[1][period_index]
-                ) / MONEY_SCALE
-                utility = (
-                    base_utility
-                    + TYPE_SCHOOL[latent_type] * school_shift
-                    + alpha_consumption * consumption
-                    + alpha_debt * debt
-                )
-                utility = np.where(period_data["feasible"], utility, -np.inf)
-                log_denominator = logsumexp(utility, axis=1, keepdims=True)
-                probability = np.exp(utility - log_denominator)
-                period_probabilities.append(probability)
-                weight = self.q[:, latent_type]
-                loglike += np.sum(
-                    weight * (utility[rows, chosen] - log_denominator[:, 0])
-                )
-
-                residual = -probability
-                residual[rows, chosen] += 1.0
-                residual *= weight[:, None]
-                residual_flat = residual.ravel()
-                score[:total_n_choice_legacy - 2] += np.asarray(
-                    base_design.T @ residual_flat
-                ).ravel()
-                if TYPE_SCHOOL[latent_type] == 1:
-                    score[
-                        total_n_choice_legacy - 2:total_n_choice_legacy
-                    ] += np.asarray(type_design.T @ residual_flat).ravel()
-                score[total_n_choice_legacy] += np.dot(
-                    consumption.ravel(), residual_flat
-                )
-                score[total_n_choice_legacy + 1] += np.dot(
-                    debt.ravel(), residual_flat
-                )
-            probabilities.append(period_probabilities)
-
-        self._theta = parameters.copy()
-        self._objective = -float(loglike)
-        self._gradient = -score
-        self._probabilities = probabilities
-        self._hessian_theta = None
-        self._hessian = None
-        self.function_evaluations += 1
-        return self._objective, self._gradient
-
-    def fun_and_jac(self, parameters):
-        return self._evaluate_likelihood_and_gradient(parameters)
-
-    def fun(self, parameters):
-        return self._evaluate_likelihood_and_gradient(parameters)[0]
-
-    def jac(self, parameters):
-        return self._evaluate_likelihood_and_gradient(parameters)[1]
-
-    def _apply_hessian_matrix(self, parameter_matrix):
-        """Return H @ V for one or several columns of V."""
-        parameter_matrix = np.asarray(parameter_matrix, dtype=float)
-        if parameter_matrix.ndim == 1:
-            parameter_matrix = parameter_matrix[:, None]
-        n_vectors = parameter_matrix.shape[1]
-        result = np.zeros((self.n_parameters, n_vectors), dtype=float)
-        base_vectors = parameter_matrix[:total_n_choice_legacy - 2]
-        type_vectors = parameter_matrix[
-            total_n_choice_legacy - 2:total_n_choice_legacy
-        ]
-        consumption_vectors = parameter_matrix[total_n_choice_legacy]
-        debt_vectors = parameter_matrix[total_n_choice_legacy + 1]
-        n = self.data["n_individuals"]
-        j = len(self.data["total_choices"])
-
-        for period_index, period_data in enumerate(self.data["periods"]):
-            base_design = period_data["choice_design_base"]
-            type_design = period_data["choice_design_school_type"]
-            z_base = np.asarray(base_design @ base_vectors).reshape(n, j, n_vectors)
-            z_school = np.asarray(type_design @ type_vectors).reshape(n, j, n_vectors)
-            debt = period_data["debt_regressor"]
-
-            for latent_type in range(4):
-                financial_type = TYPE_FINANCIAL[latent_type]
-                consumption = (
-                    self.expected_consumption[0][period_index]
-                    if financial_type == 0
-                    else self.expected_consumption[1][period_index]
-                ) / MONEY_SCALE
-                z = (
-                    z_base
-                    + TYPE_SCHOOL[latent_type] * z_school
-                    + consumption[:, :, None] * consumption_vectors[None, None, :]
-                    + debt[:, :, None] * debt_vectors[None, None, :]
-                )
-                probability = self._probabilities[period_index][latent_type]
-                expected_z = np.sum(probability[:, :, None] * z, axis=1)
-                weighted_centered_z = (
-                    self.q[:, latent_type, None, None]
-                    * probability[:, :, None]
-                    * (z - expected_z[:, None, :])
-                )
-                weighted_flat = weighted_centered_z.reshape(n * j, n_vectors)
-                result[:total_n_choice_legacy - 2] += np.asarray(
-                    base_design.T @ weighted_flat
-                )
-                if TYPE_SCHOOL[latent_type] == 1:
-                    result[
-                        total_n_choice_legacy - 2:total_n_choice_legacy
-                    ] += np.asarray(type_design.T @ weighted_flat)
-                result[total_n_choice_legacy] += (
-                    consumption.ravel() @ weighted_flat
-                )
-                result[total_n_choice_legacy + 1] += debt.ravel() @ weighted_flat
-        return result
-
-    def hessp(self, parameters, vector):
-        self._evaluate_likelihood_and_gradient(parameters)
-        self.hessian_vector_evaluations += 1
-        return self._apply_hessian_matrix(vector)[:, 0]
-
-    def _hessian_column_block(self, start_stop):
-        start, stop = start_stop
-        directions = np.zeros((self.n_parameters, stop - start), dtype=float)
-        directions[np.arange(start, stop), np.arange(stop - start)] = 1.0
-        return start, stop, self._apply_hessian_matrix(directions)
-
-    def hess(self, parameters):
-        parameters = np.asarray(parameters, dtype=float)
-        self._evaluate_likelihood_and_gradient(parameters)
-        if self._same_parameters(self._hessian_theta, parameters):
-            return self._hessian
-
-        blocks = [
-            (start, min(start + self.hessian_block_size, self.n_parameters))
-            for start in range(0, self.n_parameters, self.hessian_block_size)
-        ]
-        hessian_start = time.perf_counter()
-        evaluation_number = self.hessian_evaluations + 1
-        if self.progress_callback is not None:
-            self.progress_callback(
-                f"Exact Hessian {evaluation_number} started: "
-                f"{self.n_parameters} parameters, {self.hessian_workers} workers, "
-                f"{len(blocks)} column blocks"
-            )
-        hessian = np.empty((self.n_parameters, self.n_parameters), dtype=float)
-        completed_blocks = 0
-        progress_interval = max(1, len(blocks) // 10)
-
-        def store_block(result):
-            nonlocal completed_blocks
-            start, stop, values = result
-            hessian[:, start:stop] = values
-            completed_blocks += 1
-            if (
-                self.progress_callback is not None
-                and (
-                    completed_blocks == len(blocks)
-                    or completed_blocks % progress_interval == 0
-                )
-            ):
-                self.progress_callback(
-                    f"Exact Hessian {evaluation_number}: "
-                    f"{completed_blocks}/{len(blocks)} column blocks completed"
-                )
-
-        if self.hessian_workers == 1 or len(blocks) == 1:
-            for result in map(self._hessian_column_block, blocks):
-                store_block(result)
-        else:
-            with ThreadPoolExecutor(max_workers=self.hessian_workers) as executor:
-                for result in executor.map(self._hessian_column_block, blocks):
-                    store_block(result)
-
-        # Roundoff and parallel reduction order can introduce tiny asymmetry.
-        hessian = 0.5 * (hessian + hessian.T)
-        self._hessian_theta = parameters.copy()
-        self._hessian = hessian
-        self.hessian_evaluations += 1
-        if self.progress_callback is not None:
-            self.progress_callback(
-                f"Exact Hessian {evaluation_number} finished in "
-                f"{time.perf_counter() - hessian_start:.2f}s"
-            )
-        return hessian
-
-
-def validate_auxiliary_choice_newton_evaluator(
-    evaluator,
-    parameter_vectors,
-    directions=3,
-    epsilon=1.0e-5,
-    compare_legacy_gradient=True,
-):
-    """Check parameterization, score, and Hessian at multiple parameter vectors.
-
-    The exact Hessian-vector product is compared with a central difference of
-    the analytical score.  Optionally, the sparse-design objective and score are
-    also compared with the legacy analytical implementation.
-    """
-    rng = np.random.default_rng(20260713)
-    reports = []
-    for parameters in parameter_vectors:
-        parameters = np.asarray(parameters, dtype=float)
-        objective, gradient = evaluator.fun_and_jac(parameters)
-        report = {
-            "objective": float(objective),
-            "gradient_inf_norm": float(np.max(np.abs(gradient))),
-        }
-        if compare_legacy_gradient:
-            legacy_objective, legacy_gradient = auxiliary_choice_objective(
-                parameters,
-                evaluator.data,
-                evaluator.expected_consumption,
-                evaluator.q,
-            )
-            report["objective_difference"] = float(objective - legacy_objective)
-            report["legacy_gradient_max_difference"] = float(
-                np.max(np.abs(gradient - legacy_gradient))
-            )
-
-        direction_errors = []
-        for _ in range(directions):
-            direction = rng.normal(size=len(parameters))
-            direction /= np.linalg.norm(direction)
-            analytic = evaluator.hessp(parameters, direction)
-            gradient_plus = evaluator.jac(parameters + epsilon * direction).copy()
-            gradient_minus = evaluator.jac(parameters - epsilon * direction).copy()
-            numeric = (gradient_plus - gradient_minus) / (2.0 * epsilon)
-            scale = max(1.0, np.max(np.abs(analytic)), np.max(np.abs(numeric)))
-            direction_errors.append(float(np.max(np.abs(analytic - numeric)) / scale))
-        report["hessp_relative_errors"] = np.asarray(direction_errors)
-        reports.append(report)
-    return reports
-
-
 def estimate_school_measure(initial, x, outcome, q_school):
     observed = np.isfinite(outcome)
     result = minimize(
@@ -4199,9 +3716,6 @@ def perform_em(
     tolerance=3.0e-4,
     return_details=False,
     verbose=True,
-    choice_optimizer="trust-exact",
-    hessian_workers=None,
-    hessian_block_size=None,
 ):
     """Estimate the four-type auxiliary model (LL, LH, HL, HH).
 
@@ -4233,7 +3747,7 @@ def perform_em(
 
     # Load choice arrays and all fixed data once.
     step_start = time.perf_counter()
-    progress("Setup 1/8: loading cached choice and state arrays...")
+    progress("Setup 1/7: loading cached choice and state arrays...")
     (
         choices_all,
         _vjt_unused_low,
@@ -4250,12 +3764,12 @@ def perform_em(
     finish_step("loading cached arrays", step_start)
 
     step_start = time.perf_counter()
-    progress("Setup 2/8: loading schooling measures...")
+    progress("Setup 2/7: loading schooling measures...")
     measures = pd.read_csv(f"{path}/feasible_measures.csv")
     finish_step("loading schooling measures", step_start)
 
     step_start = time.perf_counter()
-    progress("Setup 3/8: building fixed auxiliary data and expected wages...")
+    progress("Setup 3/7: building fixed auxiliary data and expected wages...")
     auxiliary_data = build_auxiliary_em_data(
         choices_all,
         choices_array_all,
@@ -4280,20 +3794,6 @@ def perform_em(
     if len(measures) != n:
         raise ValueError("Schooling measures and auxiliary panel have different sample sizes.")
 
-    step_start = time.perf_counter()
-    progress("Setup 4/8: building the sparse choice design for score and Hessian...")
-    prepare_auxiliary_choice_design(auxiliary_data)
-    design_nnz = sum(
-        period_data["choice_design_base"].nnz
-        + period_data["choice_design_school_type"].nnz
-        for period_data in auxiliary_data["periods"]
-    )
-    finish_step(
-        "building the sparse choice design",
-        step_start,
-        extra=f"stored nonzero entries={design_nnz:,}",
-    )
-
     # Choice parameters retain the old g(.) block and append one common
     # expected-consumption coefficient and one debt-vs-home coefficient.
     choice_parameters = np.zeros(total_n_multi, dtype=float)
@@ -4311,21 +3811,21 @@ def perform_em(
     financial_seed = max(0.05, 0.125 * abs(float(typeffect)))
 
     step_start = time.perf_counter()
-    progress("Setup 5/8: initializing grant equations...")
+    progress("Setup 4/7: initializing grant equations...")
     grant_parameters = initialize_financial_source(
         auxiliary_data["grant"], financial_typeeffect=financial_seed
     )
     finish_step("initializing grant equations", step_start)
 
     step_start = time.perf_counter()
-    progress("Setup 6/8: initializing transfer equations...")
+    progress("Setup 5/7: initializing transfer equations...")
     transfer_parameters = initialize_financial_source(
         auxiliary_data["transfer"], financial_typeeffect=financial_seed
     )
     finish_step("initializing transfer equations", step_start)
 
     step_start = time.perf_counter()
-    progress("Setup 7/8: computing initial expected consumption...")
+    progress("Setup 6/7: computing initial expected consumption...")
     expected_consumption = build_expected_consumption(
         None,
         grant_parameters,
@@ -4336,7 +3836,7 @@ def perform_em(
     finish_step("initial expected consumption", step_start)
 
     step_start = time.perf_counter()
-    progress("Setup 8/8: computing initial likelihoods and posteriors...")
+    progress("Setup 7/7: computing initial likelihoods and posteriors...")
     pinew = np.full(4, 0.25, dtype=float)
     q, initial_loglike = all_auxiliary_log_likelihoods(
         pinew,
@@ -4412,71 +3912,25 @@ def perform_em(
         step_start = time.perf_counter()
         progress(
             f"Iteration {iteration + 1}: optimizing the education-choice block "
-            f"({len(choice_parameters)} parameters, method={choice_optimizer})..."
+            f"({len(choice_parameters)} parameters)..."
         )
-        choice_evaluator = AuxiliaryChoiceNewtonEvaluator(
-            auxiliary_data,
-            expected_consumption,
-            q_current,
-            hessian_workers=hessian_workers,
-            hessian_block_size=hessian_block_size,
-            progress_callback=progress,
+        choice_result = minimize(
+            auxiliary_choice_objective,
+            choice_parameters,
+            args=(auxiliary_data, expected_consumption, q_current),
+            jac=True,
+            method="BFGS",
+            options={"disp": False, "maxiter": 200, "gtol": 1.0e-5},
         )
-        progress(
-            f"Iteration {iteration + 1} Hessian configuration: "
-            f"workers={choice_evaluator.hessian_workers}, "
-            f"column block size={choice_evaluator.hessian_block_size}"
-        )
-        choice_objective_before = choice_evaluator.fun(choice_parameters)
-        normalized_optimizer = choice_optimizer.lower()
-        if normalized_optimizer == "trust-exact":
-            choice_result = minimize(
-                choice_evaluator.fun_and_jac,
-                choice_parameters,
-                jac=True,
-                hess=choice_evaluator.hess,
-                method="trust-exact",
-                options={"disp": False, "maxiter": 100, "gtol": 1.0e-5},
-            )
-        elif normalized_optimizer in ("newton-cg", "newton_cg"):
-            choice_result = minimize(
-                choice_evaluator.fun,
-                choice_parameters,
-                jac=choice_evaluator.jac,
-                hessp=choice_evaluator.hessp,
-                method="Newton-CG",
-                options={"disp": False, "maxiter": 100, "xtol": 1.0e-6},
-            )
-        elif normalized_optimizer == "bfgs":
-            choice_result = minimize(
-                choice_evaluator.fun_and_jac,
-                choice_parameters,
-                jac=True,
-                method="BFGS",
-                options={"disp": False, "maxiter": 200, "gtol": 1.0e-5},
-            )
-        else:
-            raise ValueError(
-                "choice_optimizer must be 'trust-exact', 'Newton-CG', or 'BFGS'."
-            )
         choice_parameters = np.asarray(choice_result.x)
-        choice_gradient_inf = float(np.max(np.abs(choice_result.jac)))
         finish_step(
             f"iteration {iteration + 1} education-choice optimization",
             step_start,
             extra=(
                 f"success={choice_result.success}, nit={getattr(choice_result, 'nit', 'NA')}, "
                 f"nfev={getattr(choice_result, 'nfev', 'NA')}, "
-                f"njev={getattr(choice_result, 'njev', 'NA')}, "
-                f"nhev={getattr(choice_result, 'nhev', 'NA')}, "
-                f"objective change={choice_result.fun - choice_objective_before:.6f}, "
-                f"gradient_inf={choice_gradient_inf:.3e}, "
-                f"exact H/Hv evaluations={choice_evaluator.hessian_evaluations}/"
-                f"{choice_evaluator.hessian_vector_evaluations}"
+                f"njev={getattr(choice_result, 'njev', 'NA')}"
             ),
-        )
-        progress(
-            f"Iteration {iteration + 1} choice optimizer message: {choice_result.message}"
         )
 
         # 4. Estimate measures using schooling posterior collapses.
@@ -4584,6 +4038,24 @@ def perform_em(
             observed_loglike=np.asarray(loglike_history),
         )
         finish_step(f"iteration {iteration + 1} checkpoint saving", step_start)
+
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: writing reporting tables...")
+        table_paths = write_auxiliary_em_tables(
+            iteration=iteration + 1,
+            pi=pinew,
+            choice_parameters=choice_parameters,
+            measure_late=measure_late,
+            measure_summer=measure_summer,
+            grant_parameters=grant_parameters,
+            transfer_parameters=transfer_parameters,
+            auxiliary_data=auxiliary_data,
+        )
+        finish_step(
+            f"iteration {iteration + 1} reporting tables",
+            step_start,
+            extra=f"saved to {table_paths['iteration_dir']}",
+        )
 
         progress(
             f"Iteration {iteration + 1} completed in "
