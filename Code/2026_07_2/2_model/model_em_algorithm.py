@@ -3709,7 +3709,13 @@ def all_auxiliary_log_likelihoods(
     return update_four_type_posteriors(pi, conditional)
 
     
-def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=False):
+def perform_em(
+    typeffect,
+    max_iterations=250,
+    tolerance=3.0e-4,
+    return_details=False,
+    verbose=True,
+):
     """Estimate the four-type auxiliary model (LL, LH, HL, HH).
 
     The orchestration deliberately mirrors the economic algorithm: current
@@ -3721,7 +3727,26 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
     global total_n_late
     global total_n_summer
 
+    estimation_start = time.perf_counter()
+
+    def progress(message):
+        if verbose:
+            elapsed = time.perf_counter() - estimation_start
+            print(f"[Auxiliary EM +{elapsed:9.2f}s] {message}", flush=True)
+
+    def finish_step(label, step_start, extra=""):
+        elapsed = time.perf_counter() - step_start
+        suffix = f" | {extra}" if extra else ""
+        progress(f"Finished {label} in {elapsed:.2f}s{suffix}")
+
+    progress(
+        "Starting four-type auxiliary estimation "
+        f"(max_iterations={max_iterations}, tolerance={tolerance:g})"
+    )
+
     # Load choice arrays and all fixed data once.
+    step_start = time.perf_counter()
+    progress("Setup 1/7: loading cached choice and state arrays...")
     (
         choices_all,
         _vjt_unused_low,
@@ -3735,7 +3760,15 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         x_firstgrad,
         x_exp,
     ) = load_all_arrays_feasible(auxiliar=1)
+    finish_step("loading cached arrays", step_start)
+
+    step_start = time.perf_counter()
+    progress("Setup 2/7: loading schooling measures...")
     measures = pd.read_csv(f"{path}/feasible_measures.csv")
+    finish_step("loading schooling measures", step_start)
+
+    step_start = time.perf_counter()
+    progress("Setup 3/7: building fixed auxiliary data and expected wages...")
     auxiliary_data = build_auxiliary_em_data(
         choices_all,
         choices_array_all,
@@ -3746,6 +3779,15 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         x_first4,
         x_firstgrad,
         x_exp,
+    )
+    finish_step(
+        "building fixed auxiliary data",
+        step_start,
+        extra=(
+            f"N={auxiliary_data['n_individuals']}, "
+            f"periods={len(auxiliary_data['periods'])}, "
+            f"alternatives={len(auxiliary_data['total_choices'])}"
+        ),
     )
     n = auxiliary_data["n_individuals"]
     if len(measures) != n:
@@ -3766,12 +3808,23 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
     # A positive seed fixes the financial label and prevents a symmetric
     # four-class initialization from collapsing immediately to two classes.
     financial_seed = max(0.05, 0.125 * abs(float(typeffect)))
+
+    step_start = time.perf_counter()
+    progress("Setup 4/7: initializing grant equations...")
     grant_parameters = initialize_financial_source(
         auxiliary_data["grant"], financial_typeeffect=financial_seed
     )
+    finish_step("initializing grant equations", step_start)
+
+    step_start = time.perf_counter()
+    progress("Setup 5/7: initializing transfer equations...")
     transfer_parameters = initialize_financial_source(
         auxiliary_data["transfer"], financial_typeeffect=financial_seed
     )
+    finish_step("initializing transfer equations", step_start)
+
+    step_start = time.perf_counter()
+    progress("Setup 6/7: computing initial expected consumption...")
     expected_consumption = build_expected_consumption(
         None,
         grant_parameters,
@@ -3779,7 +3832,10 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         auxiliary_data,
         auxiliary_data["total_choices"],
     )
+    finish_step("initial expected consumption", step_start)
 
+    step_start = time.perf_counter()
+    progress("Setup 7/7: computing initial likelihoods and posteriors...")
     pinew = np.full(4, 0.25, dtype=float)
     q, initial_loglike = all_auxiliary_log_likelihoods(
         pinew,
@@ -3792,6 +3848,11 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         measures,
         expected_consumption,
     )
+    finish_step(
+        "initial likelihood and posterior calculation",
+        step_start,
+        extra=f"initial observed log likelihood={initial_loglike:.6f}",
+    )
     loglike_history = [initial_loglike]
     xnew = np.concatenate((choice_parameters, measure_late, measure_summer))
     err = np.inf
@@ -3802,6 +3863,8 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         )
 
     for iteration in range(max_iterations):
+        iteration_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}/{max_iterations} started")
         pi = pinew.copy()
         q_current = q.copy()
         x0 = xnew.copy()
@@ -3810,14 +3873,31 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
 
         # 1. Estimate financial types using financial posterior collapses.
         q_financial = collapse_financial_weights(q_current)
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: estimating grant equations...")
         grant_parameters = estimate_financial_source(
             auxiliary_data["grant"], q_financial, previous=grant_parameters
         )
+        finish_step(
+            f"iteration {iteration + 1} grant equations",
+            step_start,
+            extra=f"receipt optimizer success={grant_parameters['receipt_success']}",
+        )
+
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: estimating transfer equations...")
         transfer_parameters = estimate_financial_source(
             auxiliary_data["transfer"], q_financial, previous=transfer_parameters
         )
+        finish_step(
+            f"iteration {iteration + 1} transfer equations",
+            step_start,
+            extra=f"receipt optimizer success={transfer_parameters['receipt_success']}",
+        )
 
         # 2. Rebuild expected consumption for low/high financial resources.
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: rebuilding expected consumption...")
         expected_consumption = build_expected_consumption(
             None,
             grant_parameters,
@@ -3825,8 +3905,14 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
             auxiliary_data,
             auxiliary_data["total_choices"],
         )
+        finish_step(f"iteration {iteration + 1} expected consumption", step_start)
 
         # 3. Estimate the choice block with all four posterior weights.
+        step_start = time.perf_counter()
+        progress(
+            f"Iteration {iteration + 1}: optimizing the education-choice block "
+            f"({len(choice_parameters)} parameters)..."
+        )
         choice_result = minimize(
             auxiliary_choice_objective,
             choice_parameters,
@@ -3836,24 +3922,50 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
             options={"disp": False, "maxiter": 200, "gtol": 1.0e-5},
         )
         choice_parameters = np.asarray(choice_result.x)
+        finish_step(
+            f"iteration {iteration + 1} education-choice optimization",
+            step_start,
+            extra=(
+                f"success={choice_result.success}, nit={getattr(choice_result, 'nit', 'NA')}, "
+                f"nfev={getattr(choice_result, 'nfev', 'NA')}, "
+                f"njev={getattr(choice_result, 'njev', 'NA')}"
+            ),
+        )
 
         # 4. Estimate measures using schooling posterior collapses.
         q_school = collapse_school_weights(q_current)
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: estimating the late-school measure...")
         measure_late, late_fun, late_result = estimate_school_measure(
             measure_late,
             auxiliary_data["x1_measure"],
             np.asarray(measures["late_school"], dtype=float),
             q_school,
         )
+        finish_step(
+            f"iteration {iteration + 1} late-school measure",
+            step_start,
+            extra=f"success={late_result.success}, nit={getattr(late_result, 'nit', 'NA')}",
+        )
+
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: estimating the summer-class measure...")
         measure_summer, summer_fun, summer_result = estimate_school_measure(
             measure_summer,
             auxiliary_data["x1_measure"],
             np.asarray(measures["summer_class"], dtype=float),
             q_school,
         )
+        finish_step(
+            f"iteration {iteration + 1} summer-class measure",
+            step_start,
+            extra=f"success={summer_result.success}, nit={getattr(summer_result, 'nit', 'NA')}",
+        )
         xnew = np.concatenate((choice_parameters, measure_late, measure_summer))
 
         # 5. Recompute all four conditional likelihoods, then update pi and q.
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: recomputing likelihoods and posteriors...")
         q, observed_loglike = all_auxiliary_log_likelihoods(
             pi,
             choice_parameters,
@@ -3878,6 +3990,11 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
             measures,
             expected_consumption,
         )
+        finish_step(
+            f"iteration {iteration + 1} likelihood and posterior update",
+            step_start,
+            extra=f"observed log likelihood={observed_loglike:.6f}",
+        )
         loglike_history.append(observed_loglike)
 
         parameter_change = max(
@@ -3888,20 +4005,15 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         )
         err = parameter_change
 
-        print(f"Auxiliary EM iteration {iteration}")
-        print("  pi [LL, LH, HL, HH] =", pinew)
-        print("  observed log likelihood =", observed_loglike)
-        print("  maximum update =", err)
-        print(
-            "  optimizer success [choice, late, summer, grant, transfer] =",
-            choice_result.success,
-            late_result.success,
-            summer_result.success,
-            grant_parameters["receipt_success"],
-            transfer_parameters["receipt_success"],
+        progress(
+            f"Iteration {iteration + 1} estimates: "
+            f"pi [LL, LH, HL, HH]={np.array2string(pinew, precision=6)}, "
+            f"maximum update={err:.6g}"
         )
 
         # Lightweight backward-compatible checkpoints.
+        step_start = time.perf_counter()
+        progress(f"Iteration {iteration + 1}: saving checkpoints...")
         np.save(f"{path_estimates}/param_em_{iteration}_typeff{typeffect}.npy", xnew)
         np.save(f"{path_estimates}/param_em_latest.npy", xnew)
         np.save(f"{path_estimates}/em_q_typeff{typeffect}.npy", q)
@@ -3924,10 +4036,22 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
             transfer_sigma=transfer_parameters["sigma"],
             observed_loglike=np.asarray(loglike_history),
         )
+        finish_step(f"iteration {iteration + 1} checkpoint saving", step_start)
+
+        progress(
+            f"Iteration {iteration + 1} completed in "
+            f"{time.perf_counter() - iteration_start:.2f}s"
+        )
 
         if err <= tolerance:
+            progress(
+                f"Converged after {iteration + 1} iterations: "
+                f"maximum update {err:.6g} <= tolerance {tolerance:g}"
+            )
             break
 
+    step_start = time.perf_counter()
+    progress("Saving final auxiliary estimates and expected-consumption arrays...")
     expected_consumption_low = np.stack(expected_consumption[0], axis=0)
     expected_consumption_high = np.stack(expected_consumption[1], axis=0)
     np.save(
@@ -3960,6 +4084,7 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         transfer_sigma=transfer_parameters["sigma"],
         observed_loglike=np.asarray(loglike_history),
     )
+    finish_step("saving final auxiliary estimates", step_start)
 
     details = {
         "pi": pinew,
@@ -3977,7 +4102,9 @@ def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=F
         "iterations": len(loglike_history) - 1,
     }
     if return_details:
+        progress(f"Auxiliary estimation finished in {time.perf_counter() - estimation_start:.2f}s")
         return details
+    progress(f"Auxiliary estimation finished in {time.perf_counter() - estimation_start:.2f}s")
     return pinew, xnew, q
 
 def get_marginal_effects():
@@ -4040,7 +4167,7 @@ total_n_summer  = 9 + 1 # 9 coefficients + 1 type em
 #-----------------------------------------------------------------------------#
 #                       CODE TO IMPLEMENT THE ALGORITHM
 
-#pi, xnew, q = perform_em(2)
+pi, xnew, q = perform_em(2)
 
 #.............................................................................#
 #                       CODE TO CHECK THE JACOBIAN ETC...
