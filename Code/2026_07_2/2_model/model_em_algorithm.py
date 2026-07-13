@@ -9,8 +9,25 @@ import scipy
 import os
 import time
 import pandas as pd
-#import numba
-from numba import njit,jit,prange
+# Numba is optional. The auxiliary estimator remains correct without it, while
+# server environments that provide Numba retain the legacy acceleration.
+try:
+    from numba import njit, jit, prange
+    from numba.core.errors import NumbaPendingDeprecationWarning, NumbaDeprecationWarning
+except ImportError:
+    def njit(*decorator_args, **decorator_kwargs):
+        if decorator_args and callable(decorator_args[0]) and len(decorator_args) == 1:
+            return decorator_args[0]
+        return lambda function: function
+
+    jit = njit
+    prange = range
+
+    class NumbaPendingDeprecationWarning(Warning):
+        pass
+
+    class NumbaDeprecationWarning(Warning):
+        pass
 import multiprocessing 
 import multiprocessing as mp
 from scipy.optimize import minimize
@@ -21,8 +38,7 @@ from scipy.optimize import check_grad
 from scipy.optimize import approx_fprime
 #import mkl
 import warnings
-
-from numba.core.errors import NumbaPendingDeprecationWarning,NumbaDeprecationWarning
+from scipy.special import expit, logsumexp
 
 warnings.simplefilter('ignore',category=NumbaDeprecationWarning)
 warnings.simplefilter('ignore',category=NumbaPendingDeprecationWarning)
@@ -3025,104 +3041,944 @@ def logit_margineffect(param,x):
     
     return margeffect
 
+
+#-----------------------------------------------------------------------------#
+# Four-type auxiliary EM: LL, LH, HL, HH
+#-----------------------------------------------------------------------------#
+
+TYPE_LL = 0
+TYPE_LH = 1
+TYPE_HL = 2
+TYPE_HH = 3
+TYPE_NAMES = np.array(["LL", "LH", "HL", "HH"])
+TYPE_SCHOOL = np.array([0, 0, 1, 1], dtype=int)
+TYPE_FINANCIAL = np.array([0, 1, 0, 1], dtype=int)
+MONEY_SCALE = 1000.0
+
+
+def _financial_alt_features(choices):
+    """Alternative-level controls: four-year, graduate, part-time, full-time."""
+    choices = np.asarray(choices)
+    return np.column_stack(
+        (
+            choices[:, 1] == 2,
+            choices[:, 1] == 3,
+            choices[:, 2] == 1,
+            choices[:, 2] == 2,
+        )
+    ).astype(float)
+
+
+def _state_wage_design(state):
+    """Vectorized version of the full-model ``get_x2_new`` wage state."""
+    state = np.asarray(state)
+    design = np.zeros((state.shape[0], 10), dtype=float)
+    design[:, 0] = state[:, 0]
+    major = state[:, 8].astype(int)
+
+    regular = (major != 0) & (major != 12)
+    regular_rows = np.flatnonzero(regular)
+    regular_major = major[regular]
+    regular_columns = np.where(regular_major < 3, regular_major - 1, regular_major - 2)
+    valid = (regular_columns >= 0) & (regular_columns < 8)
+    design[regular_rows[valid], 1 + regular_columns[valid]] = 1.0
+    design[major == 12, 8] = 1.0
+    design[:, 9] = state[:, 6]
+    return design
+
+
+def _occupation_wage_design(state_design, occupation):
+    """Apply the exact occupation-specific wage mapping used by the full model."""
+    column_map = {
+        1: tuple(range(10)),
+        2: (0, 1, 6, 7, 8),
+        3: (0, 3, 4, 6, 7),
+        6: (0, 2, 3, 4, 5, 8),
+        7: (0, 4, 7, 8),
+        8: (0, 1, 5, 7, 8),
+        9: tuple(range(10)),
+        10: tuple(range(10)),
+    }
+    return state_design[:, column_map[int(occupation)]]
+
+
+def load_fixed_wage_parameters():
+    """Load, but never estimate, the wage equations used by the auxiliary EM."""
+    occupations = (1, 2, 3, 6, 7, 8, 9, 10)
+    parameters = {
+        occupation: np.load(f"{pathfunctions}/wage_{occupation}.npy")
+        for occupation in occupations
+    }
+    return {
+        "school": np.load(f"{pathfunctions}/wage_0.npy"),
+        "occupations": parameters,
+        "sigmas": np.asarray(np.load(f"{pathfunctions}/sigmas.npy"), dtype=float),
+        "occupation_order": occupations,
+    }
+
+
+def predict_expected_wages(x1_design, state, feasible_choices, wage_parameters):
+    """Expected annual wage for every observation and feasible alternative.
+
+    Wage equations are in log hourly wages. The lognormal correction is included,
+    and labor supply follows the full-model convention: 0, 20, or 40 hours/week.
+    """
+    choices = np.asarray(feasible_choices)
+    nobs, nchoices = x1_design.shape[0], choices.shape[0]
+    expected = np.zeros((nobs, nchoices), dtype=float)
+    state_design = _state_wage_design(state)
+    sigmas = wage_parameters["sigmas"]
+
+    school_mu = np.column_stack((x1_design, state_design[:, :-1])) @ wage_parameters["school"]
+    school_hourly = np.exp(np.clip(school_mu + 0.5 * sigmas[0] ** 2, -20.0, 20.0))
+
+    occupation_hourly = {}
+    for sigma_index, occupation in enumerate(wage_parameters["occupation_order"], start=1):
+        x2_wage = _occupation_wage_design(state_design, occupation)
+        wage_x = np.column_stack((x1_design, x2_wage))
+        mu = wage_x @ wage_parameters["occupations"][occupation]
+        occupation_hourly[occupation] = np.exp(
+            np.clip(mu + 0.5 * sigmas[sigma_index] ** 2, -20.0, 20.0)
+        )
+
+    annual_hours = choices[:, 2].astype(float) * 0.5 * 40.0 * 52.0
+    for j, (occupation, education, work) in enumerate(choices.astype(int)):
+        if work == 0:
+            continue
+        if education > 0:
+            expected[:, j] = school_hourly * annual_hours[j]
+        elif occupation in occupation_hourly:
+            expected[:, j] = occupation_hourly[occupation] * annual_hours[j]
+    return expected
+
+
+def _feasible_choice_mask(states, total_choices):
+    """Cache legal alternatives; this individual loop is never run inside EM."""
+    mask = np.zeros((states.shape[0], total_choices.shape[0]), dtype=bool)
+    for i, state in enumerate(states.astype(int)):
+        possible = get_possible_choices(state)
+        indices = np.where((total_choices == possible[:, None]).all(-1))[1]
+        mask[i, indices] = True
+    return mask
+
+
+def _observed_financial_design(x1_design, choices):
+    return np.column_stack((x1_design, _financial_alt_features(choices)))
+
+
+def build_auxiliary_em_data(
+    choices_all,
+    choices_array_all,
+    x1_new,
+    x_change,
+    x_educ,
+    x_first2,
+    x_first4,
+    x_firstgrad,
+    x_exp,
+):
+    """Load and cache every object that is fixed across auxiliary EM iterations."""
+    total_choices = get_total_choices().astype(int)
+    wage_parameters = load_fixed_wage_parameters()
+    debt_grid = get_debt_range()
+    periods = []
+    grant_rows = []
+    transfer_rows = []
+    n_individuals = len(choices_all[0])
+
+    for period in range(1, T):
+        x1_raw, state, debt_index, debtchoice, choices, income = load_data_superfeasible(
+            period, return_income=True
+        )
+        x1_period = np.asarray(x1_new[f"period{period}"], dtype=float)
+        if len(choices) != n_individuals:
+            raise ValueError("The auxiliary EM requires the same balanced individuals each period.")
+
+        feasible = _feasible_choice_mask(state, total_choices)
+        chosen_index = np.asarray(choices_array_all[period - 1], dtype=int)
+        if not np.all(feasible[np.arange(n_individuals), chosen_index]):
+            raise ValueError(f"Observed infeasible choice found in auxiliary period {period}.")
+
+        expected_wage = predict_expected_wages(
+            x1_period, state, total_choices, wage_parameters
+        )
+        debt_index = np.asarray(debt_index, dtype=int)
+        debt_dollars = debt_grid[np.clip(debt_index, 0, len(debt_grid) - 1)]
+
+        periods.append(
+            {
+                "period": period,
+                "choices": np.asarray(choices),
+                "chosen_index": chosen_index,
+                "state": np.asarray(state),
+                "x1": x1_period,
+                "feasible": feasible,
+                "expected_wage": expected_wage,
+                "debt_dollars": debt_dollars,
+                "x_change": np.asarray(x_change[f"period{period}"]),
+                "x_educ": np.asarray(x_educ[f"period{period}"]),
+                "x_first2": np.asarray(x_first2[f"period{period}"]),
+                "x_first4": np.asarray(x_first4[f"period{period}"]),
+                "x_firstgrad": np.asarray(x_firstgrad[f"period{period}"]),
+                "x_exp": np.asarray(x_exp[f"period{period}"]),
+            }
+        )
+
+        education = choices[:, 1].astype(int)
+        individual_index = np.arange(n_individuals, dtype=int)
+        financial_x = _observed_financial_design(x1_period, choices)
+
+        grant = np.asarray(income[:, 1], dtype=float)
+        grant_observed = (education > 0) & np.isfinite(grant)
+        grant_rows.append(
+            {
+                "x": financial_x[grant_observed],
+                "amount": grant[grant_observed],
+                "individual": individual_index[grant_observed],
+            }
+        )
+
+        transfer = np.asarray(income[:, 2], dtype=float) + np.asarray(income[:, 3], dtype=float)
+        transfer_observed = (
+            np.isin(education, (1, 2))
+            & np.isfinite(income[:, 2])
+            & np.isfinite(income[:, 3])
+        )
+        transfer_rows.append(
+            {
+                "x": financial_x[transfer_observed],
+                "amount": transfer[transfer_observed],
+                "individual": individual_index[transfer_observed],
+            }
+        )
+
+    def stack_financial(rows):
+        return {
+            "x": np.concatenate([row["x"] for row in rows], axis=0),
+            "amount": np.concatenate([row["amount"] for row in rows]),
+            "individual": np.concatenate([row["individual"] for row in rows]),
+        }
+
+    alt_features = _financial_alt_features(total_choices)
+    tuition = np.select(
+        [total_choices[:, 1] == 1, total_choices[:, 1] == 2, total_choices[:, 1] == 3],
+        [4000.0, 8000.0, 14000.0],
+        default=0.0,
+    )
+    return {
+        "n_individuals": n_individuals,
+        "total_choices": total_choices,
+        "periods": periods,
+        "grant": stack_financial(grant_rows),
+        "transfer": stack_financial(transfer_rows),
+        "alt_financial_features": alt_features,
+        "grant_eligible": total_choices[:, 1] > 0,
+        "transfer_eligible": np.isin(total_choices[:, 1], (1, 2)),
+        "tuition": tuition,
+        "nonhome": np.any(total_choices != 0, axis=1).astype(float),
+        "x1_measure": np.asarray(x1_new["period1"], dtype=float),
+    }
+
+
+def collapse_financial_weights(q):
+    return np.column_stack((q[:, TYPE_LL] + q[:, TYPE_HL], q[:, TYPE_LH] + q[:, TYPE_HH]))
+
+
+def collapse_school_weights(q):
+    return np.column_stack((q[:, TYPE_LL] + q[:, TYPE_LH], q[:, TYPE_HL] + q[:, TYPE_HH]))
+
+
+def _weighted_type_logit_objective(parameters, x, outcome, weights):
+    beta, shift = parameters[:-1], parameters[-1]
+    eta_low = x @ beta
+    eta_high = eta_low + shift
+    probability_low = expit(eta_low)
+    probability_high = expit(eta_high)
+
+    loglike_low = outcome * eta_low - np.logaddexp(0.0, eta_low)
+    loglike_high = outcome * eta_high - np.logaddexp(0.0, eta_high)
+    objective = -np.sum(weights[:, 0] * loglike_low + weights[:, 1] * loglike_high)
+
+    residual_low = weights[:, 0] * (probability_low - outcome)
+    residual_high = weights[:, 1] * (probability_high - outcome)
+    gradient_beta = x.T @ (residual_low + residual_high)
+    gradient_shift = np.sum(residual_high)
+    return objective, np.append(gradient_beta, gradient_shift)
+
+
+def _weighted_type_normal_fit(x, log_amount, weights):
+    nobs, nbase = x.shape
+    design_low = np.column_stack((x, np.zeros(nobs)))
+    design_high = np.column_stack((x, np.ones(nobs)))
+    design = np.vstack((design_low, design_high))
+    outcome = np.tile(log_amount, 2)
+    weight = np.concatenate((weights[:, 0], weights[:, 1]))
+    root_weight = np.sqrt(np.clip(weight, 0.0, None))
+    weighted_design = design * root_weight[:, None]
+    weighted_outcome = outcome * root_weight
+    coefficients = np.linalg.lstsq(weighted_design, weighted_outcome, rcond=None)[0]
+    residual = outcome - design @ coefficients
+    variance = np.sum(weight * residual ** 2) / max(np.sum(weight), 1.0)
+    return coefficients, float(np.sqrt(max(variance, 1.0e-8)))
+
+
+def estimate_financial_source(dataset, q_financial, previous=None):
+    """Weighted receipt logit plus weighted log-normal positive-amount model."""
+    x = dataset["x"]
+    amount = dataset["amount"]
+    row_weights = q_financial[dataset["individual"]]
+    receipt = (amount > 0).astype(float)
+    initial_receipt = (
+        previous["receipt"]
+        if previous is not None
+        else np.zeros(x.shape[1] + 1, dtype=float)
+    )
+    result = minimize(
+        _weighted_type_logit_objective,
+        initial_receipt,
+        args=(x, receipt, row_weights),
+        jac=True,
+        method="L-BFGS-B",
+        options={"disp": False, "maxiter": 300, "gtol": 1.0e-6, "ftol": 1.0e-12},
+    )
+
+    positive = (amount > 0) & np.isfinite(amount)
+    if not np.any(positive):
+        raise ValueError("No positive observed financial amounts are available.")
+    amount_coefficients, amount_sigma = _weighted_type_normal_fit(
+        x[positive], np.log(amount[positive]), row_weights[positive]
+    )
+    return {
+        "receipt": np.asarray(result.x),
+        "amount": amount_coefficients,
+        "sigma": amount_sigma,
+        "receipt_success": bool(result.success),
+        "receipt_message": str(result.message),
+    }
+
+
+def initialize_financial_source(dataset, financial_typeeffect=0.25):
+    n_individuals = int(np.max(dataset["individual"])) + 1
+    equal_weights = np.full((n_individuals, 2), 0.5)
+    parameters = estimate_financial_source(dataset, equal_weights)
+    parameters["receipt"][-1] = financial_typeeffect
+    parameters["amount"][-1] = 0.25 * financial_typeeffect
+    return parameters
+
+
+def _source_log_likelihood_by_financial_type(parameters, dataset, n_individuals):
+    x, amount = dataset["x"], dataset["amount"]
+    individual = dataset["individual"]
+    receipt = (amount > 0).astype(float)
+    beta_receipt, shift_receipt = parameters["receipt"][:-1], parameters["receipt"][-1]
+    beta_amount, shift_amount = parameters["amount"][:-1], parameters["amount"][-1]
+    sigma_amount = max(float(parameters["sigma"]), 1.0e-8)
+
+    eta_low = x @ beta_receipt
+    eta_high = eta_low + shift_receipt
+    row_loglike = np.column_stack(
+        (
+            receipt * eta_low - np.logaddexp(0.0, eta_low),
+            receipt * eta_high - np.logaddexp(0.0, eta_high),
+        )
+    )
+
+    positive = (amount > 0) & np.isfinite(amount)
+    if np.any(positive):
+        log_amount = np.log(amount[positive])
+        mean_low = x[positive] @ beta_amount
+        mean_high = mean_low + shift_amount
+        constant = np.log(2.0 * np.pi * sigma_amount ** 2)
+        row_loglike[positive, 0] += -0.5 * (
+            constant + ((log_amount - mean_low) / sigma_amount) ** 2
+        )
+        row_loglike[positive, 1] += -0.5 * (
+            constant + ((log_amount - mean_high) / sigma_amount) ** 2
+        )
+
+    individual_loglike = np.zeros((n_individuals, 2), dtype=float)
+    np.add.at(individual_loglike, individual, row_loglike)
+    return individual_loglike
+
+
+def financial_log_likelihoods(grant_parameters, transfer_parameters, auxiliary_data):
+    n = auxiliary_data["n_individuals"]
+    grant = _source_log_likelihood_by_financial_type(
+        grant_parameters, auxiliary_data["grant"], n
+    )
+    transfer = _source_log_likelihood_by_financial_type(
+        transfer_parameters, auxiliary_data["transfer"], n
+    )
+    by_financial_type = grant + transfer
+    return by_financial_type[:, TYPE_FINANCIAL]
+
+
+def _expected_source_by_period(parameters, period_data, auxiliary_data, eligibility):
+    n = auxiliary_data["n_individuals"]
+    x1 = period_data["x1"]
+    alt = auxiliary_data["alt_financial_features"]
+    n_x1 = x1.shape[1]
+
+    receipt_base = x1 @ parameters["receipt"][:n_x1]
+    receipt_alt = alt @ parameters["receipt"][n_x1:-1]
+    amount_base = x1 @ parameters["amount"][:n_x1]
+    amount_alt = alt @ parameters["amount"][n_x1:-1]
+
+    eta_receipt_low = receipt_base[:, None] + receipt_alt[None, :]
+    eta_amount_low = amount_base[:, None] + amount_alt[None, :]
+    expected = np.empty((2, n, alt.shape[0]), dtype=float)
+    for financial_type in (0, 1):
+        receipt_shift = financial_type * parameters["receipt"][-1]
+        amount_shift = financial_type * parameters["amount"][-1]
+        probability = expit(eta_receipt_low + receipt_shift)
+        conditional_level = np.exp(
+            np.clip(
+                eta_amount_low + amount_shift + 0.5 * parameters["sigma"] ** 2,
+                -20.0,
+                20.0,
+            )
+        )
+        expected[financial_type] = probability * conditional_level
+        expected[financial_type, :, ~eligibility] = 0.0
+    return expected
+
+
+def build_expected_consumption(
+    wage_parameters,
+    grant_parameters,
+    transfer_parameters,
+    model_data,
+    feasible_choices,
+):
+    """Expected consumption for low/high financial-resource types.
+
+    Fixed expected wages are cached in ``model_data``. Grants are available for
+    all schooling alternatives; parental transfers follow the full-model rule
+    and are available for two- and four-year enrollment, but not graduate school.
+    No quadrature, debt choice, or continuation value enters this calculation.
+    """
+    del wage_parameters, feasible_choices  # predictions/mappings are already cached
+    low, high = [], []
+    for period_data in model_data["periods"]:
+        expected_grant = _expected_source_by_period(
+            grant_parameters,
+            period_data,
+            model_data,
+            model_data["grant_eligible"],
+        )
+        expected_transfer = _expected_source_by_period(
+            transfer_parameters,
+            period_data,
+            model_data,
+            model_data["transfer_eligible"],
+        )
+        resources = (
+            period_data["expected_wage"][None, :, :]
+            + expected_grant
+            + expected_transfer
+            - model_data["tuition"][None, None, :]
+        )
+        resources[:, :, -1] = 0.0  # preserve the home-production normalization
+        low.append(resources[0])
+        high.append(resources[1])
+    return low, high
+
+
+def _choice_components(choice_parameters, auxiliary_data, expected_consumption):
+    legacy_count = total_n_choice_legacy
+    legacy_parameters = choice_parameters[:legacy_count]
+    consumption_coefficient = choice_parameters[legacy_count]
+    debt_coefficient = choice_parameters[legacy_count + 1]
+    utility_parameters = build_param_g(legacy_parameters)
+    consumption_low, consumption_high = expected_consumption
+    return (
+        utility_parameters,
+        consumption_coefficient,
+        debt_coefficient,
+        consumption_low,
+        consumption_high,
+    )
+
+
+def auxiliary_choice_log_likelihoods(choice_parameters, auxiliary_data, expected_consumption):
+    """Individual choice-sequence log likelihood for LL, LH, HL, and HH."""
+    utility_parameters, alpha_c, alpha_b, consumption_low, consumption_high = (
+        _choice_components(choice_parameters, auxiliary_data, expected_consumption)
+    )
+    n = auxiliary_data["n_individuals"]
+    loglike = np.zeros((n, 4), dtype=float)
+
+    for period_index, period_data in enumerate(auxiliary_data["periods"]):
+        g_school = []
+        for school_type in (0, 1):
+            g_school.append(
+                get_all_g(
+                    utility_parameters,
+                    period_data["x1"],
+                    period_data["x_change"],
+                    period_data["x_educ"],
+                    period_data["x_first2"],
+                    period_data["x_first4"],
+                    period_data["x_firstgrad"],
+                    period_data["x_exp"],
+                    period_data["period"],
+                    school_type + 1,
+                )
+            )
+        debt_regressor = (
+            period_data["debt_dollars"][:, None]
+            * auxiliary_data["nonhome"][None, :]
+            / MONEY_SCALE
+        )
+        for latent_type in range(4):
+            consumption = (
+                consumption_low[period_index]
+                if TYPE_FINANCIAL[latent_type] == 0
+                else consumption_high[period_index]
+            )
+            utility = (
+                g_school[TYPE_SCHOOL[latent_type]]
+                + alpha_c * consumption / MONEY_SCALE
+                + alpha_b * debt_regressor
+            )
+            utility = np.where(period_data["feasible"], utility, -np.inf)
+            log_probability = utility - logsumexp(utility, axis=1, keepdims=True)
+            loglike[:, latent_type] += log_probability[
+                np.arange(n), period_data["chosen_index"]
+            ]
+    return loglike
+
+
+def auxiliary_choice_objective(choice_parameters, auxiliary_data, expected_consumption, q):
+    """Weighted four-type choice likelihood with the legacy analytic score."""
+    utility_parameters, alpha_c, alpha_b, consumption_low, consumption_high = (
+        _choice_components(choice_parameters, auxiliary_data, expected_consumption)
+    )
+    legacy_gradient = np.zeros(total_n_choice_legacy, dtype=float)
+    resource_gradient = np.zeros(2, dtype=float)
+    loglike = 0.0
+    affected = map_param_to_choice(fields, occupations)
+
+    for period_index, period_data in enumerate(auxiliary_data["periods"]):
+        g_school = []
+        for school_type in (0, 1):
+            g_school.append(
+                get_all_g(
+                    utility_parameters,
+                    period_data["x1"],
+                    period_data["x_change"],
+                    period_data["x_educ"],
+                    period_data["x_first2"],
+                    period_data["x_first4"],
+                    period_data["x_firstgrad"],
+                    period_data["x_exp"],
+                    period_data["period"],
+                    school_type + 1,
+                )
+            )
+        previous_affects = build_previous_affects(period_data["x_change"])
+        debt_regressor = (
+            period_data["debt_dollars"][:, None]
+            * auxiliary_data["nonhome"][None, :]
+            / MONEY_SCALE
+        )
+        chosen = period_data["chosen_index"]
+        rows = np.arange(len(chosen))
+
+        for latent_type in range(4):
+            school_type = TYPE_SCHOOL[latent_type]
+            consumption = (
+                consumption_low[period_index]
+                if TYPE_FINANCIAL[latent_type] == 0
+                else consumption_high[period_index]
+            )
+            consumption_scaled = consumption / MONEY_SCALE
+            utility = (
+                g_school[school_type]
+                + alpha_c * consumption_scaled
+                + alpha_b * debt_regressor
+            )
+            utility = np.where(period_data["feasible"], utility, -np.inf)
+            log_denominator = logsumexp(utility, axis=1, keepdims=True)
+            probability = np.exp(utility - log_denominator)
+            chosen_log_probability = utility[rows, chosen] - log_denominator[:, 0]
+            loglike += np.sum(q[:, latent_type] * chosen_log_probability)
+
+            q_for_score = np.zeros((len(chosen), 2), dtype=float)
+            q_for_score[:, school_type] = q[:, latent_type]
+            legacy_gradient += jacobian_likelihood(
+                chosen,
+                probability,
+                period_data["x1"],
+                period_data["x_change"],
+                period_data["x_educ"],
+                period_data["x_first2"],
+                period_data["x_first4"],
+                period_data["x_firstgrad"],
+                period_data["x_exp"],
+                period_data["period"],
+                q_for_score,
+                school_type + 1,
+                affected,
+                previous_affects,
+            )
+            resource_gradient[0] += np.sum(
+                q[:, latent_type]
+                * (
+                    consumption_scaled[rows, chosen]
+                    - np.sum(probability * consumption_scaled, axis=1)
+                )
+            )
+            resource_gradient[1] += np.sum(
+                q[:, latent_type]
+                * (
+                    debt_regressor[rows, chosen]
+                    - np.sum(probability * debt_regressor, axis=1)
+                )
+            )
+
+    gradient = np.concatenate((legacy_gradient, resource_gradient))
+    return -float(loglike), -gradient
+
+
+def estimate_school_measure(initial, x, outcome, q_school):
+    observed = np.isfinite(outcome)
+    result = minimize(
+        _weighted_type_logit_objective,
+        initial,
+        args=(x[observed], outcome[observed], q_school[observed]),
+        jac=True,
+        method="L-BFGS-B",
+        options={"disp": False, "maxiter": 300, "gtol": 1.0e-6, "ftol": 1.0e-12},
+    )
+    return np.asarray(result.x), float(result.fun), result
+
+
+def school_measure_log_likelihoods(parameters, x, outcome):
+    observed = np.isfinite(outcome)
+    result = np.zeros((len(outcome), 4), dtype=float)
+    beta, shift = parameters[:-1], parameters[-1]
+    eta_low = x @ beta
+    eta_high = eta_low + shift
+    by_school = np.column_stack(
+        (
+            outcome * eta_low - np.logaddexp(0.0, eta_low),
+            outcome * eta_high - np.logaddexp(0.0, eta_high),
+        )
+    )
+    by_school[~observed] = 0.0
+    result[:] = by_school[:, TYPE_SCHOOL]
+    return result
+
+
+def update_four_type_posteriors(pi, conditional_log_likelihood):
+    safe_pi = np.clip(np.asarray(pi, dtype=float), 1.0e-12, 1.0)
+    joint = conditional_log_likelihood + np.log(safe_pi)[None, :]
+    log_mixture = logsumexp(joint, axis=1)
+    q = np.exp(joint - log_mixture[:, None])
+    return q, float(np.sum(log_mixture))
+
+
+def all_auxiliary_log_likelihoods(
+    pi,
+    choice_parameters,
+    measure_late,
+    measure_summer,
+    grant_parameters,
+    transfer_parameters,
+    auxiliary_data,
+    measures,
+    expected_consumption,
+):
+    conditional = auxiliary_choice_log_likelihoods(
+        choice_parameters, auxiliary_data, expected_consumption
+    )
+    conditional += school_measure_log_likelihoods(
+        measure_late,
+        auxiliary_data["x1_measure"],
+        np.asarray(measures["late_school"], dtype=float),
+    )
+    conditional += school_measure_log_likelihoods(
+        measure_summer,
+        auxiliary_data["x1_measure"],
+        np.asarray(measures["summer_class"], dtype=float),
+    )
+    conditional += financial_log_likelihoods(
+        grant_parameters, transfer_parameters, auxiliary_data
+    )
+    return update_four_type_posteriors(pi, conditional)
+
     
-def perform_em(typeffect):
-    
-    # Initialitze parameters
-    
+def perform_em(typeffect, max_iterations=250, tolerance=3.0e-4, return_details=False):
+    """Estimate the four-type auxiliary model (LL, LH, HL, HH).
+
+    The orchestration deliberately mirrors the economic algorithm: current
+    posteriors -> financial M-step -> expected consumption -> choice M-step ->
+    schooling-measure M-step -> new likelihoods and posteriors. Wage equations
+    are fixed throughout and all invariant arrays are cached before iteration.
+    """
     global total_n_multi
     global total_n_late
     global total_n_summer
-    
-    #xnew = np.load("{path_estimates}/param_em_good.npy")
-    xnew = np.zeros(total_n_multi+total_n_late+total_n_summer)
-    
-    xnew[total_n_multi-2:total_n_multi] = typeffect
-    xnew[total_n_multi+total_n_late-1] = typeffect
-    xnew[total_n_multi+total_n_late+total_n_summer-1] = typeffect
-    
-    pinew = np.array([0.5,0.5])
-    
-    #q = np.load(f"{path_estimates}/estimates/em_q_typeff2.npy")   
-    #pinew = get_pi_new(q)
-    
-    # Load arrays
-    
-    choices_all, vjt_all,vjt_all2, x1_new, choices_array_all, x_change, x_educ, x_first2, x_first4, x_firstgrad, x_exp = load_all_arrays_feasible(auxiliar=1) 
 
-    # Load measures
-    
+    # Load choice arrays and all fixed data once.
+    (
+        choices_all,
+        _vjt_unused_low,
+        _vjt_unused_high,
+        x1_new,
+        choices_array_all,
+        x_change,
+        x_educ,
+        x_first2,
+        x_first4,
+        x_firstgrad,
+        x_exp,
+    ) = load_all_arrays_feasible(auxiliar=1)
     measures = pd.read_csv(f"{path}/feasible_measures.csv")
+    auxiliary_data = build_auxiliary_em_data(
+        choices_all,
+        choices_array_all,
+        x1_new,
+        x_change,
+        x_educ,
+        x_first2,
+        x_first4,
+        x_firstgrad,
+        x_exp,
+    )
+    n = auxiliary_data["n_individuals"]
+    if len(measures) != n:
+        raise ValueError("Schooling measures and auxiliary panel have different sample sizes.")
 
-    
-    err = 10
-    it = 0
-    while err>0.0003:
-        
-        # Current pi and params
-        
-        pi = pinew
-        x0 = xnew
-        
-        # Update posterior probabilities:
-        
-        q = get_q(pi,x0,choices_all,vjt_all,x1_new,choices_array_all,x_change,x_educ, x_first2, x_first4, x_firstgrad, x_exp, measures)
+    # Choice parameters retain the old g(.) block and append one common
+    # expected-consumption coefficient and one debt-vs-home coefficient.
+    choice_parameters = np.zeros(total_n_multi, dtype=float)
+    choice_parameters[total_n_choice_legacy - 2:total_n_choice_legacy] = typeffect
+    choice_parameters[total_n_choice_legacy] = 0.05
+    choice_parameters[total_n_choice_legacy + 1] = -0.02
 
-        # Update pi
-        
-        pinew = get_pi_new(q)
-        print(pinew)
-        
-        # update the parameters
-        #---------------------------------------------------------------------#
-        
-        # First minimize the education choice model
-        
-        res = minimize(likelihood_simple,x0[:total_n_multi],args=(choices_all, vjt_all,x1_new, choices_array_all,x_change,x_educ,x_first2,x_first4,x_firstgrad,x_exp,q),
-                       jac=True,options = {'disp':True})
-        
-        xnew1 = res.x 
-        fun1 = res.fun
-        #---------------------------------------------------------------------#
-        
-        # Now minimize the logit for late to school
-        
-        res = minimize(logit_loglike,x0[total_n_multi:total_n_multi+total_n_late],args=(x1_new["period1"],np.array(measures["late_school"]),q),
-                       options = {'disp':True})
-        
-        xnew2 = res.x
-        fun2 = res.fun
-        #---------------------------------------------------------------------#
-        # Now minimize the logit for summer courses
-        
-        res = minimize(logit_loglike,x0[total_n_multi:total_n_multi+total_n_late],args=(x1_new["period1"],np.array(measures["summer_class"]),q),
-                       options = {'disp':True})
-        
-        xnew3 = res.x
-        fun3 = res.fun
-        #---------------------------------------------------------------------#
-        
-        # Put all parameters together
-        
-        xnew = np.concatenate((xnew1,xnew2,xnew3))
-        likeval = fun1 + fun2 + fun3
-        
-        #---------------------------------------------------------------------#
-        # Check for tolerance
-        
-        err = np.sum(np.sqrt((x0-xnew)**2))
-        
-        print(xnew1[-2:])
-        print(xnew2[-1])
-        print(xnew3[-1])
-        print("Current error is ", err)
-        np.save(f"{path_estimates}/param_em_{it}_typeff{typeffect}.npy",xnew)
-        np.save(f"{path_estimates}/param_em_latest.npy",xnew)
-        np.save(f"{path_estimates}/em_q_typeff{typeffect}.npy",q)
-        np.save(f"{path_estimates}/likelihood_external_em_{typeffect}.npy",np.array(likeval))
-        it = it +1
-        
-    return pi, xnew, q
+    measure_late = np.zeros(total_n_late, dtype=float)
+    measure_summer = np.zeros(total_n_summer, dtype=float)
+    measure_late[-1] = typeffect
+    measure_summer[-1] = typeffect
+
+    # A positive seed fixes the financial label and prevents a symmetric
+    # four-class initialization from collapsing immediately to two classes.
+    financial_seed = max(0.05, 0.125 * abs(float(typeffect)))
+    grant_parameters = initialize_financial_source(
+        auxiliary_data["grant"], financial_typeeffect=financial_seed
+    )
+    transfer_parameters = initialize_financial_source(
+        auxiliary_data["transfer"], financial_typeeffect=financial_seed
+    )
+    expected_consumption = build_expected_consumption(
+        None,
+        grant_parameters,
+        transfer_parameters,
+        auxiliary_data,
+        auxiliary_data["total_choices"],
+    )
+
+    pinew = np.full(4, 0.25, dtype=float)
+    q, initial_loglike = all_auxiliary_log_likelihoods(
+        pinew,
+        choice_parameters,
+        measure_late,
+        measure_summer,
+        grant_parameters,
+        transfer_parameters,
+        auxiliary_data,
+        measures,
+        expected_consumption,
+    )
+    loglike_history = [initial_loglike]
+    xnew = np.concatenate((choice_parameters, measure_late, measure_summer))
+    err = np.inf
+
+    def financial_vector(parameters):
+        return np.concatenate(
+            (parameters["receipt"], parameters["amount"], [parameters["sigma"]])
+        )
+
+    for iteration in range(max_iterations):
+        pi = pinew.copy()
+        q_current = q.copy()
+        x0 = xnew.copy()
+        grant0 = financial_vector(grant_parameters)
+        transfer0 = financial_vector(transfer_parameters)
+
+        # 1. Estimate financial types using financial posterior collapses.
+        q_financial = collapse_financial_weights(q_current)
+        grant_parameters = estimate_financial_source(
+            auxiliary_data["grant"], q_financial, previous=grant_parameters
+        )
+        transfer_parameters = estimate_financial_source(
+            auxiliary_data["transfer"], q_financial, previous=transfer_parameters
+        )
+
+        # 2. Rebuild expected consumption for low/high financial resources.
+        expected_consumption = build_expected_consumption(
+            None,
+            grant_parameters,
+            transfer_parameters,
+            auxiliary_data,
+            auxiliary_data["total_choices"],
+        )
+
+        # 3. Estimate the choice block with all four posterior weights.
+        choice_result = minimize(
+            auxiliary_choice_objective,
+            choice_parameters,
+            args=(auxiliary_data, expected_consumption, q_current),
+            jac=True,
+            method="BFGS",
+            options={"disp": False, "maxiter": 200, "gtol": 1.0e-5},
+        )
+        choice_parameters = np.asarray(choice_result.x)
+
+        # 4. Estimate measures using schooling posterior collapses.
+        q_school = collapse_school_weights(q_current)
+        measure_late, late_fun, late_result = estimate_school_measure(
+            measure_late,
+            auxiliary_data["x1_measure"],
+            np.asarray(measures["late_school"], dtype=float),
+            q_school,
+        )
+        measure_summer, summer_fun, summer_result = estimate_school_measure(
+            measure_summer,
+            auxiliary_data["x1_measure"],
+            np.asarray(measures["summer_class"], dtype=float),
+            q_school,
+        )
+        xnew = np.concatenate((choice_parameters, measure_late, measure_summer))
+
+        # 5. Recompute all four conditional likelihoods, then update pi and q.
+        q, observed_loglike = all_auxiliary_log_likelihoods(
+            pi,
+            choice_parameters,
+            measure_late,
+            measure_summer,
+            grant_parameters,
+            transfer_parameters,
+            auxiliary_data,
+            measures,
+            expected_consumption,
+        )
+        pinew = np.clip(q.mean(axis=0), 1.0e-10, None)
+        pinew /= pinew.sum()
+        q, observed_loglike = all_auxiliary_log_likelihoods(
+            pinew,
+            choice_parameters,
+            measure_late,
+            measure_summer,
+            grant_parameters,
+            transfer_parameters,
+            auxiliary_data,
+            measures,
+            expected_consumption,
+        )
+        loglike_history.append(observed_loglike)
+
+        parameter_change = max(
+            float(np.max(np.abs(xnew - x0))),
+            float(np.max(np.abs(financial_vector(grant_parameters) - grant0))),
+            float(np.max(np.abs(financial_vector(transfer_parameters) - transfer0))),
+            float(np.max(np.abs(q - q_current))),
+        )
+        err = parameter_change
+
+        print(f"Auxiliary EM iteration {iteration}")
+        print("  pi [LL, LH, HL, HH] =", pinew)
+        print("  observed log likelihood =", observed_loglike)
+        print("  maximum update =", err)
+        print(
+            "  optimizer success [choice, late, summer, grant, transfer] =",
+            choice_result.success,
+            late_result.success,
+            summer_result.success,
+            grant_parameters["receipt_success"],
+            transfer_parameters["receipt_success"],
+        )
+
+        # Lightweight backward-compatible checkpoints.
+        np.save(f"{path_estimates}/param_em_{iteration}_typeff{typeffect}.npy", xnew)
+        np.save(f"{path_estimates}/param_em_latest.npy", xnew)
+        np.save(f"{path_estimates}/em_q_typeff{typeffect}.npy", q)
+        np.save(
+            f"{path_estimates}/likelihood_external_em_{typeffect}.npy",
+            np.asarray(loglike_history),
+        )
+        np.savez_compressed(
+            f"{path_estimates}/auxiliary_em_checkpoint.npz",
+            pi=pinew,
+            q=q,
+            choice_parameters=choice_parameters,
+            measure_late=measure_late,
+            measure_summer=measure_summer,
+            grant_receipt=grant_parameters["receipt"],
+            grant_amount=grant_parameters["amount"],
+            grant_sigma=grant_parameters["sigma"],
+            transfer_receipt=transfer_parameters["receipt"],
+            transfer_amount=transfer_parameters["amount"],
+            transfer_sigma=transfer_parameters["sigma"],
+            observed_loglike=np.asarray(loglike_history),
+        )
+
+        if err <= tolerance:
+            break
+
+    expected_consumption_low = np.stack(expected_consumption[0], axis=0)
+    expected_consumption_high = np.stack(expected_consumption[1], axis=0)
+    np.save(
+        f"{path_estimates}/expected_consumption_fin_low.npy",
+        expected_consumption_low,
+    )
+    np.save(
+        f"{path_estimates}/expected_consumption_fin_high.npy",
+        expected_consumption_high,
+    )
+    np.save(f"{path_estimates}/auxiliary_type_probabilities.npy", pinew)
+    np.save(f"{path_estimates}/auxiliary_q_four_types.npy", q)
+    np.save(
+        f"{path_estimates}/auxiliary_observed_loglike_history.npy",
+        np.asarray(loglike_history),
+    )
+    np.savez_compressed(
+        f"{path_estimates}/auxiliary_em_results.npz",
+        type_names=TYPE_NAMES,
+        pi=pinew,
+        q=q,
+        choice_parameters=choice_parameters,
+        measure_late=measure_late,
+        measure_summer=measure_summer,
+        grant_receipt=grant_parameters["receipt"],
+        grant_amount=grant_parameters["amount"],
+        grant_sigma=grant_parameters["sigma"],
+        transfer_receipt=transfer_parameters["receipt"],
+        transfer_amount=transfer_parameters["amount"],
+        transfer_sigma=transfer_parameters["sigma"],
+        observed_loglike=np.asarray(loglike_history),
+    )
+
+    details = {
+        "pi": pinew,
+        "q": q,
+        "type_names": TYPE_NAMES.copy(),
+        "choice_parameters": choice_parameters,
+        "measure_late": measure_late,
+        "measure_summer": measure_summer,
+        "grant_parameters": grant_parameters,
+        "transfer_parameters": transfer_parameters,
+        "expected_consumption_fin_low": expected_consumption_low,
+        "expected_consumption_fin_high": expected_consumption_high,
+        "observed_loglike_history": np.asarray(loglike_history),
+        "converged": bool(err <= tolerance),
+        "iterations": len(loglike_history) - 1,
+    }
+    if return_details:
+        return details
+    return pinew, xnew, q
 
 def get_marginal_effects():
     
@@ -3142,7 +3998,9 @@ def get_marginal_effects():
 
 
 
-get_feasible()
+# Data preparation is intentionally not run on import. Call get_feasible(),
+# get_data_superfeasible(), or get_x_g_superfeasible() explicitly when rebuilding
+# the auxiliary sample and its cached design arrays.
 #get_feasible_pubid()
 #get_data_superfeasible()
 #get_x_g_superfeasible()
@@ -3162,7 +4020,14 @@ n_param_g_first = 1 + 4 + 1
 n_param_g_exp = (fields-1)*4*6
 n_param_g_types = 2 # one effect on associate and one on 4y schools
 total_n = n_param_g_x1 + n_param_g_change + n_param_g_work + n_param_g_educ + n_param_g_period + n_param_g_period_work + n_param_g_first + n_param_g_exp + n_param_g_types
-total_n_multi = total_n
+total_n_choice_legacy = total_n
+n_param_auxiliary_consumption = 1
+n_param_auxiliary_debt = 1
+total_n_multi = (
+    total_n_choice_legacy
+    + n_param_auxiliary_consumption
+    + n_param_auxiliary_debt
+)
 total_n_late    = 9 + 1 # 9 coefficients + 1 type em
 total_n_summer  = 9 + 1 # 9 coefficients + 1 type em
 
