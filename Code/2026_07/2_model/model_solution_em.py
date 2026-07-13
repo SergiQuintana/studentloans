@@ -43,6 +43,7 @@ T = 10
 # experience after
 # major at graduation
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, STATES
+import budget_shock as bs
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathcont = DIR["MODEL_CONTINUATION"]
@@ -124,49 +125,22 @@ def build_debt_pen_vec(budget_params):
 
     So only entries 1:4 matter for parinc-specific penalties.
 
-    Expected in budget_params:
-      budget_params["debt_pen_parinc"] is either:
-        - length 3: [pen_par2, pen_par3, pen_par4]  (preferred)
-        - length 4: [pen_par1, pen_par2, pen_par3, pen_par4]
-          (we convert to dummy form relative to par1 baseline)
+    Current estimator output uses ``baseline_plus_deviations``:
+      [dp0, dp2, dp3, dp4], giving penalties
+      [dp0, dp0+dp2, dp0+dp3, dp0+dp4].
+
+    Older files without an explicit parameterization are interpreted as four
+    group levels, preserving compatibility with prior saved estimates.
     """
-    v = np.zeros(9, dtype=np.float64)
-
-    p = np.asarray(budget_params["debt_pen_parinc"], dtype=np.float64)
-
-    if p.size == 3:
-        v[1] = p[0]
-        v[2] = p[1]
-        v[3] = p[2]
-    elif p.size == 4:
-        # dummy coefficients relative to par1
-        v[1] = p[1] - p[0]
-        v[2] = p[2] - p[0]
-        v[3] = p[3] - p[0]
-        # if you *also* want par1 to have a nonzero baseline penalty:
-        # v[0] = p[0]
-    else:
-        raise ValueError("budget_params['debt_pen_parinc'] must be length 3 or 4")
-
-    return v
+    return bs.debt_penalty_design_vector(budget_params)
 
 
 def load_params_frombudget():
-    sigma_path = EST("risk_aversion.npy")
-    budget_path = EST("budgetshock_params.npy")
-
-    sigma_u_parinc = None
-    budget_params = None
-    debt_pen_vec = None
-
-    if os.path.exists(sigma_path):
-        sigma_u_parinc = np.load(sigma_path).astype(np.float64)
-
-    if os.path.exists(budget_path):
-        budget_params = np.load(budget_path, allow_pickle=True).item()
-        # build the ready-to-use vector once, here
-        debt_pen_vec = build_debt_pen_vec(budget_params)
-
+    budget_params = bs.load(raise_if_missing=False)
+    if budget_params is None:
+        return None, None, None
+    sigma_u_parinc = budget_params.get("risk_aversion")
+    debt_pen_vec = build_debt_pen_vec(budget_params)
     return sigma_u_parinc, budget_params, debt_pen_vec
     
 
@@ -1581,36 +1555,12 @@ def get_sigma(j,sigmas):
 
 
 def get_quadrature_budget(deg, x1, x2, j, period):
-    mu_z, sigma_z = budget_mu_sigma_from_params(x1, x2, j, period)
-    z, wz = get_quadrature(deg, mu_z, sigma_z)
-    return z, wz
+    return bs.quadrature(budget_params, x1, period, degree=deg)
 
 
 def budget_mu_sigma_from_params(x1, x2, j, period):
-    global budget_params
-
-    periods = np.asarray(budget_params["periods"], dtype=int)
-    p_idx = int(np.where(periods == int(period))[0][0])
-
-    mu_block = np.asarray(budget_params["mu_blocks"][p_idx], dtype=np.float64)
-
-    par = int(x1[0, 0])  # 1..4
-    ab  = int(x1[0, 1])  # 1..4
-
-    mu0, mu_p2, mu_p3, mu_p4, mu_a2, mu_a3, mu_a4 = mu_block
-
-    mu = mu0
-    if par == 2: mu += mu_p2
-    if par == 3: mu += mu_p3
-    if par == 4: mu += mu_p4
-    if ab  == 2: mu += mu_a2
-    if ab  == 3: mu += mu_a3
-    if ab  == 4: mu += mu_a4
-
-    sigma_e = budget_params["sigma_e"]
-    sigma = float(sigma_e[p_idx] if np.ndim(sigma_e) > 0 else sigma_e)
-
-    return float(mu), float(sigma)
+    mean = float(np.asarray(bs.conditional_mean(budget_params, x1, period)).reshape(-1)[0])
+    return mean, bs.conditional_sigma(budget_params, period)
 
 
 def get_quadrature(deg,mu,sigma):
@@ -2397,9 +2347,7 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
     
     models = 0
     
-    parinc = int(x1[i,0])           # 1..4
-    #sigma_u = float(sigma_u_parinc[parinc-1])
-    sigma_u = 1.4
+    sigma_u = float(bs.risk_aversion(budget_params, x1[i, :]))
     for period in range(T,0,-1):
         print(period)
         if period < T:

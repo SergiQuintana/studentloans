@@ -31,6 +31,7 @@ from model_solution_em import (
 # Parameters for the wage equations:
 from pathlib import Path
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, LIK
+import budget_shock as bs
 pathfunctions   = DIR["MODEL_FUNCOEF"]
 path_realdata   = DIR["MODEL_REALDATA"]
 path_estimates  = DIR["MODEL_ESTIMATES"]
@@ -747,10 +748,13 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     x_educ = x[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
     x_noteduc = x[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
 
-    # Draw a budget shock: 
-        
-    #psi_noteduc  = np.random.normal(loc=mu, scale=sigma_e, size=np.shape(x_noteduc)[0])
-    psi_educ = np.random.normal(loc=mu, scale=sigmas[0], size=np.shape(x_educ)[0])
+    # Draw distinct shocks in their correct units. The wage shock is in log
+    # wages; the fitted budget shock is additive in dollar consumption.
+    if budget_params is None:
+        reload_budget_shock_params(raise_if_missing=True)
+    wage_psi_educ = np.random.normal(loc=0.0, scale=sigmas[0], size=np.shape(x_educ)[0])
+    budget_psi_educ = bs.draw(budget_params, x_educ[:, 1:5], period)
+    sigma_educ = bs.risk_aversion(budget_params, x_educ[:, 1:5])
     
         
     choices_educ = choices[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
@@ -766,7 +770,9 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     # The individuals that are making educational choices will endogenize the choice of debt given a shock:
     # Notice here hta the choices are only for the subset of individuals that make education chioces
     
-    payoff = get_conditional_agents(sigma_u,x_educ[:,1:5],x_educ[:,5:15],x_educ[:,15],psi_educ,choices_educ,period,conterfactual,types,maxdebt)
+    payoff = get_conditional_agents(sigma_educ,x_educ[:,1:5],x_educ[:,5:15],x_educ[:,15],
+                                    budget_psi_educ,wage_psi_educ,choices_educ,period,
+                                    conterfactual,types,maxdebt)
     debt_educ = np.nanargmax(payoff,axis=1)
 
     
@@ -857,7 +863,7 @@ def get_debt_range():
     
     return debt_range
     
-def get_conditional_agents(sigma_u,x1,x2,b,psi,j,period,conterfactual,types,maxdebt):
+def get_conditional_agents(sigma_u,x1,x2,b,budget_psi,wage_psi,j,period,conterfactual,types,maxdebt):
     
     "this function returns the conditional value function associated with each alternative"
     
@@ -870,7 +876,7 @@ def get_conditional_agents(sigma_u,x1,x2,b,psi,j,period,conterfactual,types,maxd
     
     j = total_choices[j,:]
             
-    u = get_utility_agents(sigma_u,x1,x2,b,b1,psi,j,period,conterfactual,maxdebt)
+    u = get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfactual,maxdebt)
 
     continuation = beta*VT_agents(x1,x2,b1,period,j,conterfactual,types,maxdebt)
         
@@ -1522,7 +1528,7 @@ def wage(x1_new,x2_new,j,param_wage):
 
 
 #@njit()
-def get_utility_agents(sigma_u,x1,x2,b,b1,psi,j,period,conterfactual,maxdebt):
+def get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfactual,maxdebt):
     
     " this function returns the utility associated with a particular alternative"
     
@@ -1540,9 +1546,10 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,psi,j,period,conterfactual,maxdebt):
     
     w = wage0(x1_new,x2)
     
-    wage_shock = np.exp((w + psi[...,None]))*full_part_time[...,None]*1/2*(40*52)
+    wage_shock = np.exp((w + wage_psi[...,None]))*full_part_time[...,None]*1/2*(40*52)
     
-    c = (h + wage_shock[:,0] -(1+r)*debt_range[np.array(b,dtype="int")]-tuition_agents(conterfactual,j))
+    c = (h + wage_shock[:,0] + budget_psi
+         -(1+r)*debt_range[np.array(b,dtype="int")]-tuition_agents(conterfactual,j))
     
     c =c[...,None]
     c = np.repeat(c,np.shape(b1)[0],axis=1)
@@ -1551,7 +1558,21 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,psi,j,period,conterfactual,maxdebt):
     c  = c + b2
     #c = check_consumption(c)
 
-    u = 0.1*((0.00001*c)**(1-sigma_u)/(1-sigma_u))
+    sigma_rows = np.asarray(sigma_u, dtype=np.float64)
+    if sigma_rows.ndim == 0:
+        sigma_rows = np.full(c.shape[0], float(sigma_rows))
+    sigma_matrix = sigma_rows[:, None]
+    scaled_c = 0.00001 * c
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = np.where(
+            np.abs(sigma_matrix - 1.0) < 1e-8,
+            0.1 * np.log(scaled_c),
+            0.1 * scaled_c ** (1.0 - sigma_matrix) / (1.0 - sigma_matrix),
+        )
+
+    # Apply exactly the same participation penalty as the SMM loan objective.
+    penalty = bs.debt_penalty(budget_params, x1)[:, None]
+    u = u + penalty * (b1[None, :] > 0.0)
     
     # Incorporate debt  rules! 
     
@@ -1839,6 +1860,13 @@ def tuition_agents(conterfactual,j):
 #param_g = temp_param_g()
 wage_0, params_wage,sigmas,param_grants,param_prob_grants,param_fam,param_prob_grad = load_all_parameters()
 debt_range = get_debt_range()
+budget_params = bs.load(raise_if_missing=False)
+
+def reload_budget_shock_params(raise_if_missing=True):
+    """Reload the shared specification after re-estimating it in this process."""
+    global budget_params
+    budget_params = bs.load(raise_if_missing=raise_if_missing)
+    return budget_params
 
 #n=200000
 #sigma_u = 1.4

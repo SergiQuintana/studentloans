@@ -43,6 +43,7 @@ from model_simulation_em import tuition_agents
 from model_interpolate_terminal import build_interpolator_dictionary
 
 from config import DIR, OUT, EST, ENSURE_DIR
+import budget_shock as bs
 
 # Canonical roots from config (no chdir anywhere)
 PATH_OUT        = DIR["MODEL_OUTPUT"]
@@ -73,31 +74,9 @@ def save_budgetshock_estimates(best_x: np.ndarray, periods: list[int], filename_
     """
     _ensure_est_dir()
 
-    P = len(periods)
     best_x = np.asarray(best_x, dtype=np.float64)
-
-    # unpack (matches minimize_distance_multi)
-    mu_blocks   = best_x[:7*P].reshape(P, 7)
-    sigma_e_vec = best_x[7*P:7*P + P].astype(np.float64)
-    ra_levels   = best_x[7*P + P:7*P + P + 4].astype(np.float64)
-
-    # debt penalty: constant + 3 deviations
-    dp_parinc = best_x[7*P + P + 4:7*P + P + 4 + 4].astype(np.float64)  # [dp0, dp2, dp3, dp4]
-
-    # 1) risk aversion for simulation (your sim loads this)
-    np.save(EST("risk_aversion.npy"), ra_levels)
-
-    # 2) budget shock parametrization for quadrature (your sim loads this)
-    budget_params = {
-        "periods": np.asarray(periods, dtype=np.int64),
-        "mu_blocks": mu_blocks.astype(np.float64),         # shape (P,7)
-        "sigma_e": sigma_e_vec.astype(np.float64),         # shape (P,)
-        "debt_pen_parinc": dp_parinc.astype(np.float64),   # shape (4,) == [dp0,dp2,dp3,dp4]
-    }
-    np.save(EST("budgetshock_params.npy"), budget_params, allow_pickle=True)
-
-    # 3) optional raw vector (useful for debugging/restarts)
-    np.save(EST(f"{filename_prefix}_bestx.npy"), best_x)
+    budget_params = bs.unpack_estimation_vector(best_x, periods)
+    bs.save(budget_params, raw_vector=best_x, filename_prefix=filename_prefix)
 
     print(f"[saved] {EST('risk_aversion.npy')}")
     print(f"[saved] {EST('budgetshock_params.npy')}")
@@ -658,14 +637,11 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
 
     P = len(periods)
 
-    mu_blocks = params[:7*P].reshape(P, 7)
-    sigma_e_vec = params[7*P:7*P + P].astype(np.float64)
-
-    ra_start = 7*P + P
-    ra_levels = params[ra_start:ra_start + 4].astype(np.float64)
-
-    dp_start = ra_start + 4
-    dp0, dp2, dp3, dp4 = params[dp_start:dp_start + 4].astype(np.float64)
+    spec = bs.unpack_estimation_vector(params, periods)
+    mu_blocks = spec["mu_blocks"]
+    sigma_e_vec = spec["sigma_e"]
+    ra_levels = spec["risk_aversion"]
+    dp0, dp2, dp3, dp4 = spec["debt_pen_parinc"]
 
     sim_list = []
     per_period_loss = []
@@ -681,23 +657,9 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
         max_idx = pack["max_idx"]
 
         # period-specific mu params
-        mu0, mu_par2, mu_par3, mu_par4, mu_ab2, mu_ab3, mu_ab4 = mu_blocks[pi, :]
-        sigma_e_p = float(sigma_e_vec[pi])
-
-        par = x1[:, 0].astype(int)  # 1..4
-        ab  = x1[:, 1].astype(int)  # 1..4 (still in mu)
-        par2, par3, par4 = dummies_234(par)
-        ab2_, ab3_, ab4_ = dummies_234(ab)
-
-        mu_i = (mu0
-                + mu_par2*par2 + mu_par3*par3 + mu_par4*par4
-                + mu_ab2*ab2_  + mu_ab3*ab3_  + mu_ab4*ab4_).astype(np.float64)
-
-        # DEBT PENALTY: constant + 3 deviations (par1 gets dp0)
-        debtpen_i = (dp0 + dp2*par2 + dp3*par3 + dp4*par4).astype(np.float64)
-
-        gi = (par - 1).astype(int)  # 0..3
-        sigma_i = ra_levels[gi].astype(np.float64)
+        debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+        sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
+        gi = x1[:, 0].astype(int) - 1
 
         # terminal evaluated by ra group
         n = budget.shape[0]
@@ -716,7 +678,7 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
         sim_draws = np.zeros((24, s), dtype=np.float64)
 
         for k in range(s):
-            e = (mu_i + sigma_e_p * Z[k, :]).astype(np.float64)
+            e = bs.realization(spec, x1, p, Z[k, :]).astype(np.float64)
 
             debt_idx = solve_one_draw_debt_idx_terminal_only(
                 budget=budget,
