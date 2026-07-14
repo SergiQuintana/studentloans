@@ -71,6 +71,7 @@ import model_predict_ccps as mccp
 import model_getccp_sequence as mgs
 from model_interpolate_terminal import build_interp_cache 
 from model_fitloans_dynamic import estimate_budget_shock 
+from latent_types import TYPE_IDS
 #-----------------------------------------------------------------------------------------------#
 
 mu = 0
@@ -185,19 +186,24 @@ if __name__ == '__main__':
     
         print("Predict CCPs after auxiliary model")
     
-        utility_parameters_aux1 = mccp.load_utility_parameters(1)
-        utility_parameters_aux2 = mccp.load_utility_parameters(2)
+        auxiliary_ccp_parameters = {
+            type_id: mccp.load_utility_parameters(type_id)
+            for type_id in TYPE_IDS
+        }
         debt_range = ms.debt_range
     
         pool_obj = multiprocessing.Pool(processes=10)
         args = [
-            (i, ms.invariant_states, ms.debt_range, utility_parameters_aux1, 1)
+            (
+                i,
+                ms.invariant_states,
+                ms.debt_range,
+                auxiliary_ccp_parameters[type_id],
+                type_id,
+            )
+            for type_id in TYPE_IDS
             for i in range(np.shape(ms.invariant_states)[0])
         ]
-        args.extend(
-            (i, ms.invariant_states, ms.debt_range, utility_parameters_aux2, 2)
-            for i in range(np.shape(ms.invariant_states)[0])
-        )
     
         results = pool_obj.starmap(mccp.get_all_ccps, args, chunksize=1)
         pool_obj.close()

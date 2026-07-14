@@ -82,6 +82,13 @@ T = 10
 
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST,LIK
 from tables import write_auxiliary_em_tables
+from latent_types import (
+    TYPE_NAMES,
+    TYPE_SCHOOL,
+    TYPE_GRANT,
+    TYPE_TRANSFER,
+    N_TYPES as N_AUXILIARY_TYPES,
+)
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathout = DIR["MODEL_OUTPUT"]
@@ -3055,24 +3062,9 @@ def logit_margineffect(param,x):
 
 #-----------------------------------------------------------------------------#
 # Eight-type auxiliary EM: schooling x grant x parental transfer
+# The shared ordering is defined in latent_types.py.
 #-----------------------------------------------------------------------------#
 
-TYPE_NAMES = np.array(
-    [
-        "S0G0T0",
-        "S0G0T1",
-        "S0G1T0",
-        "S0G1T1",
-        "S1G0T0",
-        "S1G0T1",
-        "S1G1T0",
-        "S1G1T1",
-    ]
-)
-TYPE_SCHOOL = np.repeat(np.array([0, 1], dtype=int), 4)
-TYPE_GRANT = np.tile(np.repeat(np.array([0, 1], dtype=int), 2), 2)
-TYPE_TRANSFER = np.tile(np.array([0, 1], dtype=int), 4)
-N_AUXILIARY_TYPES = len(TYPE_NAMES)
 MONEY_SCALE = 1000.0
 
 
