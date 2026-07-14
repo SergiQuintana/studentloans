@@ -6,6 +6,7 @@ Created on Thu Feb 15 15:46:43 2024
 """
 import numpy as np
 import scipy
+import argparse
 import os
 import time
 import pandas as pd
@@ -4344,6 +4345,25 @@ total_n_summer  = 9 + 1 # 9 coefficients + 1 type em
 #                       CODE TO IMPLEMENT THE ALGORITHM
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run the auxiliary EM estimator."
+    )
+    parser.add_argument(
+        "--rebuild-data",
+        action="store_true",
+        help=(
+            "Rebuild feasible and superfeasible caches from the raw Model input "
+            "panels before estimation. Use this after rerunning the Stata export."
+        ),
+    )
+    arguments = parser.parse_args()
+    if arguments.rebuild_data:
+        print("Rebuilding feasible auxiliary-data caches from raw panels...", flush=True)
+        get_feasible()
+        get_feasible_pubid()
+        get_superfeasible()
+        get_x_g_superfeasible()
+        print("Finished rebuilding auxiliary-data caches.", flush=True)
     pi, xnew, q = perform_em(2)
 
 #.............................................................................#
