@@ -54,17 +54,38 @@ FINANCIAL_X_NAMES = X1_NAMES + (
     "full_time",
 )
 GRANT_X_NAMES = X1_NAMES + ("part_time", "full_time")
+LOAN_X_NAMES = X1_NAMES + ("grants_thousands", "transfers_thousands")
 GRANT_EDUCATION_NAMES = {1: "Two-year", 2: "Four-year", 3: "Graduate"}
 
 
 def _type_layout(number_types: int):
     """Return labels/dimensions, including support for legacy checkpoints."""
+    if number_types == 16:
+        components = [
+            (school, grant, transfer, loan)
+            for school in (0, 1)
+            for grant in (0, 1)
+            for transfer in (0, 1)
+            for loan in (0, 1)
+        ]
+        label = lambda value: "1 (high)" if value else "0 (baseline)"
+        return {
+            "names": tuple(
+                f"S{school}G{grant}T{transfer}L{loan}"
+                for school, grant, transfer, loan in components
+            ),
+            "school": tuple(label(row[0]) for row in components),
+            "grant": tuple(label(row[1]) for row in components),
+            "transfer": tuple(label(row[2]) for row in components),
+            "loan": tuple(label(row[3]) for row in components),
+        }
     if number_types == 8:
         return {
             "names": TYPE_NAMES,
             "school": SCHOOL_TYPE,
             "grant": GRANT_TYPE,
             "transfer": TRANSFER_TYPE,
+            "loan": ("0 (baseline)",) * 8,
         }
     if number_types == 4:
         # In the old model the same resource type entered both equations.
@@ -74,8 +95,11 @@ def _type_layout(number_types: int):
             "school": ("0 (baseline)", "0 (baseline)", "1 (high)", "1 (high)"),
             "grant": resource,
             "transfer": resource,
+            "loan": ("0 (baseline)",) * 4,
         }
-    raise ValueError(f"Expected 8 new types (or 4 legacy types), received {number_types}.")
+    raise ValueError(
+        f"Expected 16 current types (or 8/4 legacy types), received {number_types}."
+    )
 
 
 def _choice_parameter_names(number_parameters: int) -> list[str]:
@@ -121,6 +145,7 @@ def _parameter_rows(
     measure_summer,
     grant_parameters,
     transfer_parameters,
+    loan_parameters,
     type_layout,
 ):
     rows = []
@@ -137,6 +162,8 @@ def _parameter_rows(
                 dimension = "Grant"
             elif "parental_transfer_type" in name:
                 dimension = "Parental transfer"
+            elif "loan_type" in name:
+                dimension = "Loan"
             rows.append(
                 {
                     "iteration": int(iteration),
@@ -176,6 +203,15 @@ def _parameter_rows(
     add("Transfer", "Log positive amount", transfer_names, transfer_parameters["amount"])
     add("Transfer", "Log positive amount", ("sigma",), (transfer_parameters["sigma"],))
 
+    if loan_parameters is not None:
+        loan_names = LOAN_X_NAMES + ("high_loan_type",)
+        for education in (1, 2, 3):
+            parameters = loan_parameters[education]
+            component = f"Loan: {GRANT_EDUCATION_NAMES[education]}"
+            add(component, "Receipt logit", loan_names, parameters["receipt"])
+            add(component, "Log positive amount", loan_names, parameters["amount"])
+            add(component, "Log positive amount", ("sigma",), (parameters["sigma"],))
+
     add(
         "Type distribution",
         "Prior probability",
@@ -195,6 +231,7 @@ def _prior_table(iteration, pi, type_layout):
             "schooling_type": type_layout["school"],
             "grant_type": type_layout["grant"],
             "parental_transfer_type": type_layout["transfer"],
+            "loan_type": type_layout["loan"],
             "prior_probability": pi,
             "prior_percent": 100.0 * pi,
         }
@@ -216,6 +253,7 @@ def _probability_rows(iteration, outcome, x, parameters, varying_dimension, type
         "Schooling": type_layout["school"],
         "Grant": type_layout["grant"],
         "Parental transfer": type_layout["transfer"],
+        "Loan": type_layout["loan"],
     }[varying_dimension]
     for value in dimension_values:
         is_high = value == "1 (high)"
@@ -229,16 +267,18 @@ def _probability_rows(iteration, outcome, x, parameters, varying_dimension, type
             "schooling_type": school,
             "grant_type": grant,
             "parental_transfer_type": transfer,
+            "loan_type": loan,
             "varying_type_dimension": varying_dimension,
             "average_predicted_probability": probability,
             "marginal_effect_vs_all_baseline": probability - reference,
             "marginal_effect_percentage_points": 100.0 * (probability - reference),
         }
-        for type_name, school, grant, transfer, probability in zip(
+        for type_name, school, grant, transfer, loan, probability in zip(
             type_layout["names"],
             type_layout["school"],
             type_layout["grant"],
             type_layout["transfer"],
+            type_layout["loan"],
             probabilities,
         )
     ]
@@ -250,6 +290,7 @@ def _marginal_effect_table(
     measure_summer,
     grant_parameters,
     transfer_parameters,
+    loan_parameters,
     auxiliary_data,
     type_layout,
 ):
@@ -304,6 +345,18 @@ def _marginal_effect_table(
             type_layout,
         )
     )
+    if loan_parameters is not None:
+        for education in (1, 2, 3):
+            rows.extend(
+                _probability_rows(
+                    iteration,
+                    f"Receive loan: {GRANT_EDUCATION_NAMES[education]}",
+                    auxiliary_data["loan"][education]["x"],
+                    loan_parameters[education]["receipt"],
+                    "Loan",
+                    type_layout,
+                )
+            )
     rows.extend(
         _probability_rows(
             iteration,
@@ -386,6 +439,7 @@ def write_auxiliary_em_tables(
     measure_summer,
     grant_parameters,
     transfer_parameters,
+    loan_parameters,
     auxiliary_data,
     output_root=None,
 ):
@@ -405,6 +459,7 @@ def write_auxiliary_em_tables(
             measure_summer,
             grant_parameters,
             transfer_parameters,
+            loan_parameters,
             type_layout,
         ),
         "type_prior_probabilities": _prior_table(iteration, pi, type_layout),
@@ -414,6 +469,7 @@ def write_auxiliary_em_tables(
             measure_summer,
             grant_parameters,
             transfer_parameters,
+            loan_parameters,
             auxiliary_data,
             type_layout,
         ),
@@ -434,8 +490,7 @@ def _load_auxiliary_data():
 
     (
         choices_all,
-        _vjt_low,
-        _vjt_high,
+        _vjt_all_types,
         x1_new,
         choices_array_all,
         x_change,
@@ -494,6 +549,16 @@ def main():
             }
             for index, education in enumerate((1, 2, 3))
         }
+    loan_parameters = None
+    if "loan_receipt" in checkpoint.files:
+        loan_parameters = {
+            education: {
+                "receipt": checkpoint["loan_receipt"][index],
+                "amount": checkpoint["loan_amount"][index],
+                "sigma": float(checkpoint["loan_sigma"][index]),
+            }
+            for index, education in enumerate((1, 2, 3))
+        }
     paths = write_auxiliary_em_tables(
         iteration=iteration,
         pi=checkpoint["pi"],
@@ -506,6 +571,7 @@ def main():
             "amount": checkpoint["transfer_amount"],
             "sigma": float(checkpoint["transfer_sigma"]),
         },
+        loan_parameters=loan_parameters,
         auxiliary_data=auxiliary_data,
     )
     print(f"Auxiliary EM tables written to {paths['iteration_dir']}", flush=True)
