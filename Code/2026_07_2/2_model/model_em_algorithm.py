@@ -13,9 +13,11 @@ import pandas as pd
 # Numba is optional. The auxiliary estimator remains correct without it, while
 # server environments that provide Numba retain the legacy acceleration.
 try:
-    from numba import njit, jit, prange
+    from numba import njit, jit, prange, get_num_threads, set_num_threads
     from numba.core.errors import NumbaPendingDeprecationWarning, NumbaDeprecationWarning
+    NUMBA_AVAILABLE = True
 except ImportError:
+    NUMBA_AVAILABLE = False
     def njit(*decorator_args, **decorator_kwargs):
         if decorator_args and callable(decorator_args[0]) and len(decorator_args) == 1:
             return decorator_args[0]
@@ -23,6 +25,13 @@ except ImportError:
 
     jit = njit
     prange = range
+
+    def get_num_threads():
+        return 1
+
+    def set_num_threads(number_threads):
+        if int(number_threads) != 1:
+            raise RuntimeError("Numba is unavailable; only one Python thread can be used.")
 
     class NumbaPendingDeprecationWarning(Warning):
         pass
@@ -3665,8 +3674,8 @@ def auxiliary_choice_log_likelihoods(choice_parameters, auxiliary_data, expected
     return loglike
 
 
-def auxiliary_choice_objective(choice_parameters, auxiliary_data, expected_consumption, q):
-    """Weighted eight-type choice likelihood with the legacy analytic score."""
+def auxiliary_choice_objective_legacy(choice_parameters, auxiliary_data, expected_consumption, q):
+    """Reference eight-type objective using the original analytical score path."""
     utility_parameters, alpha_c, alpha_b, consumption_by_resource_type = (
         _choice_components(choice_parameters, auxiliary_data, expected_consumption)
     )
@@ -3752,6 +3761,311 @@ def auxiliary_choice_objective(choice_parameters, auxiliary_data, expected_consu
 
     gradient = np.concatenate((legacy_gradient, resource_gradient))
     return -float(loglike), -gradient
+
+
+@njit(parallel=True)
+def _parallel_type_probabilities(
+    g_school,
+    consumption_by_resource,
+    debt_regressor,
+    feasible,
+    chosen,
+    alpha_c,
+    alpha_b,
+    type_school,
+    type_grant,
+    type_transfer,
+):
+    """Stable softmax for every individual/type row in parallel."""
+    ntypes = type_school.shape[0]
+    nobs = g_school.shape[1]
+    nchoices = g_school.shape[2]
+    probability = np.zeros((ntypes, nobs, nchoices), dtype=np.float64)
+    chosen_log_probability = np.empty((ntypes, nobs), dtype=np.float64)
+
+    for flat_index in prange(ntypes * nobs):
+        latent_type = flat_index // nobs
+        individual = flat_index - latent_type * nobs
+        school_type = type_school[latent_type]
+        resource_type = 2 * type_grant[latent_type] + type_transfer[latent_type]
+
+        maximum = -np.inf
+        chosen_utility = -np.inf
+        for alternative in range(nchoices):
+            if feasible[individual, alternative]:
+                utility = (
+                    g_school[school_type, individual, alternative]
+                    + alpha_c
+                    * consumption_by_resource[resource_type, individual, alternative]
+                    + alpha_b * debt_regressor[individual, alternative]
+                )
+                if utility > maximum:
+                    maximum = utility
+                if alternative == chosen[individual]:
+                    chosen_utility = utility
+
+        denominator = 0.0
+        for alternative in range(nchoices):
+            if feasible[individual, alternative]:
+                utility = (
+                    g_school[school_type, individual, alternative]
+                    + alpha_c
+                    * consumption_by_resource[resource_type, individual, alternative]
+                    + alpha_b * debt_regressor[individual, alternative]
+                )
+                denominator += np.exp(utility - maximum)
+
+        log_denominator = maximum + np.log(denominator)
+        chosen_log_probability[latent_type, individual] = (
+            chosen_utility - log_denominator
+        )
+        for alternative in range(nchoices):
+            if feasible[individual, alternative]:
+                utility = (
+                    g_school[school_type, individual, alternative]
+                    + alpha_c
+                    * consumption_by_resource[resource_type, individual, alternative]
+                    + alpha_b * debt_regressor[individual, alternative]
+                )
+                probability[latent_type, individual, alternative] = np.exp(
+                    utility - log_denominator
+                )
+
+    return probability, chosen_log_probability
+
+
+@njit(parallel=True)
+def _weighted_probability_by_school(probability, q, type_school):
+    """Collapse type-specific probabilities using current posterior weights."""
+    ntypes, nobs, nchoices = probability.shape
+    weighted_all = np.zeros((nobs, nchoices), dtype=np.float64)
+    weighted_high_school = np.zeros((nobs, nchoices), dtype=np.float64)
+    q_all = np.zeros(nobs, dtype=np.float64)
+    q_high_school = np.zeros(nobs, dtype=np.float64)
+
+    for individual in prange(nobs):
+        for latent_type in range(ntypes):
+            weight = q[individual, latent_type]
+            q_all[individual] += weight
+            if type_school[latent_type] == 1:
+                q_high_school[individual] += weight
+            for alternative in range(nchoices):
+                contribution = weight * probability[latent_type, individual, alternative]
+                weighted_all[individual, alternative] += contribution
+                if type_school[latent_type] == 1:
+                    weighted_high_school[individual, alternative] += contribution
+    return weighted_all, weighted_high_school, q_all, q_high_school
+
+
+@njit(parallel=True)
+def _parallel_column_score(score_residual, individual_regressor):
+    """Reduce independent analytical score columns across individuals."""
+    nobs, nparameters = score_residual.shape
+    result = np.zeros(nparameters, dtype=np.float64)
+    for parameter in prange(nparameters):
+        total = 0.0
+        for individual in range(nobs):
+            total += (
+                score_residual[individual, parameter]
+                * individual_regressor[individual, parameter]
+            )
+        result[parameter] = total
+    return result
+
+
+def _legacy_individual_regressors(period_data):
+    """Individual-side regressors in the exact 602-parameter legacy ordering."""
+    nobs = period_data["x1"].shape[0]
+    regressors = np.zeros((nobs, total_n_choice_legacy), dtype=float)
+    cursor = 0
+
+    # Alternative groups x the nine invariant characteristics.
+    for group in range(1 + fields + 1 + occupations):
+        regressors[:, cursor + 9 * group:cursor + 9 * (group + 1)] = period_data["x1"]
+    cursor += 9 * (1 + fields + 1 + occupations)
+
+    # Work-choice parameters.
+    work_count = 2 + 2 * fields + occupations + 2
+    regressors[:, cursor:cursor + work_count] = 1.0
+    cursor += work_count
+
+    # Previous-choice parameters.
+    previous_affects = build_previous_affects(period_data["x_change"])
+    previous_count = 1 + fields + occupations
+    regressors[:, cursor:cursor + previous_count] = previous_affects
+    cursor += previous_count
+
+    # Education/occupation complementarities.
+    x_educ = period_data["x_educ"]
+    education_columns = (
+        tuple(range(9))
+        + (0, 2, 7, 8)
+        + (4, 5, 7, 8)
+        + (3, 4, 5, 6, 8)
+        + (0, 5, 8)
+        + (0, 2, 6, 8)
+        + tuple(range(9))
+        + tuple(range(9))
+    )
+    regressors[:, cursor:cursor + len(education_columns)] = x_educ[:, education_columns]
+    cursor += len(education_columns)
+
+    period = int(period_data["period"])
+    period_groups = 1 + fields + occupations
+    period_slots = T - 2
+    if period > 1:
+        for group in range(period_groups):
+            regressors[:, cursor + group * period_slots + period - 2] = 1.0
+    cursor += period_groups * period_slots
+    graduate_period_slots = T - 5 - 1
+    if period > 5:
+        regressors[:, cursor + period - 6] = 1.0
+    cursor += graduate_period_slots
+
+    # Period-by-work effects.
+    if period > 1:
+        for group in range(3):
+            regressors[:, cursor + group * period_slots + period - 2] = 1.0
+    cursor += 3 * period_slots
+    if period > 5:
+        for group in range(2):
+            regressors[:, cursor + group * graduate_period_slots + period - 6] = 1.0
+    cursor += 2 * graduate_period_slots
+
+    regressors[:, cursor] = period_data["x_first2"][:, 0]
+    cursor += 1
+    regressors[:, cursor:cursor + 4] = period_data["x_first4"]
+    cursor += 4
+    if period > 5:
+        regressors[:, cursor] = period_data["x_firstgrad"][:, 0]
+    cursor += 1
+
+    # Seven field groups, each with the same 24 experience/ability regressors.
+    experience_width = period_data["x_exp"].shape[1]
+    for group in range(fields - 1):
+        regressors[
+            :, cursor + group * experience_width:cursor + (group + 1) * experience_width
+        ] = period_data["x_exp"]
+    cursor += (fields - 1) * experience_width
+
+    # The last two parameters are the high-schooling-type utility shifts.
+    regressors[:, cursor:cursor + 2] = 1.0
+    cursor += 2
+    if cursor != total_n_choice_legacy:
+        raise RuntimeError(
+            f"Legacy regressor map produced {cursor} parameters; expected "
+            f"{total_n_choice_legacy}."
+        )
+    return regressors
+
+
+def auxiliary_choice_objective_parallel(
+    choice_parameters, auxiliary_data, expected_consumption, q
+):
+    """Weighted choice likelihood with batched, parallel closed-form score."""
+    utility_parameters, alpha_c, alpha_b, consumption_by_resource_type = (
+        _choice_components(choice_parameters, auxiliary_data, expected_consumption)
+    )
+    affected = np.asarray(map_param_to_choice(fields, occupations), dtype=float)
+    common_count = total_n_choice_legacy - 2
+    legacy_gradient = np.zeros(total_n_choice_legacy, dtype=float)
+    resource_gradient = np.zeros(2, dtype=float)
+    loglike = 0.0
+
+    for period_index, period_data in enumerate(auxiliary_data["periods"]):
+        g_school = np.stack(
+            [
+                get_all_g(
+                    utility_parameters,
+                    period_data["x1"],
+                    period_data["x_change"],
+                    period_data["x_educ"],
+                    period_data["x_first2"],
+                    period_data["x_first4"],
+                    period_data["x_firstgrad"],
+                    period_data["x_exp"],
+                    period_data["period"],
+                    school_type + 1,
+                )
+                for school_type in (0, 1)
+            ],
+            axis=0,
+        )
+        debt_regressor = (
+            period_data["debt_dollars"][:, None]
+            * auxiliary_data["nonhome"][None, :]
+            / MONEY_SCALE
+        )
+        consumption_by_resource = np.stack(
+            [
+                consumption_by_resource_type[resource][period_index] / MONEY_SCALE
+                for resource in range(4)
+            ],
+            axis=0,
+        )
+        probability, chosen_log_probability = _parallel_type_probabilities(
+            np.ascontiguousarray(g_school),
+            np.ascontiguousarray(consumption_by_resource),
+            np.ascontiguousarray(debt_regressor),
+            np.ascontiguousarray(period_data["feasible"]),
+            np.ascontiguousarray(period_data["chosen_index"], dtype=np.int64),
+            alpha_c,
+            alpha_b,
+            TYPE_SCHOOL,
+            TYPE_GRANT,
+            TYPE_TRANSFER,
+        )
+        loglike += float(np.sum(q.T * chosen_log_probability))
+
+        weighted_probability, weighted_high, q_all, q_high = (
+            _weighted_probability_by_school(probability, q, TYPE_SCHOOL)
+        )
+        chosen = np.asarray(period_data["chosen_index"], dtype=int)
+        regressors = _legacy_individual_regressors(period_data)
+
+        expected_common = weighted_probability @ affected[:common_count].T
+        chosen_common = affected[:common_count, chosen].T * q_all[:, None]
+        legacy_gradient[:common_count] += _parallel_column_score(
+            chosen_common - expected_common,
+            regressors[:, :common_count],
+        )
+
+        expected_type = weighted_high @ affected[common_count:].T
+        chosen_type = affected[common_count:, chosen].T * q_high[:, None]
+        legacy_gradient[common_count:] += _parallel_column_score(
+            chosen_type - expected_type,
+            regressors[:, common_count:],
+        )
+
+        rows = np.arange(len(chosen))
+        resource_gradient[1] += np.sum(
+            q_all * debt_regressor[rows, chosen]
+            - np.sum(weighted_probability * debt_regressor, axis=1)
+        )
+        for latent_type in range(N_AUXILIARY_TYPES):
+            resource_index = 2 * TYPE_GRANT[latent_type] + TYPE_TRANSFER[latent_type]
+            consumption = consumption_by_resource[resource_index]
+            resource_gradient[0] += np.sum(
+                q[:, latent_type]
+                * (
+                    consumption[rows, chosen]
+                    - np.sum(probability[latent_type] * consumption, axis=1)
+                )
+            )
+
+    gradient = np.concatenate((legacy_gradient, resource_gradient))
+    return -float(loglike), -gradient
+
+
+def auxiliary_choice_objective(choice_parameters, auxiliary_data, expected_consumption, q):
+    """Active analytical objective; set AUXILIARY_LEGACY_JACOBIAN=1 to fall back."""
+    if os.environ.get("AUXILIARY_LEGACY_JACOBIAN", "0") == "1":
+        return auxiliary_choice_objective_legacy(
+            choice_parameters, auxiliary_data, expected_consumption, q
+        )
+    return auxiliary_choice_objective_parallel(
+        choice_parameters, auxiliary_data, expected_consumption, q
+    )
 
 
 def estimate_school_measure(initial, x, outcome, q_school):
@@ -3855,6 +4169,10 @@ def perform_em(
     progress(
         "Starting eight-type auxiliary estimation "
         f"(max_iterations={max_iterations}, tolerance={tolerance:g})"
+    )
+    progress(
+        "Analytical choice objective: parallel probability/score path | "
+        f"Numba available={NUMBA_AVAILABLE}, threads={get_num_threads()}"
     )
 
     # Load choice arrays and all fixed data once.
@@ -4356,7 +4674,20 @@ if __name__ == "__main__":
             "panels before estimation. Use this after rerunning the Stata export."
         ),
     )
+    parser.add_argument(
+        "--numba-threads",
+        type=int,
+        default=None,
+        help=(
+            "Set the Numba worker count for the parallel probability and closed-form "
+            "score kernels. By default Numba uses all CPUs visible to the process."
+        ),
+    )
     arguments = parser.parse_args()
+    if arguments.numba_threads is not None:
+        if arguments.numba_threads < 1:
+            parser.error("--numba-threads must be positive.")
+        set_num_threads(arguments.numba_threads)
     if arguments.rebuild_data:
         print("Rebuilding feasible auxiliary-data caches from raw panels...", flush=True)
         get_feasible()
