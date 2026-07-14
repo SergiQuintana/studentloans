@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Produce reporting tables for the four-type auxiliary EM estimator.
+"""Produce reporting tables for the auxiliary latent-type EM estimator.
 
 The EM routine calls :func:`write_auxiliary_em_tables` after every iteration.
 This file can also be run after estimation to recreate the tables from the
@@ -18,9 +18,24 @@ from scipy.special import expit
 from config import EST, OUT
 
 
-TYPE_NAMES = ("LL", "LH", "HL", "HH")
-SCHOOL_TYPE = ("Low", "Low", "High", "High")
-FINANCIAL_TYPE = ("Low", "High", "Low", "High")
+TYPE_NAMES = (
+    "S0G0T0",
+    "S0G0T1",
+    "S0G1T0",
+    "S0G1T1",
+    "S1G0T0",
+    "S1G0T1",
+    "S1G1T0",
+    "S1G1T1",
+)
+SCHOOL_TYPE = ("0 (baseline)",) * 4 + ("1 (high)",) * 4
+GRANT_TYPE = (
+    "0 (baseline)",
+    "0 (baseline)",
+    "1 (high)",
+    "1 (high)",
+) * 2
+TRANSFER_TYPE = ("0 (baseline)", "1 (high)") * 4
 X1_NAMES = (
     "constant",
     "parent_income_q2",
@@ -38,6 +53,29 @@ FINANCIAL_X_NAMES = X1_NAMES + (
     "part_time",
     "full_time",
 )
+GRANT_X_NAMES = X1_NAMES + ("part_time", "full_time")
+GRANT_EDUCATION_NAMES = {1: "Two-year", 2: "Four-year", 3: "Graduate"}
+
+
+def _type_layout(number_types: int):
+    """Return labels/dimensions, including support for legacy checkpoints."""
+    if number_types == 8:
+        return {
+            "names": TYPE_NAMES,
+            "school": SCHOOL_TYPE,
+            "grant": GRANT_TYPE,
+            "transfer": TRANSFER_TYPE,
+        }
+    if number_types == 4:
+        # In the old model the same resource type entered both equations.
+        resource = ("0 (baseline)", "1 (high)", "0 (baseline)", "1 (high)")
+        return {
+            "names": ("LL", "LH", "HL", "HH"),
+            "school": ("0 (baseline)", "0 (baseline)", "1 (high)", "1 (high)"),
+            "grant": resource,
+            "transfer": resource,
+        }
+    raise ValueError(f"Expected 8 new types (or 4 legacy types), received {number_types}.")
 
 
 def _choice_parameter_names(number_parameters: int) -> list[str]:
@@ -83,6 +121,7 @@ def _parameter_rows(
     measure_summer,
     grant_parameters,
     transfer_parameters,
+    type_layout,
 ):
     rows = []
 
@@ -94,8 +133,10 @@ def _parameter_rows(
             dimension = type_dimension
             if "schooling_type" in name:
                 dimension = "Schooling"
-            elif "financial_type" in name:
-                dimension = "Financial resources"
+            elif "grant_type" in name:
+                dimension = "Grant"
+            elif "parental_transfer_type" in name:
+                dimension = "Parental transfer"
             rows.append(
                 {
                     "iteration": int(iteration),
@@ -117,42 +158,50 @@ def _parameter_rows(
     add("Schooling measure", "Late school", measure_names, measure_late)
     add("Schooling measure", "Summer class", measure_names, measure_summer)
 
-    financial_names = FINANCIAL_X_NAMES + ("high_financial_type",)
-    for source_name, parameters in (
-        ("Grant", grant_parameters),
-        ("Transfer", transfer_parameters),
-    ):
-        add(source_name, "Receipt logit", financial_names, parameters["receipt"])
-        add(source_name, "Log positive amount", financial_names, parameters["amount"])
-        add(source_name, "Log positive amount", ("sigma",), (parameters["sigma"],))
+    grant_names = GRANT_X_NAMES + ("high_grant_type",)
+    if "receipt" in grant_parameters:  # legacy pooled checkpoint
+        add("Grant", "Receipt logit", FINANCIAL_X_NAMES + ("high_grant_type",), grant_parameters["receipt"])
+        add("Grant", "Log positive amount", FINANCIAL_X_NAMES + ("high_grant_type",), grant_parameters["amount"])
+        add("Grant", "Log positive amount", ("sigma",), (grant_parameters["sigma"],))
+    else:
+        for education in (1, 2, 3):
+            parameters = grant_parameters[education]
+            component = f"Grant: {GRANT_EDUCATION_NAMES[education]}"
+            add(component, "Receipt logit", grant_names, parameters["receipt"])
+            add(component, "Log positive amount", grant_names, parameters["amount"])
+            add(component, "Log positive amount", ("sigma",), (parameters["sigma"],))
+
+    transfer_names = FINANCIAL_X_NAMES + ("high_parental_transfer_type",)
+    add("Transfer", "Receipt logit", transfer_names, transfer_parameters["receipt"])
+    add("Transfer", "Log positive amount", transfer_names, transfer_parameters["amount"])
+    add("Transfer", "Log positive amount", ("sigma",), (transfer_parameters["sigma"],))
 
     add(
         "Type distribution",
         "Prior probability",
-        tuple(f"prior_probability_{name}" for name in TYPE_NAMES),
+        tuple(f"prior_probability_{name}" for name in type_layout["names"]),
         pi,
         "Joint type",
     )
     return pd.DataFrame(rows)
 
 
-def _prior_table(iteration, pi):
+def _prior_table(iteration, pi, type_layout):
     pi = np.asarray(pi, dtype=float).reshape(-1)
-    if len(pi) != 4:
-        raise ValueError("The four-type table requires four prior probabilities.")
     return pd.DataFrame(
         {
             "iteration": int(iteration),
-            "type": TYPE_NAMES,
-            "schooling_type": SCHOOL_TYPE,
-            "financial_resources_type": FINANCIAL_TYPE,
+            "type": type_layout["names"],
+            "schooling_type": type_layout["school"],
+            "grant_type": type_layout["grant"],
+            "parental_transfer_type": type_layout["transfer"],
             "prior_probability": pi,
             "prior_percent": 100.0 * pi,
         }
     )
 
 
-def _probability_rows(iteration, outcome, x, parameters, varying_dimension):
+def _probability_rows(iteration, outcome, x, parameters, varying_dimension, type_layout):
     x = np.asarray(x, dtype=float)
     parameters = np.asarray(parameters, dtype=float).reshape(-1)
     if x.shape[1] + 1 != len(parameters):
@@ -163,8 +212,13 @@ def _probability_rows(iteration, outcome, x, parameters, varying_dimension):
     low = float(np.mean(expit(x @ parameters[:-1])))
     high = float(np.mean(expit(x @ parameters[:-1] + parameters[-1])))
     probabilities = []
-    for school, financial in zip(SCHOOL_TYPE, FINANCIAL_TYPE):
-        is_high = financial == "High" if varying_dimension == "Financial resources" else school == "High"
+    dimension_values = {
+        "Schooling": type_layout["school"],
+        "Grant": type_layout["grant"],
+        "Parental transfer": type_layout["transfer"],
+    }[varying_dimension]
+    for value in dimension_values:
+        is_high = value == "1 (high)"
         probabilities.append(high if is_high else low)
     reference = probabilities[0]
     return [
@@ -173,14 +227,19 @@ def _probability_rows(iteration, outcome, x, parameters, varying_dimension):
             "outcome": outcome,
             "type": type_name,
             "schooling_type": school,
-            "financial_resources_type": financial,
+            "grant_type": grant,
+            "parental_transfer_type": transfer,
             "varying_type_dimension": varying_dimension,
             "average_predicted_probability": probability,
-            "marginal_effect_vs_LL": probability - reference,
+            "marginal_effect_vs_all_baseline": probability - reference,
             "marginal_effect_percentage_points": 100.0 * (probability - reference),
         }
-        for type_name, school, financial, probability in zip(
-            TYPE_NAMES, SCHOOL_TYPE, FINANCIAL_TYPE, probabilities
+        for type_name, school, grant, transfer, probability in zip(
+            type_layout["names"],
+            type_layout["school"],
+            type_layout["grant"],
+            type_layout["transfer"],
+            probabilities,
         )
     ]
 
@@ -192,24 +251,57 @@ def _marginal_effect_table(
     grant_parameters,
     transfer_parameters,
     auxiliary_data,
+    type_layout,
 ):
     rows = []
-    rows.extend(
-        _probability_rows(
-            iteration,
-            "Receive grant",
-            auxiliary_data["grant"]["x"],
-            grant_parameters["receipt"],
-            "Financial resources",
+    if "receipt" in grant_parameters:  # legacy pooled checkpoint
+        if "x" in auxiliary_data["grant"]:
+            legacy_grant_x = auxiliary_data["grant"]["x"]
+        else:
+            legacy_parts = []
+            for education in (1, 2, 3):
+                grant_x = auxiliary_data["grant"][education]["x"]
+                legacy_parts.append(
+                    np.column_stack(
+                        (
+                            grant_x[:, :9],
+                            np.full(len(grant_x), education == 2),
+                            np.full(len(grant_x), education == 3),
+                            grant_x[:, 9:],
+                        )
+                    ).astype(float)
+                )
+            legacy_grant_x = np.concatenate(legacy_parts, axis=0)
+        rows.extend(
+            _probability_rows(
+                iteration,
+                "Receive grant",
+                legacy_grant_x,
+                grant_parameters["receipt"],
+                "Grant",
+                type_layout,
+            )
         )
-    )
+    else:
+        for education in (1, 2, 3):
+            rows.extend(
+                _probability_rows(
+                    iteration,
+                    f"Receive grant: {GRANT_EDUCATION_NAMES[education]}",
+                    auxiliary_data["grant"][education]["x"],
+                    grant_parameters[education]["receipt"],
+                    "Grant",
+                    type_layout,
+                )
+            )
     rows.extend(
         _probability_rows(
             iteration,
             "Receive transfer",
             auxiliary_data["transfer"]["x"],
             transfer_parameters["receipt"],
-            "Financial resources",
+            "Parental transfer",
+            type_layout,
         )
     )
     rows.extend(
@@ -219,6 +311,7 @@ def _marginal_effect_table(
             auxiliary_data["x1_measure"],
             measure_late,
             "Schooling",
+            type_layout,
         )
     )
     rows.extend(
@@ -228,6 +321,7 @@ def _marginal_effect_table(
             auxiliary_data["x1_measure"],
             measure_summer,
             "Schooling",
+            type_layout,
         )
     )
     return pd.DataFrame(rows)
@@ -299,6 +393,8 @@ def write_auxiliary_em_tables(
     root = Path(output_root or OUT("tables", "auxiliary_em"))
     iteration_directory = root / "iterations" / f"iteration_{int(iteration):04d}"
     latest_directory = root / "latest"
+    pi = np.asarray(pi, dtype=float).reshape(-1)
+    type_layout = _type_layout(len(pi))
 
     tables = {
         "estimated_parameters": _parameter_rows(
@@ -309,8 +405,9 @@ def write_auxiliary_em_tables(
             measure_summer,
             grant_parameters,
             transfer_parameters,
+            type_layout,
         ),
-        "type_prior_probabilities": _prior_table(iteration, pi),
+        "type_prior_probabilities": _prior_table(iteration, pi, type_layout),
         "type_marginal_effects": _marginal_effect_table(
             iteration,
             measure_late,
@@ -318,6 +415,7 @@ def write_auxiliary_em_tables(
             grant_parameters,
             transfer_parameters,
             auxiliary_data,
+            type_layout,
         ),
     }
     for stem, table in tables.items():
@@ -380,17 +478,29 @@ def main():
     if iteration is None:
         iteration = max(1, len(checkpoint["observed_loglike"]) - 1)
     auxiliary_data = _load_auxiliary_data()
+    grant_receipt = checkpoint["grant_receipt"]
+    if grant_receipt.ndim == 1:
+        grant_parameters = {
+            "receipt": grant_receipt,
+            "amount": checkpoint["grant_amount"],
+            "sigma": float(checkpoint["grant_sigma"]),
+        }
+    else:
+        grant_parameters = {
+            education: {
+                "receipt": grant_receipt[index],
+                "amount": checkpoint["grant_amount"][index],
+                "sigma": float(checkpoint["grant_sigma"][index]),
+            }
+            for index, education in enumerate((1, 2, 3))
+        }
     paths = write_auxiliary_em_tables(
         iteration=iteration,
         pi=checkpoint["pi"],
         choice_parameters=checkpoint["choice_parameters"],
         measure_late=checkpoint["measure_late"],
         measure_summer=checkpoint["measure_summer"],
-        grant_parameters={
-            "receipt": checkpoint["grant_receipt"],
-            "amount": checkpoint["grant_amount"],
-            "sigma": float(checkpoint["grant_sigma"]),
-        },
+        grant_parameters=grant_parameters,
         transfer_parameters={
             "receipt": checkpoint["transfer_receipt"],
             "amount": checkpoint["transfer_amount"],
