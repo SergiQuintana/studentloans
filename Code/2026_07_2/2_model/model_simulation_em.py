@@ -32,6 +32,7 @@ from model_solution_em import (
 from pathlib import Path
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, LIK
 import budget_shock as bs
+from financial_process import load_education_grant_process, expected_grants_vectorized
 pathfunctions   = DIR["MODEL_FUNCOEF"]
 path_realdata   = DIR["MODEL_REALDATA"]
 path_estimates  = DIR["MODEL_ESTIMATES"]
@@ -67,14 +68,7 @@ def load_all_parameters():
     
     # Grants
     
-    param_grants = np.load(f"{pathfunctions}/grants.npy")
-    
-    # Grants Probability
-    
-    pgrants_2 = np.load(f"{pathfunctions}/prob_grants_twoyear.npy")[...,None].T
-    pgrants_4 = np.load(f"{pathfunctions}/prob_grants_fouryear.npy")[...,None].T
-    
-    param_prob_grants = np.concatenate((pgrants_2,pgrants_4),axis=0)
+    grant_process = load_education_grant_process(pathfunctions)
     
     # Parental Transfers
     
@@ -88,7 +82,7 @@ def load_all_parameters():
     
     param_prob_grad = [grad_2,grad_4,grad_grad]
     
-    return wage_0, param_wage,sigmas,param_grants,param_prob_grants,param_fam,param_prob_grad
+    return wage_0, param_wage, sigmas, grant_process, param_fam, param_prob_grad
 
 def initial_state():
 
@@ -1837,9 +1831,10 @@ def fin_help_agents(x1_new,x2,j,period):
     # perform the product.
     
     p_trans =  x@param_fam.T
-    grants =  x@param_grants.T
-    
-    h = np.exp(p_trans) + np.exp(grants)
+    grants = expected_grants_vectorized(
+        x1_new, j[:, 1], j[:, 2], grant_process
+    )
+    h = np.exp(p_trans) + grants
 
     return h
 
@@ -1858,7 +1853,7 @@ def tuition_agents(conterfactual,j):
 
 
 #param_g = temp_param_g()
-wage_0, params_wage,sigmas,param_grants,param_prob_grants,param_fam,param_prob_grad = load_all_parameters()
+wage_0, params_wage, sigmas, grant_process, param_fam, param_prob_grad = load_all_parameters()
 debt_range = get_debt_range()
 budget_params = bs.load(raise_if_missing=False)
 

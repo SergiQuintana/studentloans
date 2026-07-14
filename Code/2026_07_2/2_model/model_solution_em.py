@@ -44,6 +44,7 @@ T = 10
 # major at graduation
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, STATES
 import budget_shock as bs
+from financial_process import load_education_grant_process, expected_grant_scalar
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathcont = DIR["MODEL_CONTINUATION"]
@@ -82,11 +83,7 @@ def load_all_parameters():
 
     sigmas = np.load(f"{pathfunctions}/sigmas.npy")
 
-    param_grants = np.load(f"{pathfunctions}/grants.npy")
-
-    pgrants_2 = np.load(f"{pathfunctions}/prob_grants_twoyear.npy")[..., None].T
-    pgrants_4 = np.load(f"{pathfunctions}/prob_grants_fouryear.npy")[..., None].T
-    param_prob_grants = np.concatenate((pgrants_2, pgrants_4), axis=0)
+    grant_process = load_education_grant_process(pathfunctions)
 
     param_fam = np.load(f"{pathfunctions}/parental_transfers.npy")
 
@@ -99,8 +96,7 @@ def load_all_parameters():
         wage_0,
         param_wage,
         sigmas,
-        param_grants,
-        param_prob_grants,
+        grant_process,
         param_fam,
         param_prob_grad,
     )
@@ -261,8 +257,8 @@ def fin_help(x1_new,x2,j,period):
         x = np.append(x1_new,1) # include 4ydummy
 
     p_trans = x@param_fam
-    grants =  x@param_grants
-    h = np.exp(p_trans) + np.exp(grants)
+    grants = expected_grant_scalar(x1_new, j[1], j[2], grant_process)
+    h = np.exp(p_trans) + grants
     
     return h
 
@@ -3282,7 +3278,7 @@ def get_debt_range():
 #-----------------------------------------------------------------------------#
 
 
-(wage_0, params_wage, sigmas, param_grants, param_prob_grants, param_fam, param_prob_grad) = load_all_parameters()
+(wage_0, params_wage, sigmas, grant_process, param_fam, param_prob_grad) = load_all_parameters()
 sigma_u_parinc, budget_params, debt_pen_vec = load_params_frombudget()
 
 #simulate_all_states(11)

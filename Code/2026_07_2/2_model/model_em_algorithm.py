@@ -4142,6 +4142,8 @@ def perform_em(
     tolerance=3.0e-4,
     return_details=False,
     verbose=True,
+    resume=False,
+    checkpoint_file=None,
 ):
     """Estimate the eight-type schooling x grant x transfer auxiliary model.
 
@@ -4149,6 +4151,8 @@ def perform_em(
     posteriors -> financial M-step -> expected consumption -> choice M-step ->
     schooling-measure M-step -> new likelihoods and posteriors. Wage equations
     are fixed throughout and all invariant arrays are cached before iteration.
+    Set ``resume=True`` to restore the complete saved EM state; otherwise the
+    estimator retains its original fresh-start initialization.
     """
     global total_n_multi
     global total_n_late
@@ -4168,7 +4172,8 @@ def perform_em(
 
     progress(
         "Starting eight-type auxiliary estimation "
-        f"(max_iterations={max_iterations}, tolerance={tolerance:g})"
+        f"(max_iterations={max_iterations}, tolerance={tolerance:g}, "
+        f"resume={resume})"
     )
     progress(
         "Analytical choice objective: parallel probability/score path | "
@@ -4224,34 +4229,188 @@ def perform_em(
     if len(measures) != n:
         raise ValueError("Schooling measures and auxiliary panel have different sample sizes.")
 
-    # Choice parameters retain the old g(.) block and append one common
-    # expected-consumption coefficient and one debt-vs-home coefficient.
-    choice_parameters = np.zeros(total_n_multi, dtype=float)
-    choice_parameters[total_n_choice_legacy - 2:total_n_choice_legacy] = typeffect
-    choice_parameters[total_n_choice_legacy] = 0.05
-    choice_parameters[total_n_choice_legacy + 1] = -0.02
-
-    measure_late = np.zeros(total_n_late, dtype=float)
-    measure_summer = np.zeros(total_n_summer, dtype=float)
-    measure_late[-1] = typeffect
-    measure_summer[-1] = typeffect
-
-    # Positive seeds separately orient grant and parental-transfer labels.
-    resource_type_seed = max(0.05, 0.125 * abs(float(typeffect)))
-
-    step_start = time.perf_counter()
-    progress("Setup 4/7: initializing grant equations...")
-    grant_parameters = initialize_grant_processes(
-        auxiliary_data["grant"], financial_typeeffect=resource_type_seed
+    start_iteration = 0
+    checkpoint_file = (
+        f"{path_estimates}/auxiliary_em_checkpoint.npz"
+        if checkpoint_file is None
+        else os.fspath(checkpoint_file)
     )
-    finish_step("initializing grant equations", step_start)
 
-    step_start = time.perf_counter()
-    progress("Setup 5/7: initializing transfer equations...")
-    transfer_parameters = initialize_financial_source(
-        auxiliary_data["transfer"], financial_typeeffect=resource_type_seed
-    )
-    finish_step("initializing transfer equations", step_start)
+    if resume:
+        step_start = time.perf_counter()
+        progress(f"Setup 4-5/7: loading EM checkpoint {checkpoint_file}...")
+        if not os.path.isfile(checkpoint_file):
+            raise FileNotFoundError(
+                f"Cannot resume auxiliary EM: checkpoint not found: {checkpoint_file}"
+            )
+        required_keys = {
+            "type_names", "type_school", "type_grant", "type_transfer", "pi", "q",
+            "choice_parameters", "measure_late", "measure_summer",
+            "grant_education_levels", "grant_receipt", "grant_amount", "grant_sigma",
+            "transfer_receipt", "transfer_amount", "transfer_sigma",
+            "observed_loglike",
+        }
+        with np.load(checkpoint_file, allow_pickle=False) as checkpoint:
+            missing = sorted(required_keys.difference(checkpoint.files))
+            if missing:
+                raise ValueError(
+                    "Cannot resume auxiliary EM: checkpoint is missing "
+                    + ", ".join(missing)
+                )
+            for key, expected in (
+                ("type_names", TYPE_NAMES),
+                ("type_school", TYPE_SCHOOL),
+                ("type_grant", TYPE_GRANT),
+                ("type_transfer", TYPE_TRANSFER),
+            ):
+                if not np.array_equal(checkpoint[key], expected):
+                    raise ValueError(
+                        f"Cannot resume auxiliary EM: checkpoint {key} does not "
+                        "match the current eight-type ordering."
+                    )
+
+            choice_parameters = np.asarray(checkpoint["choice_parameters"], dtype=float)
+            measure_late = np.asarray(checkpoint["measure_late"], dtype=float)
+            measure_summer = np.asarray(checkpoint["measure_summer"], dtype=float)
+            pinew = np.asarray(checkpoint["pi"], dtype=float)
+            q = np.asarray(checkpoint["q"], dtype=float)
+            loglike_history = list(
+                np.asarray(checkpoint["observed_loglike"], dtype=float).reshape(-1)
+            )
+            education_levels = np.asarray(
+                checkpoint["grant_education_levels"], dtype=int
+            )
+            grant_receipt = np.asarray(checkpoint["grant_receipt"], dtype=float)
+            grant_amount = np.asarray(checkpoint["grant_amount"], dtype=float)
+            grant_sigma = np.asarray(checkpoint["grant_sigma"], dtype=float)
+            transfer_receipt = np.asarray(checkpoint["transfer_receipt"], dtype=float)
+            transfer_amount = np.asarray(checkpoint["transfer_amount"], dtype=float)
+            transfer_sigma = float(np.asarray(checkpoint["transfer_sigma"]).reshape(()))
+
+        expected_shapes = {
+            "choice_parameters": (total_n_multi,),
+            "measure_late": (total_n_late,),
+            "measure_summer": (total_n_summer,),
+            "pi": (N_AUXILIARY_TYPES,),
+            "q": (n, N_AUXILIARY_TYPES),
+        }
+        restored_arrays = {
+            "choice_parameters": choice_parameters,
+            "measure_late": measure_late,
+            "measure_summer": measure_summer,
+            "pi": pinew,
+            "q": q,
+        }
+        for name, expected_shape in expected_shapes.items():
+            if restored_arrays[name].shape != expected_shape:
+                raise ValueError(
+                    f"Cannot resume auxiliary EM: checkpoint {name} has shape "
+                    f"{restored_arrays[name].shape}, expected {expected_shape}."
+                )
+            if not np.all(np.isfinite(restored_arrays[name])):
+                raise ValueError(
+                    f"Cannot resume auxiliary EM: checkpoint {name} contains "
+                    "non-finite values."
+                )
+        if not np.array_equal(education_levels, np.array([1, 2, 3])):
+            raise ValueError(
+                "Cannot resume auxiliary EM: checkpoint grant education levels "
+                "must be [1, 2, 3]."
+            )
+        if not loglike_history or not np.all(np.isfinite(loglike_history)):
+            raise ValueError(
+                "Cannot resume auxiliary EM: observed likelihood history is invalid."
+            )
+        if np.any(pinew <= 0.0) or not np.isclose(pinew.sum(), 1.0, atol=1.0e-8):
+            raise ValueError(
+                "Cannot resume auxiliary EM: prior probabilities must be positive "
+                "and sum to one."
+            )
+        if np.any(q < 0.0) or not np.allclose(q.sum(axis=1), 1.0, atol=1.0e-8):
+            raise ValueError(
+                "Cannot resume auxiliary EM: posterior rows must be nonnegative "
+                "and sum to one."
+            )
+
+        grant_parameters = {}
+        for row, education in enumerate((1, 2, 3)):
+            expected_financial_size = auxiliary_data["grant"][education]["x"].shape[1] + 1
+            if (
+                grant_receipt[row].shape != (expected_financial_size,)
+                or grant_amount[row].shape != (expected_financial_size,)
+            ):
+                raise ValueError(
+                    f"Cannot resume auxiliary EM: grant parameters for education "
+                    f"{education} do not match the current data design."
+                )
+            grant_parameters[education] = {
+                "receipt": grant_receipt[row].copy(),
+                "amount": grant_amount[row].copy(),
+                "sigma": float(grant_sigma[row]),
+                "receipt_success": True,
+                "receipt_message": "Loaded from EM checkpoint",
+            }
+        expected_transfer_size = auxiliary_data["transfer"]["x"].shape[1] + 1
+        if (
+            transfer_receipt.shape != (expected_transfer_size,)
+            or transfer_amount.shape != (expected_transfer_size,)
+        ):
+            raise ValueError(
+                "Cannot resume auxiliary EM: transfer parameters do not match "
+                "the current data design."
+            )
+        transfer_parameters = {
+            "receipt": transfer_receipt.copy(),
+            "amount": transfer_amount.copy(),
+            "sigma": transfer_sigma,
+            "receipt_success": True,
+            "receipt_message": "Loaded from EM checkpoint",
+        }
+        if (
+            np.any(grant_sigma <= 0.0)
+            or not np.all(np.isfinite(grant_sigma))
+            or not np.isfinite(transfer_sigma)
+            or transfer_sigma <= 0.0
+        ):
+            raise ValueError(
+                "Cannot resume auxiliary EM: financial amount standard deviations "
+                "must be finite and positive."
+            )
+        start_iteration = len(loglike_history) - 1
+        finish_step(
+            "loading and validating the EM checkpoint",
+            step_start,
+            extra=f"resuming after iteration {start_iteration}",
+        )
+    else:
+        # Choice parameters retain the old g(.) block and append one common
+        # expected-consumption coefficient and one debt-vs-home coefficient.
+        choice_parameters = np.zeros(total_n_multi, dtype=float)
+        choice_parameters[total_n_choice_legacy - 2:total_n_choice_legacy] = typeffect
+        choice_parameters[total_n_choice_legacy] = 0.05
+        choice_parameters[total_n_choice_legacy + 1] = -0.02
+
+        measure_late = np.zeros(total_n_late, dtype=float)
+        measure_summer = np.zeros(total_n_summer, dtype=float)
+        measure_late[-1] = typeffect
+        measure_summer[-1] = typeffect
+
+        # Positive seeds separately orient grant and parental-transfer labels.
+        resource_type_seed = max(0.05, 0.125 * abs(float(typeffect)))
+
+        step_start = time.perf_counter()
+        progress("Setup 4/7: initializing grant equations...")
+        grant_parameters = initialize_grant_processes(
+            auxiliary_data["grant"], financial_typeeffect=resource_type_seed
+        )
+        finish_step("initializing grant equations", step_start)
+
+        step_start = time.perf_counter()
+        progress("Setup 5/7: initializing transfer equations...")
+        transfer_parameters = initialize_financial_source(
+            auxiliary_data["transfer"], financial_typeeffect=resource_type_seed
+        )
+        finish_step("initializing transfer equations", step_start)
 
     step_start = time.perf_counter()
     progress("Setup 6/7: computing initial expected consumption...")
@@ -4265,25 +4424,33 @@ def perform_em(
     finish_step("initial expected consumption", step_start)
 
     step_start = time.perf_counter()
-    progress("Setup 7/7: computing initial likelihoods and posteriors...")
-    pinew = np.full(N_AUXILIARY_TYPES, 1.0 / N_AUXILIARY_TYPES, dtype=float)
-    q, initial_loglike = all_auxiliary_log_likelihoods(
-        pinew,
-        choice_parameters,
-        measure_late,
-        measure_summer,
-        grant_parameters,
-        transfer_parameters,
-        auxiliary_data,
-        measures,
-        expected_consumption,
-    )
-    finish_step(
-        "initial likelihood and posterior calculation",
-        step_start,
-        extra=f"initial observed log likelihood={initial_loglike:.6f}",
-    )
-    loglike_history = [initial_loglike]
+    if resume:
+        progress("Setup 7/7: using checkpoint likelihood and posterior weights...")
+        finish_step(
+            "restoring likelihood and posterior weights",
+            step_start,
+            extra=f"last observed log likelihood={loglike_history[-1]:.6f}",
+        )
+    else:
+        progress("Setup 7/7: computing initial likelihoods and posteriors...")
+        pinew = np.full(N_AUXILIARY_TYPES, 1.0 / N_AUXILIARY_TYPES, dtype=float)
+        q, initial_loglike = all_auxiliary_log_likelihoods(
+            pinew,
+            choice_parameters,
+            measure_late,
+            measure_summer,
+            grant_parameters,
+            transfer_parameters,
+            auxiliary_data,
+            measures,
+            expected_consumption,
+        )
+        finish_step(
+            "initial likelihood and posterior calculation",
+            step_start,
+            extra=f"initial observed log likelihood={initial_loglike:.6f}",
+        )
+        loglike_history = [initial_loglike]
     xnew = np.concatenate((choice_parameters, measure_late, measure_summer))
     err = np.inf
 
@@ -4296,9 +4463,13 @@ def perform_em(
             [financial_vector(parameters[education]) for education in (1, 2, 3)]
         )
 
-    for iteration in range(max_iterations):
+    for run_iteration in range(max_iterations):
+        iteration = start_iteration + run_iteration
         iteration_start = time.perf_counter()
-        progress(f"Iteration {iteration + 1}/{max_iterations} started")
+        progress(
+            f"Iteration {iteration + 1} started "
+            f"({run_iteration + 1}/{max_iterations} in this run)"
+        )
         pi = pinew.copy()
         q_current = q.copy()
         x0 = xnew.copy()
@@ -4683,7 +4854,37 @@ if __name__ == "__main__":
             "score kernels. By default Numba uses all CPUs visible to the process."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from Model/Estimates/auxiliary_em_checkpoint.npz, restoring "
+            "all parameters, eight-type prior probabilities, posterior weights, "
+            "and likelihood history. Without this flag estimation starts fresh."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default=None,
+        help=(
+            "Optional checkpoint .npz path to use with --resume. The default is "
+            "the current Model/Estimates auxiliary_em_checkpoint.npz."
+        ),
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=250,
+        help=(
+            "Maximum EM iterations for this run (default: 250). With --resume, "
+            "these are additional iterations after the saved checkpoint."
+        ),
+    )
     arguments = parser.parse_args()
+    if arguments.max_iterations < 1:
+        parser.error("--max-iterations must be positive.")
+    if arguments.checkpoint_file is not None and not arguments.resume:
+        parser.error("--checkpoint-file requires --resume.")
     if arguments.numba_threads is not None:
         if arguments.numba_threads < 1:
             parser.error("--numba-threads must be positive.")
@@ -4695,7 +4896,12 @@ if __name__ == "__main__":
         get_superfeasible()
         get_x_g_superfeasible()
         print("Finished rebuilding auxiliary-data caches.", flush=True)
-    pi, xnew, q = perform_em(2)
+    pi, xnew, q = perform_em(
+        2,
+        max_iterations=arguments.max_iterations,
+        resume=arguments.resume,
+        checkpoint_file=arguments.checkpoint_file,
+    )
 
 #.............................................................................#
 #                       CODE TO CHECK THE JACOBIAN ETC...
