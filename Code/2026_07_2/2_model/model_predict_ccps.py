@@ -7,6 +7,9 @@ Created on Wed Nov 26 16:13:32 2025
 
 import numpy as np
 import multiprocessing 
+import os
+import time
+from pathlib import Path
 from scipy.special import logsumexp
 
 from model_solution_em import (get_all_g,
@@ -140,13 +143,15 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
     state using the auxiliary model."""
     
     
-    print(f"Individual {x1[i].astype('int')}")
+    task_started = time.perf_counter()
+    total_states = len(x1)
+    total_tasks = len(TYPE_IDS) * total_states
+    task_number = (type_id - 1) * total_states + i + 1
     # Period T is a terminal-value period in the structural model. Flow-utility
     # period arrays, the likelihood, and CCP continuation sequences all cover
     # periods 1, ..., T-1 only.
     for period in INITIAL_CCP_PERIODS:
-        
-        print(period)
+        period_started = time.perf_counter()
         # Get set of states
         
         x2_set = get_x2(period)
@@ -185,6 +190,83 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
             results_ccp,
             compressed=True,
         )
+        print(
+            f"[Initial CCP | pid={os.getpid()} | task={task_number}/{total_tasks} "
+            f"| type={type_id}/{len(TYPE_IDS)} | state={i + 1}/{total_states}] "
+            f"completed period {period}/{T} | period={time.perf_counter() - period_started:.2f}s "
+            f"| task={time.perf_counter() - task_started:.2f}s",
+            flush=True,
+        )
+
+
+def initial_ccp_bundle_path(period, invariant_state, type_id, output_root=None):
+    """Return the exact initial-CCP filename consumed by the Bellman solver."""
+    if output_root is None:
+        output_root = DIR["MODEL_OUTPUT"]
+    invariant_state = np.asarray(invariant_state)
+    return Path(output_root) / "ccp" / str(period) / (
+        f"ccp_t{period}_[{invariant_state}]_em{type_id}.npz"
+    )
+
+
+def missing_initial_ccp_tasks(invariant_states, output_root=None):
+    """Find type/state tasks lacking at least one required period bundle."""
+    missing_tasks = []
+    missing_files = []
+    for type_id in TYPE_IDS:
+        for state_index, invariant_state in enumerate(invariant_states):
+            task_missing = []
+            for period in INITIAL_CCP_PERIODS:
+                filename = initial_ccp_bundle_path(
+                    period, invariant_state, type_id, output_root=output_root
+                )
+                if not filename.is_file():
+                    task_missing.append(filename)
+            if task_missing:
+                missing_tasks.append((state_index, type_id))
+                missing_files.extend(task_missing)
+    return missing_tasks, missing_files
+
+
+def ensure_initial_ccps(invariant_states, debt_range, model_parameters):
+    """Regenerate incomplete initial-CCP tasks and verify their outputs."""
+    missing_tasks, missing_files = missing_initial_ccp_tasks(invariant_states)
+    if not missing_tasks:
+        print(
+            "Initial CCP preflight passed: all required bundles are present",
+            flush=True,
+        )
+        return
+
+    print(
+        f"Initial CCP preflight found {len(missing_files)} missing bundles "
+        f"across {len(missing_tasks)} type/state tasks; regenerating those tasks",
+        flush=True,
+    )
+    retry_args = [
+        (
+            state_index,
+            invariant_states,
+            debt_range,
+            model_parameters[type_id],
+            type_id,
+        )
+        for state_index, type_id in missing_tasks
+    ]
+    with multiprocessing.Pool(processes=min(10, len(retry_args))) as pool_obj:
+        pool_obj.starmap(get_all_ccps, retry_args, chunksize=1)
+
+    remaining_tasks, remaining_files = missing_initial_ccp_tasks(invariant_states)
+    if remaining_tasks:
+        preview = "\n".join(str(path) for path in remaining_files[:10])
+        raise FileNotFoundError(
+            f"Initial CCP generation still left {len(remaining_files)} required "
+            f"bundles missing. First missing paths:\n{preview}"
+        )
+    print(
+        "Initial CCP regeneration completed and passed the preflight",
+        flush=True,
+    )
 
 
 def load_utility_parameters(type_id, results_file=AUXILIARY_RESULTS_FILE):

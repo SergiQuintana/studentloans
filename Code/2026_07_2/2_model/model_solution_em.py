@@ -49,7 +49,7 @@ from financial_process import (
     load_auxiliary_financial_process,
     prepare_type_financial_parameters,
 )
-from latent_types import type_components
+from latent_types import N_TYPES, TYPE_NAMES, type_components
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathcont = DIR["MODEL_CONTINUATION"]
@@ -2427,8 +2427,18 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
     models = 0
     
     sigma_u = float(bs.risk_aversion(budget_params, x1[i, :]))
+    task_started = time.perf_counter()
+    total_states = len(x1)
+    total_tasks = N_TYPES * total_states
+    task_number = (em_type - 1) * total_states + i + 1
+    if ccp_real == 1:
+        ccp_mode = "updated"
+    elif ccp_real == 0:
+        ccp_mode = "initial"
+    else:
+        ccp_mode = "supplied"
     for period in range(T,0,-1):
-        print(period)
+        period_started = time.perf_counter()
         if period < T:
             models = np.load(f"{pathout}/ccp/{period}/ccp_t{period}_[{x1[i,:]}]_em{em_type}.npz")
         
@@ -2446,6 +2456,14 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
                                    sigma_u,utility_parameters,models,
                                    solution_mode,conterfactual,evt,
                                    em_type,maxdebt,financial_parameters)
+        print(
+            f"[Bellman | pid={os.getpid()} | task={task_number}/{total_tasks} "
+            f"| type={em_type}/{N_TYPES}:{TYPE_NAMES[em_type - 1]} "
+            f"| state={i + 1}/{total_states} | CCP={ccp_mode}] "
+            f"completed period {period}/{T} | period={time.perf_counter() - period_started:.2f}s "
+            f"| task={time.perf_counter() - task_started:.2f}s",
+            flush=True,
+        )
         
         
         

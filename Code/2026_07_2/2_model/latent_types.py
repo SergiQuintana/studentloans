@@ -111,3 +111,16 @@ def validate_saved_layout(
                 f"Saved EM {label} does not match the shared latent-type layout."
             )
     return True
+
+
+def load_em_posteriors(results_path):
+    """Load and validate the full joint-type posterior from an EM result."""
+    with np.load(results_path, allow_pickle=False) as results:
+        validate_saved_layout(
+            results["type_names"],
+            results["type_school"],
+            results["type_grant"],
+            results["type_transfer"],
+            results["type_loan"],
+        )
+        return validate_q(results["q"])
