@@ -146,7 +146,13 @@ def get_ccp_sequence(i,x1,b,em_type):
 
         # Save results
         
-        save_npz_here(f"{path_out}/evt_ccp/{period}/evt_ccp_sequence_t{period}_{inv}_em{em_type}.npz",    names_ccp, results_ccp, compressed=True)
+        # save_npz_here already anchors relative paths below Model/Output.
+        save_npz_here(
+            f"evt_ccp/{period}/evt_ccp_sequence_t{period}_{inv}_em{em_type}.npz",
+            names_ccp,
+            results_ccp,
+            compressed=True,
+        )
         
         # Obtain new continuation
         evtnext = dict(zip(names_ccp,results_ccp))

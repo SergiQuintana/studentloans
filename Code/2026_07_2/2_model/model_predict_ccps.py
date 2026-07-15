@@ -177,7 +177,14 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
             names_ccp.append(f"ccp_t{period}_{inv}_{x2.astype(int)}")
 
 
-        save_npz_here(f"{path_out}/ccp/{period}/ccp_t{period}_{inv}_em{type_id}.npz",    names_ccp, results_ccp, compressed=True)
+        # save_npz_here already anchors relative paths below Model/Output.
+        # Passing path_out here would duplicate the absolute root on Linux.
+        save_npz_here(
+            f"ccp/{period}/ccp_t{period}_{inv}_em{type_id}.npz",
+            names_ccp,
+            results_ccp,
+            compressed=True,
+        )
 
 
 def load_utility_parameters(type_id, results_file=AUXILIARY_RESULTS_FILE):
