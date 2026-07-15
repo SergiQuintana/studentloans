@@ -124,7 +124,7 @@ def load_full_em_posteriors():
 solve_model = False
 solve_continuation = False 
 solve_qs = False
-solve_initial_ccps = True
+solve_initial_ccps = False
 get_budget = False
 
 
