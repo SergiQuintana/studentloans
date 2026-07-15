@@ -18,11 +18,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import numpy as np
 
 from config import DIR
+
+
+def progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def progress_interval(total: int) -> int:
+    """Report roughly every 2 percent, bounded to readable intervals."""
+    return max(1, min(250, total // 50))
 
 
 def duplicated_output_root(output_root: Path) -> Path:
@@ -63,6 +73,7 @@ def remove_empty_directories(root: Path) -> None:
 
 
 def move_misplaced_ccps(output_root: Path, dry_run: bool = False) -> tuple[int, int]:
+    started = time.perf_counter()
     output_root = output_root.resolve()
     source_root = duplicated_output_root(output_root).resolve()
     if source_root == output_root or output_root not in source_root.parents:
@@ -71,6 +82,8 @@ def move_misplaced_ccps(output_root: Path, dry_run: bool = False) -> tuple[int, 
         )
 
     source_ccp = source_root / "ccp"
+    progress(f"Canonical output directory: {output_root}")
+    progress(f"Searching misplaced CCP directory: {source_ccp}")
     if not source_ccp.is_dir():
         raise FileNotFoundError(
             "The misplaced CCP directory was not found. Expected:\n"
@@ -80,24 +93,50 @@ def move_misplaced_ccps(output_root: Path, dry_run: bool = False) -> tuple[int, 
     source_files = sorted(source_ccp.rglob("*.npz"))
     if not source_files:
         raise FileNotFoundError(f"No CCP .npz bundles were found below {source_ccp}.")
+    total = len(source_files)
+    interval = progress_interval(total)
+    progress(f"Found {total} CCP bundles. Validating them before moving anything...")
 
     # Validate every source before replacing any destination file.
-    for source in source_files:
+    validation_started = time.perf_counter()
+    for index, source in enumerate(source_files, start=1):
         validate_npz(source)
+        if index == 1 or index % interval == 0 or index == total:
+            elapsed = time.perf_counter() - validation_started
+            progress(
+                f"Validation: {index}/{total} ({100.0 * index / total:.1f}%) "
+                f"| {elapsed:.1f}s"
+            )
 
     overwritten = 0
-    for source in source_files:
+    action = "Checking move" if dry_run else "Moving"
+    move_started = time.perf_counter()
+    progress(
+        "Validation completed. "
+        + ("Previewing destination paths..." if dry_run else "Moving bundles...")
+    )
+    for index, source in enumerate(source_files, start=1):
         relative = source.relative_to(source_root)
         destination = output_root / relative
         if destination.exists():
             overwritten += 1
-        print(f"{source} -> {destination}")
         if not dry_run:
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(source, destination)
+        if index == 1:
+            progress(f"First bundle: {source} -> {destination}")
+        if index == 1 or index % interval == 0 or index == total:
+            elapsed = time.perf_counter() - move_started
+            progress(
+                f"{action}: {index}/{total} ({100.0 * index / total:.1f}%) "
+                f"| {elapsed:.1f}s | replacements={overwritten}"
+            )
 
     if not dry_run:
+        progress("Removing empty directories left inside the duplicated output tree...")
         remove_empty_directories(source_root)
+
+    progress(f"Recovery step finished in {time.perf_counter() - started:.1f}s")
 
     return len(source_files), overwritten
 
@@ -120,7 +159,7 @@ def main() -> None:
         Path(arguments.output_root), dry_run=arguments.dry_run
     )
     action = "Would move" if arguments.dry_run else "Moved"
-    print(
+    progress(
         f"{action} {moved} CCP bundles; "
         f"{overwritten} destination files {'would be ' if arguments.dry_run else ''}replaced."
     )
