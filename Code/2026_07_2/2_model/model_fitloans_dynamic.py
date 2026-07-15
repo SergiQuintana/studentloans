@@ -29,6 +29,9 @@ from model_em_algorithm import (
     load_data_superfeasible,
     get_feasible,
     get_feasible_pubid,
+    get_x1_new as expand_x1,
+    _state_wage_design,
+    load_fixed_wage_parameters,
 )
 
 from model_solution_em import (
@@ -42,9 +45,22 @@ from model_solution_em import (
 from model_simulation_em import tuition_agents
 from model_interpolate_terminal import build_interpolator_dictionary
 
-from config import DIR, OUT, EST, ENSURE_DIR
+from config import DIR, OUT, EST, RDATA, ENSURE_DIR
 import budget_shock as bs
-from latent_types import TYPE_IDS, TYPE_LOAN, validate_q, validate_saved_layout
+from financial_process import (
+    load_auxiliary_financial_process,
+    draw_grants_vectorized,
+    draw_transfers_vectorized,
+)
+from latent_types import (
+    N_TYPES,
+    TYPE_IDS,
+    TYPE_GRANT,
+    TYPE_TRANSFER,
+    TYPE_LOAN,
+    validate_q,
+    validate_saved_layout,
+)
 
 # Canonical roots from config (no chdir anywhere)
 PATH_OUT        = DIR["MODEL_OUTPUT"]
@@ -82,7 +98,13 @@ def load_full_em_posteriors():
 def _ensure_est_dir():
     os.makedirs(PATH_EST, exist_ok=True)
 
-def save_budgetshock_estimates(best_x: np.ndarray, periods: list[int], filename_prefix: str = "budgetshock"):
+def save_budgetshock_estimates(
+    best_x: np.ndarray,
+    periods: list[int],
+    filename_prefix: str = "budgetshock",
+    loan_heterogeneity: str = "homogeneous",
+    index_kind: str = "model_period",
+):
     """
     Saves:
       - risk_aversion.npy        (ra_levels, length 4)
@@ -95,11 +117,20 @@ def save_budgetshock_estimates(best_x: np.ndarray, periods: list[int], filename_
     _ensure_est_dir()
 
     best_x = np.asarray(best_x, dtype=np.float64)
-    budget_params = bs.unpack_estimation_vector(best_x, periods)
+    budget_params = bs.unpack_estimation_vector(
+        best_x,
+        periods,
+        loan_heterogeneity=loan_heterogeneity,
+        index_kind=index_kind,
+    )
     bs.save(budget_params, raw_vector=best_x, filename_prefix=filename_prefix)
 
-    print(f"[saved] {EST('risk_aversion.npy')}")
-    print(f"[saved] {EST('budgetshock_params.npy')}")
+    if filename_prefix == "budgetshock":
+        print(f"[saved] {EST('risk_aversion.npy')}")
+        print(f"[saved] {EST('budgetshock_params.npy')}")
+    else:
+        print(f"[saved] {EST(f'{filename_prefix}_risk_aversion.npy')}")
+        print(f"[saved] {EST(f'{filename_prefix}_params.npy')}")
     print(f"[saved] {EST(f'{filename_prefix}_bestx.npy')}")
 
 # ==============================================================================
@@ -304,6 +335,104 @@ def load_fundamentals(period, interp_dict, clear_data=False):
 
     return x1, state, types, debt, debtchoice, choices, ccp_path, budget, terminal_data
 
+
+def load_education_cell(period, interp_dict, education=2, program_year=1):
+    """Load an observed education cell while preserving model-period continuation.
+
+    Program year is read from the pre-choice experience stored in ``state``.
+    Annual loan flow is the cleaned disbursement measure; debt choice is the
+    end-of-period stock.  The two are deliberately not reconstructed from one
+    another in the data.
+    """
+    data = load_fundamentals(period, interp_dict, clear_data=False)
+    x1, state, q, debt, debtchoice, choices, ccp, budget, terminal = data
+    raw_choices = np.load(RDATA(f"choice_superfeasible_t{period}.npy"))
+    education_mask = raw_choices[:, 1] > 0
+
+    flow_path = RDATA(f"loanflow_superfeasible_t{period}.npy")
+    decile_path = RDATA(f"parental_income_decile_superfeasible_t{period}.npy")
+    if not os.path.exists(flow_path):
+        raise FileNotFoundError(
+            f"Missing {flow_path}. Rebuild superfeasible data with "
+            "model_em_algorithm.get_data_superfeasible()."
+        )
+    if not os.path.exists(decile_path):
+        raise FileNotFoundError(
+            f"Missing {decile_path}. Run prepare_parental_income_deciles.py first."
+        )
+    loan_flow = np.asarray(np.load(flow_path), dtype=np.float64)[education_mask]
+    parent_decile = np.asarray(np.load(decile_path), dtype=np.int64)[education_mask]
+
+    cell_code = bs.education_cell_code(education, program_year)
+    observed_code = bs.education_cell_from_state(state, education)
+    cell = (choices[:, 1].astype(int) == int(education)) & (observed_code == cell_code)
+
+    term_g, term_ng, p_grad = terminal
+    idx = np.flatnonzero(cell)
+    terminal_cell = [
+        [term_g[i] for i in idx],
+        [term_ng[i] for i in idx],
+        p_grad[idx],
+    ]
+    return {
+        "period": int(period),
+        "cell_code": int(cell_code),
+        "x1": np.ascontiguousarray(x1[cell]),
+        "state": np.ascontiguousarray(state[cell]),
+        "q": validate_q(q[cell], n_individuals=int(cell.sum())),
+        "debt": np.ascontiguousarray(debt[cell], dtype=np.float64),
+        "debtchoice": np.ascontiguousarray(debtchoice[cell], dtype=np.float64),
+        "loan_flow": np.ascontiguousarray(loan_flow[cell], dtype=np.float64),
+        "parent_decile": np.ascontiguousarray(parent_decile[cell], dtype=np.int64),
+        "choice": np.ascontiguousarray(choices[cell]),
+        "ccp_by_type": np.ascontiguousarray(ccp[:, cell, :], dtype=np.float64),
+        "observed_budget": np.ascontiguousarray(budget[cell], dtype=np.float64),
+        "terminal_data": terminal_cell,
+    }
+
+
+def posterior_loan_moments(parent_decile, flow_by_type, stock_by_type, q):
+    """Loan-type/parental-decile targets and participation diagnostics.
+
+    Target ordering within each (loan type, decile) cell is
+    ``[mean positive annual flow, share with positive end stock]``.
+    The returned diagnostic is the share with positive annual flow.
+    """
+    parent_decile = np.asarray(parent_decile, dtype=np.int64).reshape(-1)
+    flow_by_type = np.asarray(flow_by_type, dtype=np.float64)
+    stock_by_type = np.asarray(stock_by_type, dtype=np.float64)
+    q = validate_q(q, n_individuals=len(parent_decile))
+    expected_shape = (N_TYPES, len(parent_decile))
+    if flow_by_type.shape != expected_shape or stock_by_type.shape != expected_shape:
+        raise ValueError(f"Flow and stock arrays must both have shape {expected_shape}.")
+
+    target, new_share, effective_weight, labels = [], [], [], []
+    for loan_type in (0, 1):
+        rows = np.flatnonzero(TYPE_LOAN == loan_type)
+        weights = q[:, rows].T
+        for decile in range(1, 11):
+            selected = parent_decile == decile
+            w = weights[:, selected].reshape(-1)
+            flow = flow_by_type[rows][:, selected].reshape(-1)
+            stock = stock_by_type[rows][:, selected].reshape(-1)
+            total = w.sum()
+            positive_flow = flow > 0.0
+            positive_weight = w[positive_flow].sum()
+            mean_flow = (
+                np.sum(w[positive_flow] * flow[positive_flow]) / positive_weight
+                if positive_weight > 0.0 else np.nan
+            )
+            stock_share = np.sum(w * (stock > 0.0)) / total if total > 0.0 else np.nan
+            flow_share = positive_weight / total if total > 0.0 else np.nan
+            target.extend((mean_flow, stock_share))
+            new_share.append(flow_share)
+            effective_weight.append(total)
+            labels.append((loan_type, decile))
+    return (
+        np.asarray(target), np.asarray(new_share),
+        np.asarray(effective_weight), tuple(labels),
+    )
+
 # ==============================================================================
 # Moments helpers
 
@@ -368,6 +497,105 @@ def get_mean_share_by_group(x1, debtchoice, x1_col, eps=0.01):
         out[i, 1] = share
 
     return out.flatten()
+
+
+DEFAULT_POSTERIOR_MOMENT_BLOCKS = ("parental_income", "ability", "loan_type")
+
+
+def _weighted_quantile(values, weights, probability):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    keep = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    values = values[keep]
+    weights = weights[keep]
+    if values.size == 0:
+        return np.nan
+    order = np.argsort(values)
+    values = values[order]
+    weights = weights[order]
+    cutoff = float(probability) * weights.sum()
+    return float(values[min(np.searchsorted(np.cumsum(weights), cutoff), values.size - 1)])
+
+
+def _weighted_debt_moments(values, weights, nmoments=4, eps=0.01):
+    """Debt moments for posterior-weighted observations."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    keep = np.isfinite(values) & np.isfinite(weights) & (weights >= 0.0)
+    values = values[keep]
+    weights = weights[keep]
+    total = weights.sum()
+    if total <= 0.0:
+        return np.full(nmoments, eps, dtype=np.float64)
+
+    positive = values > 0.0
+    positive_weight = weights[positive].sum()
+    share = positive_weight / total
+    if positive_weight <= 0.0:
+        all_moments = np.array([eps, eps, eps, eps], dtype=np.float64)
+    else:
+        positive_values = values[positive]
+        positive_weights = weights[positive]
+        mean = np.sum(positive_weights * positive_values) / positive_weight
+        variance = np.sum(positive_weights * (positive_values - mean) ** 2) / positive_weight
+        p80 = _weighted_quantile(positive_values, positive_weights, 0.80)
+        all_moments = np.array([mean, share, np.sqrt(variance), p80], dtype=np.float64)
+    return all_moments[:nmoments]
+
+
+def posterior_debt_moments(
+    x1,
+    debt_by_type,
+    q,
+    moment_blocks=DEFAULT_POSTERIOR_MOMENT_BLOCKS,
+):
+    """Construct flexible moments after integrating over all joint types.
+
+    ``debt_by_type`` has shape (16, N). For data moments the same observed
+    debt-choice stock is repeated over types; for simulated moments each row
+    contains choices conditional on that joint type.
+    """
+    x1 = np.asarray(x1)
+    debt_by_type = np.asarray(debt_by_type, dtype=np.float64)
+    q = validate_q(q, n_individuals=x1.shape[0])
+    if debt_by_type.shape != (N_TYPES, x1.shape[0]):
+        raise ValueError(
+            f"debt_by_type must have shape {(N_TYPES, x1.shape[0])}; "
+            f"received {debt_by_type.shape}"
+        )
+
+    blocks = tuple(moment_blocks)
+    unknown = set(blocks).difference(DEFAULT_POSTERIOR_MOMENT_BLOCKS)
+    if unknown:
+        raise ValueError(f"Unknown posterior moment blocks: {sorted(unknown)}")
+
+    values = debt_by_type.reshape(-1)
+    weights = q.T.reshape(-1)
+    output = []
+    for block in blocks:
+        if block in ("parental_income", "ability"):
+            column = 0 if block == "parental_income" else 1
+            nmoments = 4 if block == "parental_income" else 2
+            groups = np.tile(x1[:, column], N_TYPES)
+            for level in (1, 2, 3, 4):
+                selected = groups == level
+                output.extend(
+                    _weighted_debt_moments(
+                        values[selected], weights[selected], nmoments=nmoments
+                    )
+                )
+        elif block == "loan_type":
+            # Ordering is [mean positive, share positive] for B=0, then B=1.
+            for loan_type in (0, 1):
+                type_rows = np.flatnonzero(TYPE_LOAN == loan_type)
+                output.extend(
+                    _weighted_debt_moments(
+                        debt_by_type[type_rows].reshape(-1),
+                        q[:, type_rows].T.reshape(-1),
+                        nmoments=2,
+                    )
+                )
+    return np.asarray(output, dtype=np.float64)
 
 def dummies_234(g):
     g = np.asarray(g).astype(int)
@@ -461,6 +689,38 @@ def get_sample(x1, state, types, debt, choices, ccp_path, budget, terminal, n_sa
         type_id,
         loan_type,
     )
+
+
+def get_posterior_sample(
+    x1, state, types, debt, choices, ccp_path, budget, terminal,
+    n_sample=10000, rng=None,
+):
+    """Bootstrap observations while retaining every posterior type.
+
+    Unlike ``get_sample``, this function never draws or classifies a latent
+    type. The returned CCP tensor and posterior matrix remain aligned so the
+    SMM objective can integrate over all sixteen joint types exactly.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    types = validate_q(types, n_individuals=x1.shape[0])
+    idx = rng.choice(x1.shape[0], size=int(n_sample), replace=True)
+    term_g, term_ng, p_grad = terminal
+    terminal_sample = [
+        [term_g[i] for i in idx],
+        [term_ng[i] for i in idx],
+        p_grad[idx].copy(),
+    ]
+    return {
+        "indices": idx,
+        "x1": np.ascontiguousarray(x1[idx]),
+        "state": np.ascontiguousarray(state[idx]),
+        "debt": np.ascontiguousarray(debt[idx], dtype=np.float64),
+        "choice": np.ascontiguousarray(choices[idx]),
+        "budget": np.ascontiguousarray(budget[idx], dtype=np.float64),
+        "ccp_by_type": np.ascontiguousarray(ccp_path[:, idx, :], dtype=np.float64),
+        "q": np.ascontiguousarray(types[idx], dtype=np.float64),
+        "terminal_data": terminal_sample,
+    }
 
 # ==============================================================================
 # Debt rules (caps + monotone + consumption floor)
@@ -781,24 +1041,135 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
 
     return loss
 
+
+def minimize_distance_multi_posterior(
+    params,
+    moments_data_by_period,
+    sample_by_period,
+    periods,
+    shock_heterogeneity,
+    moment_blocks,
+):
+    """SMM objective that integrates over the complete fixed EM posterior."""
+    global EVAL_COUNTER
+    EVAL_COUNTER += 1
+    spec = bs.unpack_estimation_vector(
+        params, periods, loan_heterogeneity=shock_heterogeneity
+    )
+    total_loss = 0.0
+    per_period_loss = {}
+
+    for p in periods:
+        pack = sample_by_period[p]
+        x1 = pack["x1"]
+        q = pack["q"]
+        budget = pack["budget"]
+        ccp_by_type = pack["ccp_by_type"]
+        terminal_data = pack["terminal_data"]
+        Z = pack["Z"]
+        b_idx = pack["b_idx"]
+        max_idx = pack["max_idx"]
+
+        debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+        sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
+        parental_group = x1[:, 0].astype(int) - 1
+        terminal = np.zeros((x1.shape[0], debt_range.size), dtype=np.float64)
+        cache = {}
+        for group_index in range(4):
+            idx = np.where(parental_group == group_index)[0]
+            if idx.size:
+                terminal[idx] = get_relevant_terminal_subset_cached(
+                    terminal_data, spec["risk_aversion"][group_index], idx, cache
+                )
+
+        beta_term = float(beta ** (T - p))
+        sim_draws = np.zeros((len(moments_data_by_period[p]), Z.shape[0]))
+        for draw_index in range(Z.shape[0]):
+            debt_by_type = np.empty((N_TYPES, x1.shape[0]), dtype=np.float64)
+            for type_index in range(N_TYPES):
+                shock = bs.realization(
+                    spec,
+                    x1,
+                    p,
+                    Z[draw_index],
+                    loan_type=int(TYPE_LOAN[type_index]),
+                ).astype(np.float64)
+                debt_index = solve_one_draw_debt_idx_terminal_only(
+                    budget=budget,
+                    e=shock,
+                    debt_grid=debt_range,
+                    sigma_i=sigma_i,
+                    debtpen_i=debtpen_i,
+                    ccp_path_row=ccp_by_type[type_index],
+                    terminal_row=terminal,
+                    b_idx=b_idx,
+                    max_idx=max_idx,
+                    beta_term=beta_term,
+                    c_floor=2000.0,
+                    fallback_idx=debt_range.size - 1,
+                )
+                debt_by_type[type_index] = debt_range[debt_index]
+            sim_draws[:, draw_index] = posterior_debt_moments(
+                x1, debt_by_type, q, moment_blocks=moment_blocks
+            )
+
+        simulated = sim_draws.mean(axis=1)
+        data = moments_data_by_period[p]
+        denominator = np.maximum(np.abs(data), 1.0e-6)
+        period_loss = float(np.sum(((data - simulated) / denominator) ** 2))
+        per_period_loss[int(p)] = period_loss
+        total_loss += period_loss
+
+    if EVAL_COUNTER % 10 == 0:
+        print("\n" + "=" * 100)
+        print(f"[posterior eval {EVAL_COUNTER}] total loss={total_loss:.6f}")
+        print(f"loan heterogeneity={shock_heterogeneity}")
+        print("loan mean shifts:", np.round(spec["loan_mean_shift"], 3))
+        print("loan sigma ratios:", np.round(np.exp(spec["loan_log_sigma_ratio"]), 4))
+        print("per-period loss:", per_period_loss)
+        print("=" * 100 + "\n")
+    return float(total_loss)
+
 # ==============================================================================
 # Multi-period estimator
 
-def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample=10000):
+def fit_budget_shock_multi(
+    data_by_period,
+    periods,
+    max_outer=20,
+    s=20,
+    n_sample=10000,
+    posterior_integration=False,
+    shock_heterogeneity="homogeneous",
+    moment_blocks=DEFAULT_POSTERIOR_MOMENT_BLOCKS,
+):
     """
     params = [ mu_block_per_period (7*P), sigma_e_per_period (P), ra_levels (4), debt_pen_parinc (4) ]
     where debt_pen_parinc = [dp0, dp2, dp3, dp4] (constant + deviations).
     """
     P = len(periods)
 
-    # Build data moments ONCE
+    # Build data moments ONCE. The legacy branch is unchanged; the new branch
+    # repeats observed debt over types and integrates using fixed q weights.
+    moments_data_by_period = {}
     mom_data_list = []
     for p in periods:
         x1, state, types, debt, debtchoice, choices, ccp_path, budget, terminal_data = data_by_period[p]
-        mom_par = get_moments_by_x1(x1, debtchoice, x1_col=0, nmoments=4).astype(np.float64)  # 16
-        mom_ab  = get_mean_share_by_group(x1, debtchoice, x1_col=1).astype(np.float64)        # 8
-        mom_data_list.append(np.concatenate([mom_par, mom_ab]))
-    moments_data = np.concatenate(mom_data_list).astype(np.float64)  # 24*P
+        if posterior_integration:
+            moments_data_by_period[p] = posterior_debt_moments(
+                x1,
+                np.broadcast_to(debtchoice, (N_TYPES, len(debtchoice))),
+                types,
+                moment_blocks=moment_blocks,
+            )
+        else:
+            mom_par = get_moments_by_x1(x1, debtchoice, x1_col=0, nmoments=4).astype(np.float64)  # 16
+            mom_ab  = get_mean_share_by_group(x1, debtchoice, x1_col=1).astype(np.float64)        # 8
+            mom_data_list.append(np.concatenate([mom_par, mom_ab]))
+    moments_data = (
+        None if posterior_integration
+        else np.concatenate(mom_data_list).astype(np.float64)
+    )
 
     # Initial guess
     mu0_guess = 100
@@ -810,7 +1181,16 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
     dp0_init = -1.0
     dp_parinc0 = np.array([dp0_init, -1.0, -1.0, -1.0], dtype=np.float64)  # [dp0, dp2, dp3, dp4]
 
-    params0 = np.concatenate([mu_block0, sigma_e0, ra0, dp_parinc0]).astype(np.float64)
+    params0_parts = [mu_block0, sigma_e0, ra0, dp_parinc0]
+    if shock_heterogeneity in ("mean", "both"):
+        params0_parts.append(np.zeros(P, dtype=np.float64))
+    if shock_heterogeneity in ("variance", "both"):
+        params0_parts.append(np.zeros(P, dtype=np.float64))
+    params0 = np.concatenate(params0_parts).astype(np.float64)
+    # Validate the mode and vector layout before entering the optimizer.
+    bs.unpack_estimation_vector(
+        params0, periods, loan_heterogeneity=shock_heterogeneity
+    )
 
     # Bounds
     MU_MIN, MU_MAX = -50000.0, 50000.0
@@ -823,6 +1203,11 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
         bounds.append((SIGE_MIN, SIGE_MAX))
     bounds += [(0.1001, 2.9999)] * 4
     bounds += [(-1e6, 0.0)] * 4  # dp0,dp2,dp3,dp4 <= 0
+    if shock_heterogeneity in ("mean", "both"):
+        bounds += [(MU_MIN, MU_MAX)] * P
+    if shock_heterogeneity in ("variance", "both"):
+        # sigma(B=1) = sigma(B=0) * exp(log ratio)
+        bounds += [(-3.0, 3.0)] * P
 
     best_x = params0.copy()
     best_fun = 1e30
@@ -838,21 +1223,34 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
         for p in periods:
             x1, state, types, debt, debtchoice, choices, ccp_path, budget, terminal_data = data_by_period[p]
 
-            (
-                x1s,
-                states,
-                debts,
-                choices_s,
-                budget_s,
-                evt_ccp_s,
-                _,
-                terminal_s,
-                type_ids,
-                loan_types,
-            ) = get_sample(
-                x1, state, types, debt, choices, ccp_path, budget,
-                terminal_data, n_sample=n_sample
-            )
+            if posterior_integration:
+                sampled = get_posterior_sample(
+                    x1, state, types, debt, choices, ccp_path, budget,
+                    terminal_data, n_sample=n_sample,
+                    rng=np.random.default_rng(100000 + 1000 * p + it),
+                )
+                x1s = sampled["x1"]
+                states = sampled["state"]
+                debts = sampled["debt"]
+                choices_s = sampled["choice"]
+                budget_s = sampled["budget"]
+                terminal_s = sampled["terminal_data"]
+            else:
+                (
+                    x1s,
+                    states,
+                    debts,
+                    choices_s,
+                    budget_s,
+                    evt_ccp_s,
+                    _,
+                    terminal_s,
+                    type_ids,
+                    loan_types,
+                ) = get_sample(
+                    x1, state, types, debt, choices, ccp_path, budget,
+                    terminal_data, n_sample=n_sample
+                )
 
             rng = np.random.default_rng(12345 + 1000*p + it)
             Zp = rng.standard_normal((s, x1s.shape[0])).astype(np.float64)
@@ -863,7 +1261,7 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
                 choices_s.astype(np.int64),
             )
 
-            sample_by_period[p] = {
+            common_pack = {
                 "x1": np.ascontiguousarray(x1s),
                 "state": np.ascontiguousarray(states),
                 "choice": np.ascontiguousarray(choices_s),
@@ -873,17 +1271,32 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
                 "Z": Zp,
                 "b_idx": b_idx,
                 "max_idx": max_idx,
-                # Reserved inputs for the forthcoming loan-type-specific
-                # budget-shock distribution.
-                "type_id": np.ascontiguousarray(type_ids, dtype=np.int64),
-                "loan_type": np.ascontiguousarray(loan_types, dtype=np.int64),
             }
+            if posterior_integration:
+                common_pack["ccp_by_type"] = sampled["ccp_by_type"]
+                common_pack["q"] = sampled["q"]
+            else:
+                common_pack["evt_ccp"] = np.ascontiguousarray(evt_ccp_s, dtype=np.float64)
+                common_pack["type_id"] = np.ascontiguousarray(type_ids, dtype=np.int64)
+                common_pack["loan_type"] = np.ascontiguousarray(loan_types, dtype=np.int64)
+            sample_by_period[p] = common_pack
 
-        args_obj = (moments_data, sample_by_period, periods)
+        if posterior_integration:
+            objective = minimize_distance_multi_posterior
+            args_obj = (
+                moments_data_by_period,
+                sample_by_period,
+                periods,
+                shock_heterogeneity,
+                tuple(moment_blocks),
+            )
+        else:
+            objective = minimize_distance_multi
+            args_obj = (moments_data, sample_by_period, periods)
 
         print("---- Running minimize(..., method='Nelder-Mead') ----")
         res = minimize(
-            minimize_distance_multi,
+            objective,
             x0=best_x,
             args=args_obj,
             method="Nelder-Mead",
@@ -910,6 +1323,278 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
     print("best_x:", best_x)
     return best_x, best_fun
 
+
+# ==============================================================================
+# Education-cell pre-test (posterior integrated, simulated financial resources)
+
+def _subset_cell_pack(pack, indices):
+    indices = np.asarray(indices, dtype=np.int64)
+    out = dict(pack)
+    for name in (
+        "x1", "state", "q", "debt", "debtchoice", "loan_flow",
+        "parent_decile", "choice", "observed_budget",
+    ):
+        out[name] = np.ascontiguousarray(pack[name][indices])
+    out["ccp_by_type"] = np.ascontiguousarray(pack["ccp_by_type"][:, indices, :])
+    term_g, term_ng, p_grad = pack["terminal_data"]
+    out["terminal_data"] = [
+        [term_g[i] for i in indices],
+        [term_ng[i] for i in indices],
+        p_grad[indices],
+    ]
+    return out
+
+
+def prepare_education_cell_crns(packs, draws=20, seed=12345):
+    """Pre-draw every resource shock once and reuse it in all SMM evaluations."""
+    wage_parameters = load_fixed_wage_parameters()
+    financial = load_auxiliary_financial_process(EST("auxiliary_em_results.npz"))
+    prepared = {}
+    for pack in packs:
+        period = pack["period"]
+        x1 = pack["x1"]
+        state = pack["state"]
+        choice = pack["choice"]
+        n = len(x1)
+        rng = np.random.default_rng(seed + 1000 * period)
+        crn = {
+            "wage_z": rng.standard_normal((draws, n)),
+            "grant_u": rng.random((draws, n)),
+            "grant_z": rng.standard_normal((draws, n)),
+            "transfer_u": rng.random((draws, n)),
+            "transfer_z": rng.standard_normal((draws, n)),
+            "budget_z": rng.standard_normal((draws, n)),
+        }
+
+        x1_design = expand_x1(x1)
+        state_design = _state_wage_design(state)
+        wage_mu = np.column_stack((x1_design, state_design[:, :-1])) @ wage_parameters["school"]
+        wage_sigma = float(wage_parameters["sigmas"][0])
+        education = choice[:, 1].astype(np.int64)
+        work = choice[:, 2].astype(np.int64)
+        tuition = np.asarray(tuition_agents(0, choice), dtype=np.float64).reshape(-1)
+        base_budget = np.empty((draws, N_TYPES, n), dtype=np.float64)
+
+        for draw_index in range(draws):
+            wage = (
+                np.exp(np.clip(wage_mu + wage_sigma * crn["wage_z"][draw_index], -20.0, 20.0))
+                * work * 0.5 * (40 * 52)
+            )
+            for type_index in range(N_TYPES):
+                grant = draw_grants_vectorized(
+                    x1_design, education, work, financial["grant"],
+                    grant_type=int(TYPE_GRANT[type_index]),
+                    receipt_uniform=crn["grant_u"][draw_index],
+                    amount_standard_normal=crn["grant_z"][draw_index],
+                )
+                transfer = draw_transfers_vectorized(
+                    x1_design, education, work, financial["transfer"],
+                    transfer_type=int(TYPE_TRANSFER[type_index]),
+                    receipt_uniform=crn["transfer_u"][draw_index],
+                    amount_standard_normal=crn["transfer_z"][draw_index],
+                )
+                base_budget[draw_index, type_index] = (
+                    wage + grant + transfer - tuition - (1.0 + r) * pack["debt"]
+                )
+
+        prepared_pack = dict(pack)
+        prepared_pack["base_budget_crn"] = np.ascontiguousarray(base_budget)
+        prepared_pack["budget_z"] = np.ascontiguousarray(crn["budget_z"])
+        prepared_pack["b_idx"], prepared_pack["max_idx"] = precompute_bounds_indices(
+            pack["debt"].astype(np.float64),
+            pack["state"].astype(np.int64),
+            pack["choice"].astype(np.int64),
+        )
+        prepared[period] = prepared_pack
+    return prepared
+
+
+def _pooled_observed_cell_moments(packs):
+    decile = np.concatenate([pack["parent_decile"] for pack in packs])
+    q = np.concatenate([pack["q"] for pack in packs], axis=0)
+    flow = np.concatenate([pack["loan_flow"] for pack in packs])
+    stock = np.concatenate([pack["debtchoice"] for pack in packs])
+    return posterior_loan_moments(
+        decile,
+        np.broadcast_to(flow, (N_TYPES, len(flow))),
+        np.broadcast_to(stock, (N_TYPES, len(stock))),
+        q,
+    )
+
+
+def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, labels, loss):
+    print("\n" + "=" * 112)
+    print(f"[education-cell eval {EVAL_COUNTER}] loss={loss:.6f}")
+    print(" loan  decile | mean positive annual flow: data       sim       diff | "
+          "share end-stock>0: data     sim     diff | new-flow share (diagnostic)")
+    for row, (loan_type, decile) in enumerate(labels):
+        m = 2 * row
+        print(
+            f"  {loan_type:>2}     {decile:>2}   | "
+            f"{data[m]:>10.2f} {simulated[m]:>10.2f} {simulated[m]-data[m]:>10.2f} | "
+            f"{data[m+1]:>7.4f} {simulated[m+1]:>7.4f} {simulated[m+1]-data[m+1]:>+8.4f} | "
+            f"{data_new_share[row]:>7.4f} -> {sim_new_share[row]:>7.4f}  "
+            f"(posterior weight={weights[row]:.1f})"
+        )
+    print("=" * 112 + "\n")
+
+
+def minimize_distance_education_cell(
+    params, data_moments, data_new_share, data_weights, labels, sample_by_period,
+    cell_code, education, program_year, shock_heterogeneity,
+):
+    """One education-cell SMM objective with exact integration over 16 types."""
+    global EVAL_COUNTER
+    EVAL_COUNTER += 1
+    spec = bs.unpack_estimation_vector(
+        params, [cell_code], loan_heterogeneity=shock_heterogeneity,
+        index_kind="education_cell",
+    )
+    draws = next(iter(sample_by_period.values()))["budget_z"].shape[0]
+    simulated_by_draw = []
+    diagnostic_by_draw = []
+
+    for draw_index in range(draws):
+        pooled_flow, pooled_stock, pooled_decile, pooled_q = [], [], [], []
+        for period, pack in sample_by_period.items():
+            x1 = pack["x1"]
+            terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
+            cache = {}
+            parental_group = x1[:, 0].astype(int) - 1
+            for group_index in range(4):
+                idx = np.flatnonzero(parental_group == group_index)
+                if idx.size:
+                    terminal[idx] = get_relevant_terminal_subset_cached(
+                        pack["terminal_data"], spec["risk_aversion"][group_index], idx, cache
+                    )
+            sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
+            debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+            stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
+            for type_index in range(N_TYPES):
+                shock = bs.realization(
+                    spec, x1, None, pack["budget_z"][draw_index],
+                    loan_type=int(TYPE_LOAN[type_index]), education=education,
+                    program_year=program_year,
+                ).astype(np.float64)
+                debt_index = solve_one_draw_debt_idx_terminal_only(
+                    budget=pack["base_budget_crn"][draw_index, type_index],
+                    e=shock, debt_grid=debt_range, sigma_i=sigma_i,
+                    debtpen_i=debtpen_i,
+                    ccp_path_row=pack["ccp_by_type"][type_index],
+                    terminal_row=terminal, b_idx=pack["b_idx"], max_idx=pack["max_idx"],
+                    beta_term=float(beta ** (T - period)), c_floor=2000.0,
+                    fallback_idx=debt_range.size - 1,
+                )
+                stock_by_type[type_index] = debt_range[debt_index]
+            flow_by_type = stock_by_type - (1.0 + r) * pack["debt"][None, :]
+            pooled_flow.append(flow_by_type)
+            pooled_stock.append(stock_by_type)
+            pooled_decile.append(pack["parent_decile"])
+            pooled_q.append(pack["q"])
+        moments, new_share, _, _ = posterior_loan_moments(
+            np.concatenate(pooled_decile), np.concatenate(pooled_flow, axis=1),
+            np.concatenate(pooled_stock, axis=1), np.concatenate(pooled_q, axis=0),
+        )
+        simulated_by_draw.append(moments)
+        diagnostic_by_draw.append(new_share)
+
+    simulated = np.nanmean(np.asarray(simulated_by_draw), axis=0)
+    sim_new_share = np.nanmean(np.asarray(diagnostic_by_draw), axis=0)
+    valid = np.isfinite(data_moments) & np.isfinite(simulated)
+    scale = np.where(np.arange(len(data_moments)) % 2 == 0,
+                     np.maximum(np.abs(data_moments), 100.0), 1.0)
+    loss = float(np.sum(((simulated[valid] - data_moments[valid]) / scale[valid]) ** 2))
+    if EVAL_COUNTER % 10 == 0:
+        _print_cell_fit(
+            data_moments, simulated, data_new_share, sim_new_share,
+            data_weights, labels, loss,
+        )
+        print("loan mean shift:", np.round(spec["loan_mean_shift"], 3),
+              "loan sigma ratio:", np.round(np.exp(spec["loan_log_sigma_ratio"]), 4))
+    return loss
+
+
+def minimize_distance_education_cell_differential(
+    differential, fixed_common, *objective_args,
+):
+    """Estimate only loan-type differences after fixing the common benchmark."""
+    full = np.concatenate((np.asarray(fixed_common, dtype=np.float64), differential))
+    return minimize_distance_education_cell(full, *objective_args)
+
+
+def fit_education_cell(
+    packs, education=2, program_year=1, shock_heterogeneity="homogeneous",
+    draws=20, n_sample=None, maxiter=500, seed=12345, initial=None,
+    fixed_common=None,
+):
+    """Estimate a single program-year cell without changing the dynamic solver."""
+    if not packs:
+        raise ValueError("No observations were found for the requested education cell.")
+    data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(packs)
+    rng = np.random.default_rng(seed)
+    sampled = []
+    for pack in packs:
+        if n_sample is None or len(pack["x1"]) <= n_sample:
+            sampled.append(pack)
+        else:
+            sampled.append(_subset_cell_pack(pack, rng.choice(len(pack["x1"]), n_sample, replace=True)))
+    sample_by_period = prepare_education_cell_crns(sampled, draws=draws, seed=seed)
+
+    cell_code = bs.education_cell_code(education, program_year)
+    if initial is None:
+        parts = [
+            np.tile(np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 1),
+            np.array([1000.0]), np.full(4, 1.25), np.array([-1.0, -1.0, -1.0, -1.0]),
+        ]
+        if shock_heterogeneity in ("mean", "both"):
+            parts.append(np.zeros(1))
+        if shock_heterogeneity in ("variance", "both"):
+            parts.append(np.zeros(1))
+        initial = np.concatenate(parts)
+    initial = np.asarray(initial, dtype=np.float64)
+    bs.unpack_estimation_vector(
+        initial, [cell_code], loan_heterogeneity=shock_heterogeneity,
+        index_kind="education_cell",
+    )
+    bounds = (
+        [(-50000.0, 50000.0)] * 7 + [(1.0, 50000.0)]
+        + [(0.1001, 2.9999)] * 4 + [(-1.0e6, 0.0)] * 4
+    )
+    if shock_heterogeneity in ("mean", "both"):
+        bounds += [(-50000.0, 50000.0)]
+    if shock_heterogeneity in ("variance", "both"):
+        bounds += [(-3.0, 3.0)]
+    args = (
+        data_moments, data_new_share, data_weights, labels, sample_by_period,
+        cell_code, education, program_year, shock_heterogeneity,
+    )
+    if fixed_common is None:
+        result = minimize(
+            minimize_distance_education_cell, initial, args=args, method="Nelder-Mead",
+            bounds=bounds, options={"maxiter": int(maxiter), "disp": True},
+        )
+    else:
+        fixed_common = np.asarray(fixed_common, dtype=np.float64)
+        if fixed_common.shape != (16,):
+            raise ValueError("fixed_common must be the 16-parameter homogeneous estimate.")
+        if shock_heterogeneity == "homogeneous":
+            raise ValueError("fixed_common is only meaningful for a heterogeneous stage.")
+        n_differential = int(shock_heterogeneity in ("mean", "both"))
+        n_differential += int(shock_heterogeneity in ("variance", "both"))
+        differential0 = initial[-n_differential:]
+        differential_bounds = bounds[-n_differential:]
+        result = minimize(
+            minimize_distance_education_cell_differential,
+            differential0,
+            args=(fixed_common, *args),
+            method="Nelder-Mead",
+            bounds=differential_bounds,
+            options={"maxiter": int(maxiter), "disp": True},
+        )
+        result.x_differential = result.x.copy()
+        result.x = np.concatenate((fixed_common, result.x))
+    return result, (data_moments, data_new_share, data_weights, labels)
+
 # ==============================================================================
 # Main entry point
 
@@ -933,6 +1618,54 @@ def estimate_budget_shock():
 
     save_budgetshock_estimates(best_x=best_x, periods=periods_to_fit)
     return best_x, best_fun
+
+
+def estimate_budget_shock_education_cell(
+    education=2,
+    program_year=1,
+    shock_heterogeneity="homogeneous",
+    draws=20,
+    n_sample=None,
+    maxiter=500,
+    seed=12345,
+    save=False,
+    initial=None,
+    fixed_common=None,
+):
+    """Run the dynamic estimator as a one-program-year pre-test.
+
+    The default is first-year four-year college. Observations are pooled across
+    model periods, but each retains its period-specific CCP and terminal value.
+    Set ``save=True`` only after validating the homogeneous benchmark.
+    """
+    interp_dict = get_interp_dict_cached(force_rebuild=False)
+    packs = []
+    for period in range(1, T):
+        print(f"[load education cell] model period={period}")
+        pack = load_education_cell(
+            period, interp_dict, education=education, program_year=program_year
+        )
+        if len(pack["x1"]):
+            print(f"  retained {len(pack['x1'])} enrolled observations")
+            packs.append(pack)
+    result, data_summary = fit_education_cell(
+        packs, education=education, program_year=program_year,
+        shock_heterogeneity=shock_heterogeneity, draws=draws,
+        n_sample=n_sample, maxiter=maxiter, seed=seed, initial=initial,
+        fixed_common=fixed_common,
+    )
+    if save:
+        cell_code = bs.education_cell_code(education, program_year)
+        prefix = (
+            f"budgetshock_educ{education}_year{program_year}_"
+            f"{shock_heterogeneity}"
+        )
+        save_budgetshock_estimates(
+            result.x, [cell_code], filename_prefix=prefix,
+            loan_heterogeneity=shock_heterogeneity,
+            index_kind="education_cell",
+        )
+    return result, data_summary
 
 
 # If running as script:

@@ -1,0 +1,62 @@
+"""Command-line entry point for the dynamic one-education-cell pre-test."""
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+
+from config import EST
+from model_fitloans_dynamic import estimate_budget_shock_education_cell
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--education", type=int, default=2)
+    parser.add_argument("--program-year", type=int, default=1)
+    parser.add_argument(
+        "--heterogeneity",
+        choices=("homogeneous", "mean", "variance", "both"),
+        default="homogeneous",
+    )
+    parser.add_argument("--draws", type=int, default=20)
+    parser.add_argument("--n-sample", type=int, default=None)
+    parser.add_argument("--maxiter", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--save", action="store_true")
+    parser.add_argument(
+        "--fixed-common",
+        default=None,
+        help="Path to a 16-parameter homogeneous bestx file.",
+    )
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    fixed_common = None
+    if args.fixed_common:
+        path = Path(args.fixed_common)
+        if not path.is_absolute():
+            path = Path(EST(path.name))
+        fixed_common = np.asarray(np.load(path), dtype=float)
+
+    result, _ = estimate_budget_shock_education_cell(
+        education=args.education,
+        program_year=args.program_year,
+        shock_heterogeneity=args.heterogeneity,
+        draws=args.draws,
+        n_sample=args.n_sample,
+        maxiter=args.maxiter,
+        seed=args.seed,
+        save=args.save,
+        fixed_common=fixed_common,
+    )
+    print("\nOptimization finished")
+    print("success:", result.success)
+    print("message:", result.message)
+    print("objective:", result.fun)
+    print("parameters:", result.x)
+
+
+if __name__ == "__main__":
+    main()

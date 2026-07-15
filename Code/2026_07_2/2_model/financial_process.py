@@ -431,6 +431,61 @@ def expected_grants_vectorized(x1, education, work, process, grant_type=0):
     return expected
 
 
+def draw_grants_vectorized(
+    x1, education, work, process, grant_type=0,
+    receipt_uniform=None, amount_standard_normal=None,
+):
+    """Draw grant receipt and positive amounts using supplied common draws."""
+    x1 = np.asarray(x1, dtype=float)
+    education = np.asarray(education, dtype=np.int64).reshape(-1)
+    work = np.asarray(work, dtype=np.int64).reshape(-1)
+    n = len(education)
+    grant_type = _binary_type(grant_type, n, "grant_type")
+    receipt_uniform = np.asarray(receipt_uniform, dtype=float).reshape(-1)
+    amount_standard_normal = np.asarray(
+        amount_standard_normal, dtype=float
+    ).reshape(-1)
+    if x1.shape != (n, N_INVARIANT):
+        raise ValueError(f"Grant x1 must have shape {(n, N_INVARIANT)}.")
+    if receipt_uniform.shape != (n,) or amount_standard_normal.shape != (n,):
+        raise ValueError("Grant common draws must contain one value per observation.")
+
+    out = np.zeros(n, dtype=float)
+    for level in EDUCATION_LEVELS:
+        selected = education == level
+        if not np.any(selected):
+            continue
+        index = level - 1
+        receipt = np.asarray(process["receipt"][index], dtype=float)
+        amount = np.asarray(process["amount"][index], dtype=float)
+        part_time = (work[selected] == 1).astype(float)
+        full_time = (work[selected] == 2).astype(float)
+        eta_receipt = (
+            x1[selected] @ receipt[:N_INVARIANT]
+            + part_time * receipt[9]
+            + full_time * receipt[10]
+            + grant_type[selected] * receipt[-1]
+        )
+        eta_amount = (
+            x1[selected] @ amount[:N_INVARIANT]
+            + part_time * amount[9]
+            + full_time * amount[10]
+            + grant_type[selected] * amount[-1]
+        )
+        probability = 1.0 / (1.0 + np.exp(-np.clip(eta_receipt, -40.0, 40.0)))
+        received = receipt_uniform[selected] < probability
+        amount_draw = np.exp(
+            np.clip(
+                eta_amount
+                + float(process["sigma"][index]) * amount_standard_normal[selected],
+                -20.0,
+                20.0,
+            )
+        )
+        out[selected] = received * amount_draw
+    return out
+
+
 def _transfer_alt_features(education, work):
     education = np.asarray(education, dtype=np.int64).reshape(-1)
     work = np.asarray(work, dtype=np.int64).reshape(-1)
@@ -509,3 +564,53 @@ def expected_transfers_vectorized(
     )
     expected[selected] = probability * conditional_mean
     return expected
+
+
+def draw_transfers_vectorized(
+    x1, education, work, process, transfer_type=0,
+    receipt_uniform=None, amount_standard_normal=None,
+):
+    """Draw parental-transfer receipt and amounts using supplied common draws."""
+    x1 = np.asarray(x1, dtype=float)
+    education = np.asarray(education, dtype=np.int64).reshape(-1)
+    work = np.asarray(work, dtype=np.int64).reshape(-1)
+    n = len(education)
+    transfer_type = _binary_type(transfer_type, n, "transfer_type")
+    receipt_uniform = np.asarray(receipt_uniform, dtype=float).reshape(-1)
+    amount_standard_normal = np.asarray(
+        amount_standard_normal, dtype=float
+    ).reshape(-1)
+    if x1.shape != (n, N_INVARIANT):
+        raise ValueError(f"Transfer x1 must have shape {(n, N_INVARIANT)}.")
+    if receipt_uniform.shape != (n,) or amount_standard_normal.shape != (n,):
+        raise ValueError("Transfer common draws must contain one value per observation.")
+
+    out = np.zeros(n, dtype=float)
+    selected = np.isin(education, (1, 2))
+    if not np.any(selected):
+        return out
+    receipt = np.asarray(process["receipt"], dtype=float)
+    amount = np.asarray(process["amount"], dtype=float)
+    alt = _transfer_alt_features(education[selected], work[selected])
+    eta_receipt = (
+        x1[selected] @ receipt[:N_INVARIANT]
+        + alt @ receipt[N_INVARIANT:-1]
+        + transfer_type[selected] * receipt[-1]
+    )
+    eta_amount = (
+        x1[selected] @ amount[:N_INVARIANT]
+        + alt @ amount[N_INVARIANT:-1]
+        + transfer_type[selected] * amount[-1]
+    )
+    probability = 1.0 / (1.0 + np.exp(-np.clip(eta_receipt, -40.0, 40.0)))
+    received = receipt_uniform[selected] < probability
+    amount_draw = np.exp(
+        np.clip(
+            eta_amount
+            + float(process["sigma"]) * amount_standard_normal[selected],
+            -20.0,
+            20.0,
+        )
+    )
+    out[selected] = received * amount_draw
+    return out
