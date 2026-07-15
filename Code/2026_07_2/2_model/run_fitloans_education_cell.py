@@ -7,6 +7,8 @@ import numpy as np
 
 from config import EST
 from model_fitloans_dynamic import estimate_budget_shock_education_cell
+from prepare_fitloans_ccp_sequences import prepare_fitloans_ccp_sequences
+from prepare_parental_income_deciles import build_parental_income_deciles
 
 
 def build_parser():
@@ -23,6 +25,20 @@ def build_parser():
     parser.add_argument("--maxiter", type=int, default=500)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--save", action="store_true")
+    parser.add_argument("--ccp-processes", type=int, default=10)
+    parser.add_argument(
+        "--parent-income-source",
+        default=None,
+        help=(
+            "Optional path to demographic_invariant.dta. The default is "
+            "Data/temporary/demographic_invariant.dta below the project root."
+        ),
+    )
+    parser.add_argument(
+        "--skip-preparation",
+        action="store_true",
+        help="Use only for debugging when every derived input is already verified.",
+    )
     parser.add_argument(
         "--fixed-common",
         default=None,
@@ -33,6 +49,12 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if not args.skip_preparation:
+        print("Preparing reproducible parental-income and annual-flow inputs")
+        build_parental_income_deciles(source_path=args.parent_income_source)
+        print("Checking/building CCP continuation sequences")
+        prepare_fitloans_ccp_sequences(processes=args.ccp_processes)
+
     fixed_common = None
     if args.fixed_common:
         path = Path(args.fixed_common)

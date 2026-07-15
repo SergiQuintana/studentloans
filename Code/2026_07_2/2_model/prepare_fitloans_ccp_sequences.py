@@ -19,7 +19,7 @@ PERIODS = tuple(range(1, 10))
 def sequence_bundle_path(period, invariant_state, type_id):
     invariant_state = np.asarray(invariant_state)
     return Path(DIR["MODEL_OUTPUT"]) / "evt_ccp" / str(period) / (
-        f"evt_ccp_sequence_t{period}_[{invariant_state}]_em{type_id}.npz"
+        f"evt_ccp_sequence_t{period}_{invariant_state}_em{type_id}.npz"
     )
 
 
@@ -39,12 +39,9 @@ def missing_sequence_tasks():
     return tasks, missing_files
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--processes", type=int, default=10)
-    args = parser.parse_args()
-    processes = max(1, int(args.processes))
-
+def prepare_fitloans_ccp_sequences(processes=10):
+    """Ensure all inputs derived from the already-estimated CCPs exist."""
+    processes = max(1, int(processes))
     print("Checking initial auxiliary CCP bundles for all 16 types", flush=True)
     parameters = {
         type_id: initial.load_utility_parameters(type_id)
@@ -59,7 +56,7 @@ def main():
     tasks, missing = missing_sequence_tasks()
     if not tasks:
         print("CCP-sequence preflight passed: no files are missing", flush=True)
-        return
+        return 0
     print(
         f"Generating {len(tasks)} missing type/state sequence tasks "
         f"covering {len(missing)} period bundles",
@@ -80,6 +77,14 @@ def main():
             f"First missing paths:\n{preview}"
         )
     print("All 16-type CCP sequence bundles are complete", flush=True)
+    return len(tasks)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--processes", type=int, default=10)
+    args = parser.parse_args()
+    prepare_fitloans_ccp_sequences(processes=args.processes)
 
 
 if __name__ == "__main__":
