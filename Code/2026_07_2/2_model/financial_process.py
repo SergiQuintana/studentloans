@@ -12,6 +12,18 @@ import numpy as np
 
 from latent_types import validate_saved_layout
 
+try:
+    from numba import njit
+except ImportError:  # Keep loading/reporting utilities usable without Numba.
+    def njit(*args, **kwargs):
+        if args and callable(args[0]) and len(args) == 1 and not kwargs:
+            return args[0]
+
+        def decorator(function):
+            return function
+
+        return decorator
+
 
 EDUCATION_LEVELS = (1, 2, 3)
 EDUCATION_NAMES = {1: "two_year", 2: "four_year", 3: "graduate"}
@@ -140,6 +152,136 @@ def load_auxiliary_financial_process(results_path):
             "sigma": transfer_sigma,
         },
     }
+
+
+def prepare_type_financial_parameters(process, grant_type, transfer_type):
+    """Preselect one type's coefficients for repeated Bellman evaluations.
+
+    The auxiliary EM stores each type shift as the last coefficient. Because
+    the first entry of ``x1`` is a constant, setup can absorb the shift into
+    the intercept. The returned tuple contains only contiguous numeric arrays
+    and is therefore suitable for the Numba hot path.
+    """
+    grant_type = _binary_type(grant_type, label="grant_type")
+    transfer_type = _binary_type(transfer_type, label="transfer_type")
+
+    grant = process["grant"]
+    transfer = process["transfer"]
+    grant_receipt_raw = np.asarray(grant["receipt"], dtype=np.float64)
+    grant_amount_raw = np.asarray(grant["amount"], dtype=np.float64)
+    transfer_receipt_raw = np.asarray(transfer["receipt"], dtype=np.float64)
+    transfer_amount_raw = np.asarray(transfer["amount"], dtype=np.float64)
+
+    if grant_receipt_raw.shape != (3, N_DESIGN + 1):
+        raise ValueError("Typed grant receipt parameters must have shape (3, 12).")
+    if grant_amount_raw.shape != (3, N_DESIGN + 1):
+        raise ValueError("Typed grant amount parameters must have shape (3, 12).")
+    if transfer_receipt_raw.shape != (N_INVARIANT + 5,):
+        raise ValueError("Typed transfer receipt parameters must contain 14 values.")
+    if transfer_amount_raw.shape != (N_INVARIANT + 5,):
+        raise ValueError("Typed transfer amount parameters must contain 14 values.")
+
+    grant_receipt = grant_receipt_raw[:, :N_DESIGN].copy()
+    grant_amount = grant_amount_raw[:, :N_DESIGN].copy()
+    transfer_receipt = transfer_receipt_raw[:-1].copy()
+    transfer_amount = transfer_amount_raw[:-1].copy()
+
+    # x1[0] is one, so adding the type shift to the intercept is exact.
+    grant_receipt[:, 0] += grant_type * grant_receipt_raw[:, -1]
+    grant_amount[:, 0] += grant_type * grant_amount_raw[:, -1]
+    transfer_receipt[0] += transfer_type * transfer_receipt_raw[-1]
+    transfer_amount[0] += transfer_type * transfer_amount_raw[-1]
+
+    return (
+        np.ascontiguousarray(grant_receipt),
+        np.ascontiguousarray(grant_amount),
+        np.ascontiguousarray(grant["sigma"], dtype=np.float64),
+        np.ascontiguousarray(transfer_receipt),
+        np.ascontiguousarray(transfer_amount),
+        float(transfer["sigma"]),
+    )
+
+
+@njit(cache=True)
+def expected_financial_help_numba(
+    x1,
+    education,
+    work,
+    grant_receipt,
+    grant_amount,
+    grant_sigma,
+    transfer_receipt,
+    transfer_amount,
+    transfer_sigma,
+):
+    """Expected grant plus parental transfer for one Bellman alternative.
+
+    All validation and type selection occur before this hot-path function.
+    ``x1`` has nine entries; education is 0--3 and work is 0--2. Transfers
+    remain eligible only for two- and four-year enrollment, matching the EM.
+    """
+    if education < 1 or education > 3:
+        return 0.0
+
+    education_index = education - 1
+    part_time = 1.0 if work == 1 else 0.0
+    full_time = 1.0 if work == 2 else 0.0
+
+    grant_receipt_index = 0.0
+    grant_amount_index = 0.0
+    for column in range(N_INVARIANT):
+        grant_receipt_index += x1[column] * grant_receipt[education_index, column]
+        grant_amount_index += x1[column] * grant_amount[education_index, column]
+    grant_receipt_index += (
+        part_time * grant_receipt[education_index, 9]
+        + full_time * grant_receipt[education_index, 10]
+    )
+    grant_amount_index += (
+        part_time * grant_amount[education_index, 9]
+        + full_time * grant_amount[education_index, 10]
+    )
+
+    if grant_receipt_index >= 0.0:
+        grant_probability = 1.0 / (1.0 + np.exp(-grant_receipt_index))
+    else:
+        grant_exp = np.exp(grant_receipt_index)
+        grant_probability = grant_exp / (1.0 + grant_exp)
+    grant_log_mean = grant_amount_index + 0.5 * grant_sigma[education_index] ** 2
+    grant_log_mean = min(20.0, max(-20.0, grant_log_mean))
+    expected_grant = grant_probability * np.exp(grant_log_mean)
+
+    if education not in (1, 2):
+        return expected_grant
+
+    transfer_receipt_index = 0.0
+    transfer_amount_index = 0.0
+    for column in range(N_INVARIANT):
+        transfer_receipt_index += x1[column] * transfer_receipt[column]
+        transfer_amount_index += x1[column] * transfer_amount[column]
+    four_year = 1.0 if education == 2 else 0.0
+    graduate = 1.0 if education == 3 else 0.0
+    transfer_receipt_index += (
+        four_year * transfer_receipt[9]
+        + graduate * transfer_receipt[10]
+        + part_time * transfer_receipt[11]
+        + full_time * transfer_receipt[12]
+    )
+    transfer_amount_index += (
+        four_year * transfer_amount[9]
+        + graduate * transfer_amount[10]
+        + part_time * transfer_amount[11]
+        + full_time * transfer_amount[12]
+    )
+
+    if transfer_receipt_index >= 0.0:
+        transfer_probability = 1.0 / (1.0 + np.exp(-transfer_receipt_index))
+    else:
+        transfer_exp = np.exp(transfer_receipt_index)
+        transfer_probability = transfer_exp / (1.0 + transfer_exp)
+    transfer_log_mean = transfer_amount_index + 0.5 * transfer_sigma ** 2
+    transfer_log_mean = min(20.0, max(-20.0, transfer_log_mean))
+    expected_transfer = transfer_probability * np.exp(transfer_log_mean)
+    return expected_grant + expected_transfer
 
 
 def _coerce_structural_design(parameters, education):

@@ -44,7 +44,12 @@ T = 10
 # major at graduation
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, STATES
 import budget_shock as bs
-from financial_process import load_education_grant_process, expected_grant_scalar
+from financial_process import (
+    expected_financial_help_numba,
+    load_auxiliary_financial_process,
+    prepare_type_financial_parameters,
+)
+from latent_types import type_components
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathcont = DIR["MODEL_CONTINUATION"]
@@ -52,6 +57,32 @@ pathcontfinal = DIR["MODEL_CONTINUATION_FINAL"]
 path_estimates       = DIR["MODEL_ESTIMATES"]
 pathout       = DIR["MODEL_OUTPUT"]
 #-----------------------------------------------------------------------------#
+
+# Each worker loads the common EM financial estimates at most once and caches
+# the numeric coefficient arrays selected for every joint type it encounters.
+_auxiliary_financial_process = None
+_type_financial_parameters = {}
+
+
+def get_type_financial_parameters(type_id):
+    """Return Numba-ready grant/transfer arrays for joint ``type_id``.
+
+    Validation, disk loading, and type selection happen before the Bellman
+    loops. Inner functions therefore receive only numeric arrays and never map
+    types or inspect parameter dictionaries.
+    """
+    global _auxiliary_financial_process
+
+    _, grant_type, transfer_type = type_components(type_id)
+    if type_id not in _type_financial_parameters:
+        if _auxiliary_financial_process is None:
+            _auxiliary_financial_process = load_auxiliary_financial_process(
+                EST("auxiliary_em_results.npz")
+            )
+        _type_financial_parameters[type_id] = prepare_type_financial_parameters(
+            _auxiliary_financial_process, grant_type, transfer_type
+        )
+    return _type_financial_parameters[type_id]
 
 #-----------------------------------------------------------------------------#
 # --> Define the functions
@@ -83,10 +114,6 @@ def load_all_parameters():
 
     sigmas = np.load(f"{pathfunctions}/sigmas.npy")
 
-    grant_process = load_education_grant_process(pathfunctions)
-
-    param_fam = np.load(f"{pathfunctions}/parental_transfers.npy")
-
     grad_2    = np.load(f"{pathfunctions}/prob_grad_twoyear.npy")[..., None].T
     grad_4    = np.load(f"{pathfunctions}/prob_grad_four.npy")[..., None].T
     grad_grad = np.load(f"{pathfunctions}/prob_grad_grad.npy")[..., None].T
@@ -96,8 +123,6 @@ def load_all_parameters():
         wage_0,
         param_wage,
         sigmas,
-        grant_process,
-        param_fam,
         param_prob_grad,
     )
 
@@ -243,24 +268,33 @@ def wage(x1_new,x2_new,j,param_wage):
     w = x@param_wage.T
     return w
 
-#@njit()
-def fin_help(x1_new,x2,j,period):
-    
-    "this function returns the amount of financial help individuals will recieve"
+@njit(cache=True)
+def fin_help(x1_new, j, financial_parameters):
+    """Expected grant plus transfer for one schooling alternative.
 
-    # help = b0 + x1_new +  4ydummy
-    if j[1] == 1:
-        x = np.append(x1_new,0)  # include 4ydummy
-    elif j[1] == 2:
-        x = np.append(x1_new,1) # include 4ydummy
-    elif j[1] == 3: # For now assume is the same for simplicity
-        x = np.append(x1_new,1) # include 4ydummy
-
-    p_trans = x@param_fam
-    grants = expected_grant_scalar(x1_new, j[1], j[2], grant_process)
-    h = np.exp(p_trans) + grants
-    
-    return h
+    The coefficient tuple is preselected for the permanent joint type before
+    entering the Bellman loops. This function therefore performs no type
+    mapping, file access, allocation of design vectors, or validation.
+    """
+    (
+        grant_receipt,
+        grant_amount,
+        grant_sigma,
+        transfer_receipt,
+        transfer_amount,
+        transfer_sigma,
+    ) = financial_parameters
+    return expected_financial_help_numba(
+        x1_new,
+        int(j[1]),
+        int(j[2]),
+        grant_receipt,
+        grant_amount,
+        grant_sigma,
+        transfer_receipt,
+        transfer_amount,
+        transfer_sigma,
+    )
 
 @njit()
 def tuition(j):
@@ -419,7 +453,10 @@ def get_g(x1_new,x2,j,param_g,param_g_last):
 
 
 #@njit()
-def get_utility(sigma_u,x1,x1_new,x2,b,b1,e,j,period,z=0.0):
+def get_utility(
+    sigma_u, x1, x1_new, x2, b, b1, e, j, period,
+    financial_parameters, z=0.0
+):
     """
     Studying consumption for each (shock point, b) pair.
     e: array length Q
@@ -429,7 +466,7 @@ def get_utility(sigma_u,x1,x1_new,x2,b,b1,e,j,period,z=0.0):
     nb = np.shape(b)[0]
     Q  = np.shape(e)[0]
 
-    h0 = fin_help(x1_new,x2,j,period)   # scalar
+    h0 = fin_help(x1_new, j, financial_parameters)  # type-specific scalar
     h_vis = np.repeat(h0, nb*Q)         # length Q*nb
 
     # Add budget shock if provided as vector
@@ -1483,7 +1520,10 @@ def evolve_continuation(x1,x1_new,x2,x2_new,b,period,e,j,evt,debt_tomorrow):
     
     return continuation
 
-def get_conditional(sigma_u,x1,x1_new,x2,x2_new,b,b1,e,j,period,evt,conterfactual,maxdebt,z=0.0):
+def get_conditional(
+    sigma_u, x1, x1_new, x2, x2_new, b, b1, e, j, period, evt,
+    conterfactual, maxdebt, financial_parameters, z=0.0
+):
 
     global debt_pen_vec
 
@@ -1518,7 +1558,10 @@ def get_conditional(sigma_u,x1,x1_new,x2,x2_new,b,b1,e,j,period,evt,conterfactua
 
     else:
         # ---- STUDYING ----
-        c = get_utility(sigma_u,x1,x1_new,x2_new,b,b1,e,j,period,z=z)
+        c = get_utility(
+            sigma_u, x1, x1_new, x2_new, b, b1, e, j, period,
+            financial_parameters, z=z
+        )
         continuation = beta*VT(x1,x1_new,x2,x2_new,b1,period,j,evt,0)  # shape (nb,1) or (nb,?)
 
         # IMPORTANT: include penalty INSIDE the maximization.
@@ -1594,7 +1637,7 @@ def get_quadrature_wage(deg,mu,j):
 
 def get_expected_conditional(
     sigma_u, x1, x1_new, x2, x2_new, b, b1, j, period, deg, evt, conterfactual, maxdebt,
-    deg_budget=5
+    financial_parameters, deg_budget=5
 ):
     nb = np.shape(b)[0]
 
@@ -1603,7 +1646,8 @@ def get_expected_conditional(
     if j[1] == 0:
         w_vis = np.repeat(we, nb)
         v = get_conditional(
-            sigma_u, x1, x1_new, x2, x2_new, b, b1, e_nodes, j, period, evt, conterfactual, maxdebt, z=0.0
+            sigma_u, x1, x1_new, x2, x2_new, b, b1, e_nodes, j, period,
+            evt, conterfactual, maxdebt, financial_parameters, z=0.0
         ) * w_vis
         v = v.reshape((len(e_nodes), nb)).T
         return np.sum(v, axis=1)
@@ -1619,7 +1663,7 @@ def get_expected_conditional(
     v = get_conditional(
         sigma_u, x1, x1_new, x2, x2_new, b, b1,
         e_joint, j, period, evt, conterfactual, maxdebt,
-        z=z_joint
+        financial_parameters, z=z_joint
     ) * w_vis
 
     v = v.reshape((len(w_joint), nb)).T
@@ -1907,7 +1951,11 @@ def get_x_exp(x1,x2):
     
     return x_exp
 
-def get_all_choices(x1,x1_new,x2,x2_new,b,b1,period,evt,ccp_real,sigma_u,utility_parameters,models,solution_mode,conterfactual,maxdebt):
+def get_all_choices(
+    x1, x1_new, x2, x2_new, b, b1, period, evt, ccp_real, sigma_u,
+    utility_parameters, models, solution_mode, conterfactual, maxdebt,
+    financial_parameters
+):
     
     # For each state x1 and x2 loop over all possible choices.
     
@@ -1922,7 +1970,10 @@ def get_all_choices(x1,x1_new,x2,x2_new,b,b1,period,evt,ccp_real,sigma_u,utility
         
         # get the choice
         #tic = time.time()
-        vjt = get_expected_conditional(sigma_u,x1,x1_new,x2,x2_new,b,b1,j,period,5,evt,conterfactual,maxdebt)
+        vjt = get_expected_conditional(
+            sigma_u, x1, x1_new, x2, x2_new, b, b1, j, period, 5,
+            evt, conterfactual, maxdebt, financial_parameters
+        )
         #toc = time.time()
         
         #print("J Elapsed time: ",toc-tic)
@@ -2174,7 +2225,11 @@ def get_terminal_pandas(evt,x1,x2,sigma_u,conterfactual):
     
     return evt
 
-def loop_rows(i,x1,x2,b,b1,period,evt,ccp_real,sigma_u,utility_parameters,models,solution_mode,conterfactual,maxdebt):
+def loop_rows(
+    i, x1, x2, b, b1, period, evt, ccp_real, sigma_u,
+    utility_parameters, models, solution_mode, conterfactual, maxdebt,
+    financial_parameters
+):
     inv = x1[i,:]
     inv = inv[..., None].T
     # Generate x1
@@ -2189,11 +2244,19 @@ def loop_rows(i,x1,x2,b,b1,period,evt,ccp_real,sigma_u,utility_parameters,models
             vt = terminal_from_interp(inv, x2, sigma_u, b)[..., None]  # b is debt_range (len=100)
         return vt
     elif period != 1:
-        all_vjt, exp_vjt, ccp  = get_all_choices(inv,x1_new,x2,x2_new,b,b1,period,evt,ccp_real,sigma_u,utility_parameters,models,solution_mode,conterfactual,maxdebt)
+        all_vjt, exp_vjt, ccp = get_all_choices(
+            inv, x1_new, x2, x2_new, b, b1, period, evt, ccp_real,
+            sigma_u, utility_parameters, models, solution_mode,
+            conterfactual, maxdebt, financial_parameters
+        )
         #get_expected_continuation(inv,x1_new,x2,x2_new,b1,period)
         return all_vjt, exp_vjt, ccp
     else:
-        all_vjt, exp_vjt, ccp  = get_all_choices(inv,x1_new,x2,x2_new,b,b1,period,evt,ccp_real,sigma_u,utility_parameters,models,solution_mode,conterfactual,maxdebt)
+        all_vjt, exp_vjt, ccp = get_all_choices(
+            inv, x1_new, x2, x2_new, b, b1, period, evt, ccp_real,
+            sigma_u, utility_parameters, models, solution_mode,
+            conterfactual, maxdebt, financial_parameters
+        )
         return all_vjt, exp_vjt, ccp
 
 
@@ -2234,7 +2297,7 @@ def persist_outputs_for_period(
             # vjt_nog / evt_nog
             save_fn(f"vjt_nog/{period}/vjt_t{period}_{x1i}_em{em_type}.npz", names_vjt, result_vjt, compressed=True)
             if save_evt == 1:
-                save_fn(f"evt_nog/{period}/evt_t{period}_{x1i}.npz",         names_exp, result_exp, compressed=True)
+                save_fn(f"evt_nog/{period}/evt_t{period}_{x1i}_em{em_type}.npz", names_exp, result_exp, compressed=True)
 
         elif solution_mode == 1:
             if conterfactual == 0:
@@ -2252,7 +2315,7 @@ def persist_outputs_for_period(
         # Terminal period: only EVT bundles are written
         if save_evt == 1:
             if solution_mode == 0:
-                save_fn(f"evt_nog/{period}/evt_t{period}_{x1i}.npz",            names_exp, result_exp, compressed=True)
+                save_fn(f"evt_nog/{period}/evt_t{period}_{x1i}_em{em_type}.npz", names_exp, result_exp, compressed=True)
             elif solution_mode == 1:
                 if conterfactual == 0:
                     save_fn(f"evt/{period}/evt_t{period}_{x1i}_em{em_type}.npz", names_exp, result_exp, compressed=True)
@@ -2262,7 +2325,7 @@ def persist_outputs_for_period(
 
 def loop_over_states(i, x1, x2_set, b, b1, period, ccp_real, sigma_u, 
                      utility_parameters,models,solution_mode,conterfactual,
-                     evtnew,em_type,maxdebt,save_evt = 1):
+                     evtnew,em_type,maxdebt,financial_parameters,save_evt = 1):
     
     """This function just facilitates debugging since a full x2 iteration
     can be done by just calling this function"""
@@ -2289,7 +2352,11 @@ def loop_over_states(i, x1, x2_set, b, b1, period, ccp_real, sigma_u,
         #print(i,x2)
         tic = time.time()
         if period < T:
-            all_vjt, exp_vjt, ccp = loop_rows(i, x1, x2, b, b1, period,evt, ccp_real, sigma_u, utility_parameters,models,solution_mode,conterfactual,maxdebt)
+            all_vjt, exp_vjt, ccp = loop_rows(
+                i, x1, x2, b, b1, period, evt, ccp_real, sigma_u,
+                utility_parameters, models, solution_mode, conterfactual,
+                maxdebt, financial_parameters
+            )
             names_exp.append(f"evt_t{period}_{x1i}_{x2.astype(int)}")
             names_vjt.append(f"vjt_t{period}_{x1i}_{x2.astype(int)}")
             names_ccp.append(f"ccp_t{period}_{x1i}_{x2.astype(int)}")
@@ -2298,7 +2365,11 @@ def loop_over_states(i, x1, x2_set, b, b1, period, ccp_real, sigma_u,
             result_exp.append(exp_vjt)
         else:
             models = 0
-            exp_vjt= loop_rows(i, x1, x2, b, b1, period,evt, ccp_real, sigma_u, utility_parameters,models, solution_mode,conterfactual,maxdebt)
+            exp_vjt = loop_rows(
+                i, x1, x2, b, b1, period, evt, ccp_real, sigma_u,
+                utility_parameters, models, solution_mode, conterfactual,
+                maxdebt, financial_parameters
+            )
             names_exp.append(f"evt_t{period}_{x1i}_{x2.astype(int)}")
             result_exp.append(exp_vjt)
             
@@ -2327,7 +2398,12 @@ def loop_over_states(i, x1, x2_set, b, b1, period, ccp_real, sigma_u,
     # Store CCPs if needed
     
     if ccp_real == 1: 
-        save_npz_here(f"ccp/{period}/ccp_t{period}_{x1i}_{em_type}.npz",    names_ccp, results_ccp, compressed=True)
+        save_npz_here(
+            f"ccp/{period}/ccp_t{period}_{x1i}_em{em_type}.npz",
+            names_ccp,
+            results_ccp,
+            compressed=True,
+        )
     
     return evtnext
         
@@ -2335,9 +2411,16 @@ def loop_over_states(i, x1, x2_set, b, b1, period, ccp_real, sigma_u,
 def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
                 solution_mode,conterfactual,em_type,maxdebt):
 
-    """This function computes the expected conditional value function for
-    each period, chioce and state and store them in the computer"""
+    """Solve and save one invariant state's Bellman problem for one joint type.
+
+    ``em_type`` is the permanent joint type ID in ``1, ..., 8``. Its schooling
+    component is already encoded in ``utility_parameters`` by ``build_param_g``.
+    Grant and transfer components are mapped once here and passed downward as
+    a preselected tuple of numeric arrays.
+    """
     time.sleep(0)
+
+    financial_parameters = get_type_financial_parameters(em_type)
         
     evtnext = 0 
     
@@ -2362,7 +2445,7 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
         evtnext = loop_over_states(i, x1, x2_set, b, b1, period, ccp_real,
                                    sigma_u,utility_parameters,models,
                                    solution_mode,conterfactual,evt,
-                                   em_type,maxdebt)
+                                   em_type,maxdebt,financial_parameters)
         
         
         
@@ -2473,7 +2556,7 @@ def simulate_all_states(periods):
     
 
 def load_param_g(em_type,real=1):
-    
+    """Load flow-utility parameters for one permanent joint type ID."""
     if real == 1:
         param_utility = np.load(f"{path_estimates}/param_g.npy")
     else:
@@ -2936,8 +3019,14 @@ def get_amount_educ():
 
 def build_param_g(em_type,param_utility):
     
-    """This function takes as inputs the vector of utility parameters and consutcs
-    the different matrix with the parameters. Those are
+    """Construct flow-utility arrays for one permanent joint type.
+
+    The joint type's school component determines whether the two estimated
+    schooling-preference shifts are active. Grant and transfer components do
+    not enter flow utility; they enter the Bellman budget through ``fin_help``.
+    This function is setup code and runs once per parameter vector and type.
+
+    The returned matrices are:
     
     param_g_x1      ---   associated with preferences of individulas
     param_g_work    ---   full vs part time preference dislike of work
@@ -2947,6 +3036,8 @@ def build_param_g(em_type,param_utility):
     param_g_first   ---   cost of first time enrollment 
     
     """
+
+    school_type, _, _ = type_components(em_type)
     
     size = np.shape(get_total_choices())[0]
      
@@ -3024,7 +3115,7 @@ def build_param_g(em_type,param_utility):
     past = past + amount_exp
     param_type = param_utility[past:past+amount_type]
     param_type = build_param_type(param_type,fields,size)
-    if em_type == 1:  # if it is the base category, set effects to 0!
+    if school_type == 0:  # Low-schooling component is the utility base type.
         param_type[:,:] = 0
 
     utility_parameters = [param_g_x1,param_g_work,param_g_last,param_educ,param_period,param_period_work,param_first,param_exp,param_type]
@@ -3278,7 +3369,7 @@ def get_debt_range():
 #-----------------------------------------------------------------------------#
 
 
-(wage_0, params_wage, sigmas, grant_process, param_fam, param_prob_grad) = load_all_parameters()
+(wage_0, params_wage, sigmas, param_prob_grad) = load_all_parameters()
 sigma_u_parinc, budget_params, debt_pen_vec = load_params_frombudget()
 
 #simulate_all_states(11)

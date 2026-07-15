@@ -44,6 +44,7 @@ from model_interpolate_terminal import build_interpolator_dictionary
 
 from config import DIR, OUT, EST, ENSURE_DIR
 import budget_shock as bs
+from latent_types import TYPE_IDS, validate_q, validate_saved_layout
 
 # Canonical roots from config (no chdir anywhere)
 PATH_OUT        = DIR["MODEL_OUTPUT"]
@@ -55,6 +56,24 @@ r = 0.05
 beta = 0.98
 
 debt_range = get_debt_range()
+_EM_POSTERIORS = None
+
+
+def load_full_em_posteriors():
+    """Load posterior weights in the shared joint-type ordering."""
+    global _EM_POSTERIORS
+    if _EM_POSTERIORS is not None:
+        return _EM_POSTERIORS
+
+    with np.load(EST("auxiliary_em_results.npz"), allow_pickle=False) as results:
+        validate_saved_layout(
+            results["type_names"],
+            results["type_school"],
+            results["type_grant"],
+            results["type_transfer"],
+        )
+        _EM_POSTERIORS = validate_q(results["q"])
+    return _EM_POSTERIORS
 
 # ==============================================================================
 # Savers
@@ -253,7 +272,7 @@ def load_fundamentals(period, interp_dict, clear_data=False):
         get_feasible_pubid()
 
     x1, state, debt, debtchoice, choices, income = load_data_superfeasible(period, return_income=True)
-    types = np.load(EST("em_q_typeff2.npy"))
+    types = load_full_em_posteriors()
 
     # keep only education choices
     mask = (choices[:, 1] > 0)
@@ -269,10 +288,12 @@ def load_fundamentals(period, interp_dict, clear_data=False):
     debt = debt_range[debt.astype("int")]
     debtchoice = debt_range[debtchoice.astype("int")]
 
-    # CCP path (per type)
-    ccp_path_type1 = load_ccp_path(x1, state, choices, period, 1)
-    ccp_path_type2 = load_ccp_path(x1, state, choices, period, 2)
-    ccp_path = [ccp_path_type1, ccp_path_type2]
+    # First axis follows the same type ordering as the posterior columns.
+    ccp_path = np.stack(
+        [load_ccp_path(x1, state, choices, period, em_type)
+         for em_type in TYPE_IDS],
+        axis=0,
+    )
 
     # budget w/o shock
     budget = get_budget(income, debt, choices)
@@ -381,20 +402,12 @@ def print_moment_progress(m_data_flat, m_sim_flat, levels, nmoments=2, decimals=
 # CCP-type selection + sampling
 
 @njit()
-def get_ccp_type(ccp1, ccp2, eductype):
-    """
-    Your convention in old code:
-      eductype in {1,2}, but you wrote "if eductype==0 use ccp1 else ccp2".
-    Here we treat:
-      eductype==1 -> type1, else -> type2
-    """
-    ccp = np.zeros(ccp1.shape)
-    n = eductype.shape[0]
+def get_ccp_type(ccp_by_type, type_index):
+    """Select each sampled individual's CCP path by zero-based type index."""
+    n = type_index.shape[0]
+    ccp = np.empty((n, ccp_by_type.shape[2]), dtype=ccp_by_type.dtype)
     for i in range(n):
-        if eductype[i] == 1:
-            ccp[i, :] = ccp1[i, :]
-        else:
-            ccp[i, :] = ccp2[i, :]
+        ccp[i, :] = ccp_by_type[type_index[i], i, :]
     return ccp
 
 def get_sample(x1, state, types, debt, choices, ccp_path, budget, terminal, n_sample=10000):
@@ -413,13 +426,14 @@ def get_sample(x1, state, types, debt, choices, ccp_path, budget, terminal, n_sa
     choicessample    = choices[idx, :]
     budgetsample     = budget[idx]
 
-    ccp1 = ccp_path[0][idx, :]
-    ccp2 = ccp_path[1][idx, :]
-
-    # draw education type using original convention
-    eductype = np.random.binomial(1, types[:, 1], size=N)[idx] + 1  # -> {1,2}
-
-    evt = get_ccp_type(ccp1, ccp2, eductype.astype(np.int64))
+    # Draw the permanent joint type from each individual's full posterior.
+    cumulative_q = np.cumsum(types[idx], axis=1)
+    cumulative_q[:, -1] = 1.0
+    type_index = np.sum(
+        np.random.random(n_sample)[:, None] > cumulative_q,
+        axis=1,
+    ).astype(np.int64)
+    evt = get_ccp_type(ccp_path[:, idx, :], type_index)
 
     e = np.random.normal(loc=0.0, scale=1.0, size=n_sample).astype(np.float64)
 

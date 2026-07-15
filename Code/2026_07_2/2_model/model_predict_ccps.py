@@ -178,7 +178,7 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
 
 def load_utility_parameters(type_id, results_file=AUXILIARY_RESULTS_FILE):
     """Load the complete auxiliary choice index for one joint latent type."""
-    school_type, _, _ = type_components(type_id)
+    type_components(type_id)  # Validate the public one-based joint type ID.
     with np.load(results_file, allow_pickle=False) as results:
         if "choice_parameters" not in results.files:
             raise ValueError(
@@ -192,12 +192,9 @@ def load_utility_parameters(type_id, results_file=AUXILIARY_RESULTS_FILE):
             f"expected {(expected_size,)}."
         )
 
-    # model_solution_em.build_param_g still exposes the old two-school-type
-    # interface. Map the joint type to that interface until the solver itself
-    # is converted to accept joint type IDs.
-    utility_parameters = build_param_g(
-        school_type + 1, choice_parameters[:total_n]
-    )
+    # build_param_g maps the joint ID to its schooling component. The same ID
+    # selects financial components below, keeping one ordering throughout.
+    utility_parameters = build_param_g(type_id, choice_parameters[:total_n])
     return {
         "type_id": type_id,
         "type_index": type_index(type_id),

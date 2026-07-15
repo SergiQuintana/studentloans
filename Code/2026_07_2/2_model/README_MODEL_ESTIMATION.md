@@ -51,16 +51,23 @@ compatibility mapping, but existing income panels do not contain the graduate
 grant correction and therefore are not sufficient for the new EM grant block.
 
 The auxiliary estimator in `model_em_algorithm.py` estimates the same three
-education-specific hurdle models and a pooled parental-transfer hurdle model.
-Its latent distribution has eight joint classes: binary schooling type x binary
-grant type x binary parental-transfer type. The grant-type shift enters only the
-grant receipt and positive-amount equations; the parental-transfer-type shift
-enters only the corresponding transfer equations. Expected consumption is
-therefore cached for the four grant/transfer combinations and selected using
-each class's two resource indicators. The 604-parameter education-choice
-objective and analytic gradient remain unchanged in size. These two resource
-types are auxiliary only: neither currently enters structural solution or
-forward simulation.
+education-specific grant hurdle models, a pooled parental-transfer hurdle
+model, and three education-specific annual-loan hurdle models. Its auxiliary
+latent distribution has sixteen joint classes: binary schooling type x binary
+grant type x binary parental-transfer type x binary loan type. Loan receipt and
+positive log amount depend on demographics plus realized grants and transfers;
+separate baseline equations are used for two-year, four-year, and graduate
+enrollment. Only enrolled person-years enter the loan equations. Expected
+consumption remains cached for the four grant/transfer combinations, so the
+loan type is currently identified by the loan measurement equations rather than
+entering the 604-parameter choice block directly.
+
+For this intermediate stage, `latent_types.py` deliberately remains the shared
+eight-type structural interface. The auxiliary checkpoint/results contain the
+full sixteen-column posterior and also save an explicit posterior collapsed over
+the loan dimension as `auxiliary_q_eight_types.npy`. Structural estimation and
+simulation should not consume the full sixteen-type result until their separate
+loan-type conversion is implemented.
 
 The active auxiliary choice objective keeps the exact closed-form score but
 evaluates all individual-by-type softmax rows in a Numba-parallel kernel. It

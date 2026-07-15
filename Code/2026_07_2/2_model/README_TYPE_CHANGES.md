@@ -1,14 +1,44 @@
 # Temporary tracker: extending the structural model to eight latent types
 
-Status: implementation in progress. The shared type layout, typed auxiliary
-financial-process interface, and eight-type auxiliary CCP predictor are implemented.
-The Bellman solver and structural likelihood still use their old interfaces.
+Status: estimation conversion implemented; simulation conversion remains. The
+shared type layout, typed financial processes, auxiliary CCP predictor, Bellman
+solution, structural likelihood, NPL estimation driver, and optional
+budget-shock path now use the joint-type interface.
+
+Auxiliary-only update: `model_em_algorithm.py` now extends its measurement
+mixture to sixteen S x G x T x L classes by adding a binary annual-loan type.
+The shared structural layout in `latent_types.py` intentionally remains at the
+eight S x G x T classes documented below. Expanding that shared interface is a
+separate later stage after the new auxiliary EM has been validated.
 
 This file tracks the changes required to extend the complete model from the old
 two-schooling-type interface to the eight joint types already estimated by the
 auxiliary EM algorithm. Update the checkboxes as implementation proceeds. This
 is a temporary working document and can be merged into
 `README_MODEL_ESTIMATION.md` after the conversion is complete.
+
+## Latest estimation update
+
+The following estimation changes are implemented:
+
+- `model_em_algorithm.py` prepares, loads, and evaluates VJTs for every ID in
+  `TYPE_IDS`. The structural likelihood receives one `vjt_all_types` collection
+  and the complete posterior matrix.
+- Posterior column selection occurs once per type with
+  `type_weights = q[:, type_index]`. The one-dimensional weights and mapped
+  schooling component are passed into the Numba gradient kernels.
+- `estimation_all_em.py` loads `q` from `auxiliary_em_results.npz`, constructs
+  type-indexed utility parameters, and creates Bellman, initial-CCP, and
+  CCP-sequence multiprocessing tasks from `TYPE_IDS`.
+- The original estimation switches, NPL iteration, optimizer, parameter update,
+  and output filenames are preserved.
+- `model_fitloans_dynamic.py` loads CCP paths for all configured types and uses
+  a categorical draw from each individual's full posterior. CCP-path selection
+  remains in a compact Numba kernel.
+- `tables.py` uses the new `vjt_all_types` return interface.
+
+The number of joint types is therefore controlled by `latent_types.py`; the
+estimation code does not contain a replacement hard-coded loop over eight.
 
 ## Target economic specification
 
@@ -54,14 +84,15 @@ this portion is expected to be approximately four times as expensive.
 - [x] Define `TYPE_IDS`, `TYPE_COMPONENTS`, `TYPE_NAMES`, and `N_TYPES` there.
 - [x] Add `type_components(type_id)` with bounds validation.
 - [x] Keep `type_id` one-based at public interfaces and in filenames.
-- [ ] Use `type_index = type_id - 1` only for NumPy/posterior/list indexing.
-- [ ] Do not append type to the existing `x2` arrays. Pass it separately as a
+- [x] Use a zero-based `type_index` only for NumPy/posterior/list indexing.
+- [x] Do not append type to the existing `x2` arrays. Pass it separately as a
       permanent state index, as the code currently passes `em_type`.
-- [ ] Replace hard-coded `range(1, 3)` loops with `TYPE_IDS`, not `range(1, 9)`.
-- [ ] Replace paired names such as `type1/type2` with type-indexed collections.
-- [ ] Load posterior `q` and the type layout from the same full EM results file
+- [x] Replace hard-coded `range(1, 3)` loops with `TYPE_IDS`, not `range(1, 9)`.
+- [x] Replace paired names such as `type1/type2` with type-indexed collections
+      in the active estimation path.
+- [x] Load posterior `q` and the type layout from the same full EM results file
       and validate that their dimensions and ordering agree.
-- [ ] Keep collapsed two-column posterior files only for deliberate reporting
+- [x] Keep collapsed two-column posterior files only for deliberate reporting
       or backward compatibility, never as structural-model inputs.
 
 ## 1. Shared latent-type definition (new file)
@@ -85,18 +116,19 @@ functions in the same file still assume two.
 - [x] Import the shared type layout and remove the local duplicate definitions
       (`TYPE_NAMES`, `TYPE_SCHOOL`, `TYPE_GRANT`, `TYPE_TRANSFER`,
       `N_AUXILIARY_TYPES`) or alias them from the shared module.
-- [ ] Preserve the current eight-type auxiliary likelihood and EM M-steps.
-- [ ] In `prepare_vjt_feasible`, replace the two-type loop with `TYPE_IDS`.
-- [ ] Continue saving prepared VJT arrays with `_em{type_id}` filenames.
-- [ ] In `load_all_arrays_feasible`, replace `vjt_all_type1` and
+- [x] Preserve the current eight-type auxiliary likelihood and EM M-steps.
+- [x] In `prepare_vjt_feasible`, replace the two-type loop with `TYPE_IDS`.
+- [x] Continue saving prepared VJT arrays with `_em{type_id}` filenames.
+- [x] In `load_all_arrays_feasible`, replace `vjt_all_type1` and
       `vjt_all_type2` with one `vjt_all_types` collection.
-- [ ] Change `likelihood` to accept `vjt_all_types` and infer/check the number
+- [x] Change `likelihood` to accept `vjt_all_types` and infer/check the number
       of types from the shared layout and `q`.
-- [ ] Loop over every joint `type_id` in the structural likelihood.
-- [ ] Weight the conditional contribution for type `k` by `q[:, k]`.
-- [ ] In the structural `get_all_g`, map joint type to school type instead of
+- [x] Loop over every joint `type_id` in the structural likelihood.
+- [x] Weight the conditional contribution for type `k` by an explicitly sliced
+      `type_weights = q[:, type_index]` vector passed into the Numba kernels.
+- [x] In the structural `get_all_g`, map joint type to school type instead of
       interpreting joint IDs 1 and 2 as the two schooling types.
-- [ ] In `jacobian_likelihood_numba` / `jacobian_likelihood`, use the mapped
+- [x] In `jacobian_likelihood_numba` / `jacobian_likelihood`, use the mapped
       school type to activate the two schooling-type coefficients.
 - [ ] Generalize `temp_jacobian`, `notlogs_likelihood`, and any retained
       structural diagnostic likelihoods that are still used.
@@ -146,31 +178,39 @@ saved by the auxiliary EM.
 
 ### `model_solution_em.py`
 
-- [ ] Import the shared latent-type helpers.
-- [ ] Load the EM-estimated type-specific financial process.
-- [ ] Treat the existing `em_type` argument as joint `type_id` (renaming can be
+- [x] Import the shared latent-type helpers.
+- [x] Load and cache the EM-estimated type-specific financial process lazily in
+      each worker.
+- [x] Treat the existing `em_type` argument as joint `type_id` (renaming can be
       postponed to minimize the initial diff).
-- [ ] Pass joint type through the complete Bellman call chain:
-  - [ ] `get_all_evt`
-  - [ ] `loop_over_states`
-  - [ ] `loop_rows`
-  - [ ] `get_all_choices`
-  - [ ] `get_expected_conditional`
-  - [ ] `get_conditional`
-  - [ ] `get_debt_income`
-  - [ ] `get_debt_income_home`
-  - [ ] `fin_help`
-- [ ] In `fin_help`, map joint type to grant and transfer types and select the
-      corresponding expected-resource equations.
-- [ ] In `load_param_g` / `build_param_g`, map joint type to school type.
-- [ ] Set the schooling-type utility block to zero when `school_type == 0`, not
+- [x] Map joint type once in `get_all_evt` and pass its preselected numeric
+      financial context through the studying branch of the Bellman call chain:
+  - [x] `get_all_evt`
+  - [x] `loop_over_states`
+  - [x] `loop_rows`
+  - [x] `get_all_choices`
+  - [x] `get_expected_conditional`
+  - [x] `get_conditional`
+  - [x] `get_utility`
+  - [x] `fin_help`
+- [x] Keep `get_debt_income` and `get_debt_income_home` type-independent because
+      financial help enters only studying consumption.
+- [x] In `fin_help`, use the mapped grant and transfer equations through a
+      Numba-compatible numeric kernel.
+- [x] In `load_param_g` / `build_param_g`, map joint type to school type.
+- [x] Set the schooling-type utility block to zero when `school_type == 0`, not
       only when `em_type == 1`.
-- [ ] Keep the two existing schooling-type utility coefficients; the eight
+- [x] Keep the two existing schooling-type utility coefficients; the eight
       joint types do not require eight separate schooling-effect vectors.
 - [ ] Verify that terminal values remain type-independent under the maintained
       specification. If type affects only schooling-period utility/resources,
       the terminal interpolation does not need eight versions.
-- [ ] Verify every VJT/EVT/CCP save and load path uses the joint type ID.
+- [x] Ensure VJT/EVT/CCP save and load paths use the joint type ID, including
+      adding missing type suffixes to `evt_nog` and regenerated CCP files.
+
+The Bellman financial parameters are selected once per type. Type shifts are
+absorbed into intercepts before the solution loop, and the repeated grant-plus-
+transfer calculation receives only contiguous NumPy arrays and a scalar.
 
 The existing `_em{em_type}` filename convention can represent `_em1` through
 `_em8`; a new filename schema is not required.
@@ -179,17 +219,18 @@ The existing `_em{em_type}` filename convention can represent `_em1` through
 
 ### `estimation_all_em.py`
 
-- [ ] Import `TYPE_IDS` and `N_TYPES`.
-- [ ] Replace every solution loop over `range(1, 3)` with `TYPE_IDS`.
-- [ ] Load the complete eight-column posterior `q`.
-- [ ] Replace `utility_parameters1` and `utility_parameters2` with a
+- [x] Import the shared type layout.
+- [x] Replace every solution loop over `range(1, 3)` with `TYPE_IDS`.
+- [x] Load the complete eight-column posterior `q`.
+- [x] Replace `utility_parameters1` and `utility_parameters2` with a
       type-indexed `utility_parameters` collection.
-- [ ] Create multiprocessing arguments for all eight conditional solutions.
-- [ ] Do this in the initial solution, every NPL iteration, and the optional
+- [x] Create multiprocessing arguments for all joint-type solutions.
+- [x] Do this in the initial solution, every NPL iteration, and the optional
       budget-shock/CCP preparation paths.
-- [ ] Receive `vjt_all_types` from `load_all_arrays_feasible`.
-- [ ] Pass `vjt_all_types` and the full `q` to the structural likelihood.
-- [ ] Validate that all eight VJT sets exist before likelihood evaluation.
+- [x] Receive `vjt_all_types` from `load_all_arrays_feasible`.
+- [x] Pass `vjt_all_types` and the full `q` to the structural likelihood.
+- [x] Let the existing file loads fail directly if a required type-period VJT
+      artifact is absent; no separate preflight pass is added.
 
 ## 6. Initial CCP construction
 
@@ -219,24 +260,26 @@ The existing `_em{em_type}` filename convention can represent `_em1` through
 The internal interface already accepts `em_type` and is mostly generic.
 
 - [ ] Validate the incoming joint type using `latent_types.py`.
-- [ ] Ensure callers request sequences for every `type_id`.
-- [ ] Ensure it reads and writes `_em1` through `_em8` files.
+- [x] Ensure callers request sequences for every `type_id`.
+- [x] Ensure it reads and writes `_em1` through `_em8` files.
 - [ ] Replace any documentation saying the input has only two education types.
 
 ## 8. Active loan/budget-shock estimation
 
 ### `model_fitloans_dynamic.py`
 
-- [ ] Load the complete eight-column posterior, not `em_q_typeff2.npy`.
-- [ ] Replace `ccp_path_type1` / `ccp_path_type2` with a list or array of paths
+- [x] Load the complete joint-type posterior, not `em_q_typeff2.npy`.
+- [x] Replace `ccp_path_type1` / `ccp_path_type2` with an array of paths
       for all `TYPE_IDS`.
-- [ ] Replace the binary schooling-type draw with one categorical joint-type
+- [x] Replace the binary schooling-type draw with one categorical joint-type
       draw from each individual's `q[i, :]`.
-- [ ] Select each sampled individual's CCP path using `type_id - 1`.
-- [ ] Use grant and transfer resources selected by the same joint type.
+- [x] Select each sampled individual's CCP path using its zero-based posterior
+      column index inside the Numba kernel.
+- [x] Use the CCP path solved with the grant and transfer resources selected by
+      the same joint type.
 - [ ] Preserve fixed/common random draws within an optimization.
-- [ ] Remove comments and conditions interpreting type as only type 1/type 2.
-- [ ] Validate that the solution, CCP sequence, and observed individual all use
+- [x] Remove comments and conditions interpreting type as only type 1/type 2.
+- [x] Validate that the solution, CCP sequence, and observed individual all use
       the same type ordering.
 
 ## 9. Forward structural simulation

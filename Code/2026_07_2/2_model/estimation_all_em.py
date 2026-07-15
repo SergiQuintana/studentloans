@@ -51,7 +51,7 @@ warnings.simplefilter('ignore',category=NumbaPendingDeprecationWarning)
 #--------------------------#
 # Manage Working Directoires
 
-from config import DIR, OUT, ENSURE_DEFAULT_TREE, path_estimates, STATES
+from config import DIR, OUT, EST, ENSURE_DEFAULT_TREE, path_estimates, STATES
 
 ENSURE_DEFAULT_TREE(T=10)
 
@@ -71,7 +71,7 @@ import model_predict_ccps as mccp
 import model_getccp_sequence as mgs
 from model_interpolate_terminal import build_interp_cache 
 from model_fitloans_dynamic import estimate_budget_shock 
-from latent_types import TYPE_IDS
+from latent_types import TYPE_IDS, validate_q, validate_saved_layout
 #-----------------------------------------------------------------------------------------------#
 
 mu = 0
@@ -92,6 +92,18 @@ n_param_g_first = 1 + 4 + 1
 n_param_g_exp = (fields-1)*4*6
 n_param_g_type = 2
 total_n = n_param_g_x1 + n_param_g_change + n_param_g_work + n_param_g_educ + n_param_g_period + n_param_g_period_work + n_param_g_first + n_param_g_exp +  n_param_g_type
+
+
+def load_full_em_posteriors():
+    """Load posterior weights in the shared joint-type ordering."""
+    with np.load(EST("auxiliary_em_results.npz"), allow_pickle=False) as results:
+        validate_saved_layout(
+            results["type_names"],
+            results["type_school"],
+            results["type_grant"],
+            results["type_transfer"],
+        )
+        return validate_q(results["q"])
 
 # param wage now depends on:
 # ability
@@ -149,21 +161,22 @@ if __name__ == '__main__':
         solution_mode = 1
         ccp_real = []
         models = []
-        utility_parameters = ms.load_param_g(real=0)
+        utility_parameters = {
+            em_type: ms.load_param_g(em_type, real=0)
+            for em_type in TYPE_IDS
+        }
         ms.simulate_all_states(T)
-    
-        pool_obj = mp.Pool(
-            processes=60,
-            initializer=ms.init_worker_queue,
-        )
-    
+
+        conter = 0
+        maxdebt = False
         args = [
-            (i, ms.invariant_states, debt_range, debt_range, ccp_real, sigma_u,
-             utility_parameters, models, solution_mode, em_type)
+            (i, ms.invariant_states, debt_range, debt_range, ccp_real,
+             utility_parameters[em_type], models, solution_mode, conter,
+             em_type, maxdebt)
+            for em_type in TYPE_IDS
             for i in range(np.shape(ms.invariant_states)[0])
-            for em_type in range(1, 3)
         ]
-    
+
         pool_obj = multiprocessing.Pool(60)
         results = pool_obj.starmap(ms.get_all_evt, args, chunksize=1)
         pool_obj.close()
@@ -182,7 +195,7 @@ if __name__ == '__main__':
         me.get_superfeasible()
         me.get_x_g_superfeasible()
         pi, xnew, q = me.perform_em(2)
-        q = np.load(f"{path_estimates}/em_q_typeff2.npy")
+        q = validate_q(q)
     
         print("Predict CCPs after auxiliary model")
     
@@ -210,7 +223,7 @@ if __name__ == '__main__':
     
     else:
         print("Using previously generated EM weights")
-        q = np.load(f"{path_estimates}/em_q_typeff2.npy")
+        q = load_full_em_posteriors()
     
     
     # Generate the amount of aguirregabiria_mira iterations.
@@ -224,20 +237,23 @@ if __name__ == '__main__':
         # Check which ccp estimation to use:
         if it != 0:
             ccp_real = 1
-            utility_parameters1 = ms.build_param_g(1, x0)
-            utility_parameters2 = ms.build_param_g(2, x0)
         else:
             ccp_real = 0
             # Initial guess:
             x0 = np.zeros((total_n,))
             x0 = np.load(f"{path_estimates}/param_g.npy")
-            utility_parameters1 = ms.build_param_g(1, x0)
-            utility_parameters2 = ms.build_param_g(2, x0)
     
             # Prepare the get_x matrix
             me.get_feasible()
             me.get_feasible_pubid()
             me.get_x_g_superfeasible()
+
+        # Direct utility depends on the schooling component of the joint type;
+        # financial components enter separately through the Bellman budget.
+        utility_parameters = {
+            em_type: ms.build_param_g(em_type, x0)
+            for em_type in TYPE_IDS
+        }
     
         if get_budget == True:
             #--------------------------------------#
@@ -246,13 +262,10 @@ if __name__ == '__main__':
         
             pool_obj = multiprocessing.Pool(processes=60)
             args = [
-                (i, ms.invariant_states, ms.debt_range, 1)
+                (i, ms.invariant_states, ms.debt_range, em_type)
+                for em_type in TYPE_IDS
                 for i in range(np.shape(ms.invariant_states)[0])
             ]
-            args.extend(
-                (i, ms.invariant_states, ms.debt_range, 2)
-                for i in range(np.shape(ms.invariant_states)[0])
-            )
         
             results = pool_obj.starmap(mgs.get_ccp_sequence, args, chunksize=1)
             pool_obj.close()
@@ -273,14 +286,11 @@ if __name__ == '__main__':
     
         args = [
             (i, ms.invariant_states, debt_range, debt_range, ccp_real,
-             utility_parameters1, models, solution_mode, conter, 1, maxdebt)
+             utility_parameters[em_type], models, solution_mode, conter,
+             em_type, maxdebt)
+            for em_type in TYPE_IDS
             for i in range(np.shape(ms.invariant_states)[0])
         ]
-        args.extend(
-            (i, ms.invariant_states, debt_range, debt_range, ccp_real,
-             utility_parameters2, models, solution_mode, conter, 2, maxdebt)
-            for i in range(np.shape(ms.invariant_states)[0])
-        )
     
         results = pool_obj.starmap(ms.get_all_evt, args, chunksize=1)
         pool_obj.close()
@@ -294,14 +304,14 @@ if __name__ == '__main__':
         results = pool_obj.map(me.prepare_vjt_feasible, args)
         pool_obj.close()
     
-        choices_all, vjt_all_type1, vjt_all_type2, x1_new, choices_array_all, x_change, x_educ, x_first2, x_first4, x_firstgrad, x_exp = me.load_all_arrays_feasible()
+        choices_all, vjt_all_types, x1_new, choices_array_all, x_change, x_educ, x_first2, x_first4, x_firstgrad, x_exp = me.load_all_arrays_feasible()
     
         # Now optimize the likelihood
         print("Evaluating the likelihood")
         res = minimize(
             me.likelihood,
             x0,
-            args=(choices_all, vjt_all_type1, vjt_all_type2, x1_new, choices_array_all,
+            args=(choices_all, vjt_all_types, x1_new, choices_array_all,
                   x_change, x_educ, x_first2, x_first4, x_firstgrad, x_exp, q),
             jac=True,
             options={'disp': True},

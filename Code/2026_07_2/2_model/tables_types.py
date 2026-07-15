@@ -3,7 +3,7 @@
 
 Individuals are never assigned to a single type.  For type k, observation i
 receives weight q[i, k], where q is the posterior probability produced by the
-eight-type auxiliary EM estimator.  The resulting tables are descriptive and
+sixteen-type auxiliary EM estimator.  The resulting tables are descriptive and
 do not have a causal interpretation.
 
 Run after (or during a checkpoint of) auxiliary estimation with::
@@ -25,15 +25,12 @@ import pandas as pd
 from config import EST, OUT, RDATA
 
 
-EXPECTED_TYPE_NAMES = (
-    "S0G0T0",
-    "S0G0T1",
-    "S0G1T0",
-    "S0G1T1",
-    "S1G0T0",
-    "S1G0T1",
-    "S1G1T0",
-    "S1G1T1",
+EXPECTED_TYPE_NAMES = tuple(
+    f"S{school}G{grant}T{transfer}L{loan}"
+    for school in (0, 1)
+    for grant in (0, 1)
+    for transfer in (0, 1)
+    for loan in (0, 1)
 )
 EDUCATION = {
     1: ("Two-year", "twograd"),
@@ -52,7 +49,9 @@ def _decode_strings(values) -> tuple[str, ...]:
 def _load_posteriors(results_path: Path):
     """Load the joint posterior and type layout from an EM npz result."""
     with np.load(results_path, allow_pickle=False) as results:
-        required = {"q", "type_names", "type_school", "type_grant", "type_transfer"}
+        required = {
+            "q", "type_names", "type_school", "type_grant", "type_transfer", "type_loan"
+        }
         missing = required.difference(results.files)
         if missing:
             raise ValueError(
@@ -63,17 +62,19 @@ def _load_posteriors(results_path: Path):
         school = np.asarray(results["type_school"], dtype=int).reshape(-1)
         grant = np.asarray(results["type_grant"], dtype=int).reshape(-1)
         transfer = np.asarray(results["type_transfer"], dtype=int).reshape(-1)
+        loan = np.asarray(results["type_loan"], dtype=int).reshape(-1)
         history_length = len(results["observed_loglike"]) if "observed_loglike" in results else 1
 
     if q.ndim != 2:
         raise ValueError(f"Posterior q must be a matrix; received shape {q.shape}.")
     if q.shape[1] != len(names):
         raise ValueError("The number of posterior columns does not match type_names.")
-    if not (len(names) == len(school) == len(grant) == len(transfer)):
+    if not (len(names) == len(school) == len(grant) == len(transfer) == len(loan)):
         raise ValueError("Type-name and type-component arrays have inconsistent lengths.")
-    if len(names) != 8 or set(names) != set(EXPECTED_TYPE_NAMES):
+    if len(names) != 16 or set(names) != set(EXPECTED_TYPE_NAMES):
         raise ValueError(
-            "This script requires the eight-type schooling x grant x parental-transfer "
+            "This script requires the sixteen-type schooling x grant x parental-transfer "
+            "x loan "
             f"posterior; found {names}. Use auxiliary_em_checkpoint.npz, not the "
             "two-column legacy em_q_typeff2.npy file."
         )
@@ -84,7 +85,7 @@ def _load_posteriors(results_path: Path):
         raise ValueError("Posterior probabilities do not sum to one within individual.")
     q = np.clip(q, 0.0, 1.0)
     q /= q.sum(axis=1, keepdims=True)
-    return q, names, school, grant, transfer, max(1, history_length - 1)
+    return q, names, school, grant, transfer, loan, max(1, history_length - 1)
 
 
 def _load_analysis_panel(data_path: Path, id_path: Path, q: np.ndarray) -> pd.DataFrame:
@@ -129,7 +130,7 @@ def _load_analysis_panel(data_path: Path, id_path: Path, q: np.ndarray) -> pd.Da
     return panel
 
 
-def _group_weights(q, names, school, grant, transfer):
+def _group_weights(q, names, school, grant, transfer, loan):
     """Return all joint types and each two-category marginal type dimension."""
     groups = []
     for column, name in enumerate(names):
@@ -138,6 +139,7 @@ def _group_weights(q, names, school, grant, transfer):
         ("Schooling type", school, "S"),
         ("Grant type", grant, "G"),
         ("Parental-transfer type", transfer, "T"),
+        ("Loan type", loan, "L"),
     ):
         for value in (0, 1):
             groups.append((dimension, f"{prefix}{value}", q[:, components == value].sum(axis=1)))
@@ -455,6 +457,11 @@ def _save_tables(tables, output_root: Path, iteration: int):
 All statistics use posterior probabilities q_ik as fractional weights. No
 individual is assigned to a single type.
 
+Joint types are SxGyTzLw, where S is the schooling type, G is the grant type,
+T is the parental-transfer type, and L is the loan type. Zero is the baseline
+and one is the high type for each dimension. Marginal rows sum posterior
+weights over the other three dimensions.
+
 annual current loans: currentloans among individuals enrolled in two-year,
 four-year, or graduate education in that period. Non-enrolled person-years are
 not part of these annual comparisons.
@@ -484,7 +491,7 @@ def main():
     parser.add_argument(
         "--results",
         default=EST("auxiliary_em_checkpoint.npz"),
-        help="Eight-type auxiliary EM checkpoint/results npz containing q.",
+        help="Sixteen-type auxiliary EM checkpoint/results npz containing q.",
     )
     parser.add_argument(
         "--data",
@@ -509,12 +516,12 @@ def main():
     )
     arguments = parser.parse_args()
 
-    q, names, school, grant, transfer, inferred_iteration = _load_posteriors(
+    q, names, school, grant, transfer, loan, inferred_iteration = _load_posteriors(
         Path(arguments.results)
     )
     iteration = arguments.iteration if arguments.iteration is not None else inferred_iteration
     panel = _load_analysis_panel(Path(arguments.data), Path(arguments.ids), q)
-    groups = _group_weights(q, names, school, grant, transfer)
+    groups = _group_weights(q, names, school, grant, transfer, loan)
     work_by_level, work_by_period = _work_while_enrolled(panel, groups)
     tables = {
         "student_loans_by_year_and_type": _debt_by_period(panel, groups),
