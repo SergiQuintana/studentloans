@@ -37,6 +37,7 @@ path_estimates  = DIR["MODEL_ESTIMATES"]
 path_out = DIR["MODEL_OUTPUT"]
 
 T = 10
+INITIAL_CCP_PERIODS = tuple(range(T - 1, 0, -1))
 fields=8
 occupations = 8
 n_param_g_x1 = 9*(1+fields+occupations+1)
@@ -140,7 +141,10 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
     
     
     print(f"Individual {x1[i].astype('int')}")
-    for period in range(T,0,-1):
+    # Period T is a terminal-value period in the structural model. Flow-utility
+    # period arrays, the likelihood, and CCP continuation sequences all cover
+    # periods 1, ..., T-1 only.
+    for period in INITIAL_CCP_PERIODS:
         
         print(period)
         # Get set of states

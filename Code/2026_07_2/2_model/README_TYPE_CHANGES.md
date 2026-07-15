@@ -14,6 +14,8 @@ Estimation-side status:
       separate sixteen-type definition.
 - [x] Structural posterior loading, VJT preparation, likelihood evaluation,
       Bellman tasks, initial auxiliary CCPs, and CCP sequences use `TYPE_IDS`.
+- [x] Initial auxiliary CCPs cover periods 1 through T-1; period T remains the
+      terminal-value period, matching the Bellman and likelihood conventions.
 - [x] The active loan fitter draws from all sixteen posterior columns and
       retains both the joint type ID and loan component in its sampled data.
 - [x] Existing `_em1` through `_em8` solution artifacts are treated as stale:
