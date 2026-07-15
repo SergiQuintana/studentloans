@@ -350,18 +350,12 @@ def load_education_cell(period, interp_dict, education=2, program_year=1):
     education_mask = raw_choices[:, 1] > 0
 
     flow_path = RDATA(f"loanflow_superfeasible_t{period}.npy")
-    decile_path = RDATA(f"parental_income_decile_superfeasible_t{period}.npy")
     if not os.path.exists(flow_path):
         raise FileNotFoundError(
             f"Missing {flow_path}. Rebuild superfeasible data with "
             "model_em_algorithm.get_data_superfeasible()."
         )
-    if not os.path.exists(decile_path):
-        raise FileNotFoundError(
-            f"Missing {decile_path}. Run prepare_parental_income_deciles.py first."
-        )
     loan_flow = np.asarray(np.load(flow_path), dtype=np.float64)[education_mask]
-    parent_decile = np.asarray(np.load(decile_path), dtype=np.int64)[education_mask]
 
     cell_code = bs.education_cell_code(education, program_year)
     observed_code = bs.education_cell_from_state(state, education)
@@ -383,7 +377,7 @@ def load_education_cell(period, interp_dict, education=2, program_year=1):
         "debt": np.ascontiguousarray(debt[cell], dtype=np.float64),
         "debtchoice": np.ascontiguousarray(debtchoice[cell], dtype=np.float64),
         "loan_flow": np.ascontiguousarray(loan_flow[cell], dtype=np.float64),
-        "parent_decile": np.ascontiguousarray(parent_decile[cell], dtype=np.int64),
+        "parinc": np.ascontiguousarray(x1[cell, 0], dtype=np.int64),
         "choice": np.ascontiguousarray(choices[cell]),
         "ccp_by_type": np.ascontiguousarray(ccp[:, cell, :], dtype=np.float64),
         "observed_budget": np.ascontiguousarray(budget[cell], dtype=np.float64),
@@ -391,18 +385,18 @@ def load_education_cell(period, interp_dict, education=2, program_year=1):
     }
 
 
-def posterior_loan_moments(parent_decile, flow_by_type, stock_by_type, q):
-    """Loan-type/parental-decile targets and participation diagnostics.
+def posterior_loan_moments(parinc, flow_by_type, stock_by_type, q):
+    """Loan-type/parental-income-group targets and diagnostics.
 
-    Target ordering within each (loan type, decile) cell is
+    Target ordering within each (loan type, parinc) cell is
     ``[mean positive annual flow, share with positive end stock]``.
     The returned diagnostic is the share with positive annual flow.
     """
-    parent_decile = np.asarray(parent_decile, dtype=np.int64).reshape(-1)
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
     flow_by_type = np.asarray(flow_by_type, dtype=np.float64)
     stock_by_type = np.asarray(stock_by_type, dtype=np.float64)
-    q = validate_q(q, n_individuals=len(parent_decile))
-    expected_shape = (N_TYPES, len(parent_decile))
+    q = validate_q(q, n_individuals=len(parinc))
+    expected_shape = (N_TYPES, len(parinc))
     if flow_by_type.shape != expected_shape or stock_by_type.shape != expected_shape:
         raise ValueError(f"Flow and stock arrays must both have shape {expected_shape}.")
 
@@ -410,8 +404,8 @@ def posterior_loan_moments(parent_decile, flow_by_type, stock_by_type, q):
     for loan_type in (0, 1):
         rows = np.flatnonzero(TYPE_LOAN == loan_type)
         weights = q[:, rows].T
-        for decile in range(1, 11):
-            selected = parent_decile == decile
+        for parinc_level in range(1, 5):
+            selected = parinc == parinc_level
             w = weights[:, selected].reshape(-1)
             flow = flow_by_type[rows][:, selected].reshape(-1)
             stock = stock_by_type[rows][:, selected].reshape(-1)
@@ -427,7 +421,7 @@ def posterior_loan_moments(parent_decile, flow_by_type, stock_by_type, q):
             target.extend((mean_flow, stock_share))
             new_share.append(flow_share)
             effective_weight.append(total)
-            labels.append((loan_type, decile))
+            labels.append((loan_type, parinc_level))
     return (
         np.asarray(target), np.asarray(new_share),
         np.asarray(effective_weight), tuple(labels),
@@ -1332,7 +1326,7 @@ def _subset_cell_pack(pack, indices):
     out = dict(pack)
     for name in (
         "x1", "state", "q", "debt", "debtchoice", "loan_flow",
-        "parent_decile", "choice", "observed_budget",
+        "parinc", "choice", "observed_budget",
     ):
         out[name] = np.ascontiguousarray(pack[name][indices])
     out["ccp_by_type"] = np.ascontiguousarray(pack["ccp_by_type"][:, indices, :])
@@ -1410,12 +1404,12 @@ def prepare_education_cell_crns(packs, draws=20, seed=12345):
 
 
 def _pooled_observed_cell_moments(packs):
-    decile = np.concatenate([pack["parent_decile"] for pack in packs])
+    parinc = np.concatenate([pack["parinc"] for pack in packs])
     q = np.concatenate([pack["q"] for pack in packs], axis=0)
     flow = np.concatenate([pack["loan_flow"] for pack in packs])
     stock = np.concatenate([pack["debtchoice"] for pack in packs])
     return posterior_loan_moments(
-        decile,
+        parinc,
         np.broadcast_to(flow, (N_TYPES, len(flow))),
         np.broadcast_to(stock, (N_TYPES, len(stock))),
         q,
@@ -1425,12 +1419,12 @@ def _pooled_observed_cell_moments(packs):
 def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, labels, loss):
     print("\n" + "=" * 112)
     print(f"[education-cell eval {EVAL_COUNTER}] loss={loss:.6f}")
-    print(" loan  decile | mean positive annual flow: data       sim       diff | "
+    print(" loan  parinc | mean positive annual flow: data       sim       diff | "
           "share end-stock>0: data     sim     diff | new-flow share (diagnostic)")
-    for row, (loan_type, decile) in enumerate(labels):
+    for row, (loan_type, parinc) in enumerate(labels):
         m = 2 * row
         print(
-            f"  {loan_type:>2}     {decile:>2}   | "
+            f"  {loan_type:>2}     {parinc:>2}   | "
             f"{data[m]:>10.2f} {simulated[m]:>10.2f} {simulated[m]-data[m]:>10.2f} | "
             f"{data[m+1]:>7.4f} {simulated[m+1]:>7.4f} {simulated[m+1]-data[m+1]:>+8.4f} | "
             f"{data_new_share[row]:>7.4f} -> {sim_new_share[row]:>7.4f}  "
@@ -1455,7 +1449,7 @@ def minimize_distance_education_cell(
     diagnostic_by_draw = []
 
     for draw_index in range(draws):
-        pooled_flow, pooled_stock, pooled_decile, pooled_q = [], [], [], []
+        pooled_flow, pooled_stock, pooled_parinc, pooled_q = [], [], [], []
         for period, pack in sample_by_period.items():
             x1 = pack["x1"]
             terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
@@ -1489,10 +1483,10 @@ def minimize_distance_education_cell(
             flow_by_type = stock_by_type - (1.0 + r) * pack["debt"][None, :]
             pooled_flow.append(flow_by_type)
             pooled_stock.append(stock_by_type)
-            pooled_decile.append(pack["parent_decile"])
+            pooled_parinc.append(pack["parinc"])
             pooled_q.append(pack["q"])
         moments, new_share, _, _ = posterior_loan_moments(
-            np.concatenate(pooled_decile), np.concatenate(pooled_flow, axis=1),
+            np.concatenate(pooled_parinc), np.concatenate(pooled_flow, axis=1),
             np.concatenate(pooled_stock, axis=1), np.concatenate(pooled_q, axis=0),
         )
         simulated_by_draw.append(moments)
