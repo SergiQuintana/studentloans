@@ -69,6 +69,7 @@ def load_auxiliary_financial_process(results_path):
         "type_school",
         "type_grant",
         "type_transfer",
+        "type_loan",
         "grant_education_levels",
         "grant_receipt",
         "grant_amount",
@@ -88,6 +89,7 @@ def load_auxiliary_financial_process(results_path):
             results["type_school"],
             results["type_grant"],
             results["type_transfer"],
+            results["type_loan"],
         )
         education_levels = np.asarray(
             results["grant_education_levels"], dtype=np.int64

@@ -1,15 +1,43 @@
-# Temporary tracker: extending the structural model to eight latent types
+# Temporary tracker: extending the structural model to sixteen latent types
+
+## Current sixteen-type estimation conversion (2026-07-15)
+
+The shared structural layout now matches the auxiliary EM's sixteen permanent
+S x G x T x L classes exactly. Loan type is ordered fastest, so adjacent IDs
+share school, grant, and transfer components and differ only in loan type.
+
+Estimation-side status:
+
+- [x] `latent_types.py` owns the complete sixteen-type ordering, including the
+      loan component and full saved-layout validation.
+- [x] The auxiliary EM aliases the shared layout rather than maintaining a
+      separate sixteen-type definition.
+- [x] Structural posterior loading, VJT preparation, likelihood evaluation,
+      Bellman tasks, initial auxiliary CCPs, and CCP sequences use `TYPE_IDS`.
+- [x] The active loan fitter draws from all sixteen posterior columns and
+      retains both the joint type ID and loan component in its sampled data.
+- [x] Existing `_em1` through `_em8` solution artifacts are treated as stale:
+      the new ordering changes their meaning and requires regeneration through
+      `_em16`.
+- [ ] Loan type does not yet shift the budget-shock distribution. Until that
+      refinement is implemented, each adjacent L0/L1 pair has identical value
+      functions conditional on the same S, G, and T components.
+- [ ] Forward baseline and counterfactual simulation remains to be converted.
+- [ ] No-debt solution and simulation remains to be converted.
+
+The remainder of this document records the earlier eight-type conversion. It
+is retained as a detailed map of the same estimation and simulation call paths;
+references to eight types below describe that completed intermediate stage.
 
 Status: estimation conversion implemented; simulation conversion remains. The
 shared type layout, typed financial processes, auxiliary CCP predictor, Bellman
 solution, structural likelihood, NPL estimation driver, and optional
 budget-shock path now use the joint-type interface.
 
-Auxiliary-only update: `model_em_algorithm.py` now extends its measurement
-mixture to sixteen S x G x T x L classes by adding a binary annual-loan type.
-The shared structural layout in `latent_types.py` intentionally remains at the
-eight S x G x T classes documented below. Expanding that shared interface is a
-separate later stage after the new auxiliary EM has been validated.
+The auxiliary measurement mixture and structural estimation interface now use
+the same sixteen S x G x T x L classes. The binary annual-loan type will enter
+the structural model through a type-dependent budget-shock distribution in the
+next refinement stage.
 
 This file tracks the changes required to extend the complete model from the old
 two-schooling-type interface to the eight joint types already estimated by the

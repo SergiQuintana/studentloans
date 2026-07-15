@@ -83,11 +83,13 @@ T = 10
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST,LIK
 from tables import write_auxiliary_em_tables
 from latent_types import (
+    TYPE_COMPONENTS,
     TYPE_NAMES,
     TYPE_IDS,
     TYPE_SCHOOL,
     TYPE_GRANT,
     TYPE_TRANSFER,
+    TYPE_LOAN,
     N_TYPES as N_STRUCTURAL_TYPES,
     type_components,
     validate_q,
@@ -1043,7 +1045,7 @@ def get_all_g(utility_parameters,x1_new,x_change_p,x_educ_p,x_first2_p,x_first4_
     # The joint type also contains grant and transfer components. Only its
     # schooling component enters direct utility; the financial components enter
     # the budget constraint when the model is solved.
-    school_type, _, _ = type_components(em_type)
+    school_type, _, _, _ = type_components(em_type)
     if school_type == 0:
         g_type = 0
     else:
@@ -3108,35 +3110,18 @@ def logit_margineffect(param,x):
 
 #-----------------------------------------------------------------------------#
 # Sixteen-type auxiliary EM: schooling x grant x parental transfer x loan.
-#
-# Keep this layout separate from latent_types.py for now.  The shared structural
-# model remains on its current eight S x G x T types until its loan-type
-# conversion is deliberately implemented in a later stage.
+# The shared layout is authoritative for both auxiliary and structural code.
 #-----------------------------------------------------------------------------#
 
 MONEY_SCALE = 1000.0
 
-AUXILIARY_TYPE_COMPONENTS = np.asarray(
-    [
-        (school, grant, transfer, loan)
-        for school in (0, 1)
-        for grant in (0, 1)
-        for transfer in (0, 1)
-        for loan in (0, 1)
-    ],
-    dtype=np.int64,
-)
-AUXILIARY_TYPE_SCHOOL = AUXILIARY_TYPE_COMPONENTS[:, 0]
-AUXILIARY_TYPE_GRANT = AUXILIARY_TYPE_COMPONENTS[:, 1]
-AUXILIARY_TYPE_TRANSFER = AUXILIARY_TYPE_COMPONENTS[:, 2]
-AUXILIARY_TYPE_LOAN = AUXILIARY_TYPE_COMPONENTS[:, 3]
-AUXILIARY_TYPE_NAMES = np.asarray(
-    [
-        f"S{school}G{grant}T{transfer}L{loan}"
-        for school, grant, transfer, loan in AUXILIARY_TYPE_COMPONENTS
-    ]
-)
-N_AUXILIARY_TYPES = len(AUXILIARY_TYPE_COMPONENTS)
+AUXILIARY_TYPE_COMPONENTS = TYPE_COMPONENTS
+AUXILIARY_TYPE_SCHOOL = TYPE_SCHOOL
+AUXILIARY_TYPE_GRANT = TYPE_GRANT
+AUXILIARY_TYPE_TRANSFER = TYPE_TRANSFER
+AUXILIARY_TYPE_LOAN = TYPE_LOAN
+AUXILIARY_TYPE_NAMES = TYPE_NAMES
+N_AUXILIARY_TYPES = N_STRUCTURAL_TYPES
 
 
 def _financial_alt_features(choices):
@@ -3445,7 +3430,7 @@ def collapse_loan_weights(q):
 
 
 def collapse_sgt_weights(q):
-    """Collapse the auxiliary loan dimension back to the structural S x G x T layout."""
+    """Collapse loan type for explicit eight-cell reporting/compatibility."""
     q = np.asarray(q, dtype=float)
     if q.ndim != 2 or q.shape[1] != N_AUXILIARY_TYPES:
         raise ValueError(
@@ -4951,8 +4936,8 @@ def perform_em(
             )
     np.save(f"{path_estimates}/auxiliary_type_probabilities.npy", pinew)
     np.save(f"{path_estimates}/auxiliary_q_sixteen_types.npy", q)
-    # Preserve an explicit S x G x T collapse for the still-eight-type structural
-    # code.  The full 16-column posterior remains the authoritative EM result.
+    # Preserve an explicit S x G x T collapse for reporting and compatibility.
+    # The full 16-column posterior is the structural model input.
     np.save(f"{path_estimates}/auxiliary_q_eight_types.npy", collapse_sgt_weights(q))
     np.save(
         f"{path_estimates}/auxiliary_q_schooling_types.npy",

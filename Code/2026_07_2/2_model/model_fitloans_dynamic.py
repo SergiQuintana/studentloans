@@ -44,7 +44,7 @@ from model_interpolate_terminal import build_interpolator_dictionary
 
 from config import DIR, OUT, EST, ENSURE_DIR
 import budget_shock as bs
-from latent_types import TYPE_IDS, validate_q, validate_saved_layout
+from latent_types import TYPE_IDS, TYPE_LOAN, validate_q, validate_saved_layout
 
 # Canonical roots from config (no chdir anywhere)
 PATH_OUT        = DIR["MODEL_OUTPUT"]
@@ -71,6 +71,7 @@ def load_full_em_posteriors():
             results["type_school"],
             results["type_grant"],
             results["type_transfer"],
+            results["type_loan"],
         )
         _EM_POSTERIORS = validate_q(results["q"])
     return _EM_POSTERIORS
@@ -414,8 +415,10 @@ def get_sample(x1, state, types, debt, choices, ccp_path, budget, terminal, n_sa
     """
     Bootstrap sample + type draw (kept consistent with your original version).
 
-    Returns:
-      x1sample, statesample, debtsample, choicessample, budgetsample, evt, e, terminal_sample
+    Returns the sampled states and CCPs together with the permanent joint type
+    and its loan component. The latter are retained now so the budget-shock
+    distribution can be made loan-type-specific without changing the sampling
+    interface again.
     """
     N = x1.shape[0]
     idx = np.random.choice(N, size=n_sample, replace=True)
@@ -433,6 +436,8 @@ def get_sample(x1, state, types, debt, choices, ccp_path, budget, terminal, n_sa
         np.random.random(n_sample)[:, None] > cumulative_q,
         axis=1,
     ).astype(np.int64)
+    type_id = type_index + 1
+    loan_type = TYPE_LOAN[type_index].astype(np.int64)
     evt = get_ccp_type(ccp_path[:, idx, :], type_index)
 
     e = np.random.normal(loc=0.0, scale=1.0, size=n_sample).astype(np.float64)
@@ -444,7 +449,18 @@ def get_sample(x1, state, types, debt, choices, ccp_path, budget, terminal, n_sa
         p_grad[idx].copy(),
     ]
 
-    return x1sample, statesample, debtsample, choicessample, budgetsample, evt, e, terminal_sample
+    return (
+        x1sample,
+        statesample,
+        debtsample,
+        choicessample,
+        budgetsample,
+        evt,
+        e,
+        terminal_sample,
+        type_id,
+        loan_type,
+    )
 
 # ==============================================================================
 # Debt rules (caps + monotone + consumption floor)
@@ -822,8 +838,20 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
         for p in periods:
             x1, state, types, debt, debtchoice, choices, ccp_path, budget, terminal_data = data_by_period[p]
 
-            x1s, states, debts, choices_s, budget_s, evt_ccp_s, _, terminal_s = get_sample(
-                x1, state, types, debt, choices, ccp_path, budget, terminal_data, n_sample=n_sample
+            (
+                x1s,
+                states,
+                debts,
+                choices_s,
+                budget_s,
+                evt_ccp_s,
+                _,
+                terminal_s,
+                type_ids,
+                loan_types,
+            ) = get_sample(
+                x1, state, types, debt, choices, ccp_path, budget,
+                terminal_data, n_sample=n_sample
             )
 
             rng = np.random.default_rng(12345 + 1000*p + it)
@@ -845,6 +873,10 @@ def fit_budget_shock_multi(data_by_period, periods, max_outer=20, s=20, n_sample
                 "Z": Zp,
                 "b_idx": b_idx,
                 "max_idx": max_idx,
+                # Reserved inputs for the forthcoming loan-type-specific
+                # budget-shock distribution.
+                "type_id": np.ascontiguousarray(type_ids, dtype=np.int64),
+                "loan_type": np.ascontiguousarray(loan_types, dtype=np.int64),
             }
 
         args_obj = (moments_data, sample_by_period, periods)

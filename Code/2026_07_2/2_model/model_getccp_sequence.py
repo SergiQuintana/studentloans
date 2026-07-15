@@ -14,6 +14,7 @@ The solution algorithm is analogous to that on model_solution_em.py
 """
 
 import numpy as np
+from latent_types import type_index
 import multiprocessing 
 
 from model_solution_em import (save_npz_here,
@@ -113,9 +114,9 @@ def loop_over_x2(x1,b,period,ccps,evt):
     return results_ccp, names_ccp
  
 def get_ccp_sequence(i,x1,b,em_type):
-
     """This function computes CCP for choosing home production for every period and
     state using the auxiliary model."""
+    type_index(em_type)
     
     print(f"Individual {x1[i].astype('int')}")
     

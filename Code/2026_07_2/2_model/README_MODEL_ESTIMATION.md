@@ -62,12 +62,13 @@ consumption remains cached for the four grant/transfer combinations, so the
 loan type is currently identified by the loan measurement equations rather than
 entering the 604-parameter choice block directly.
 
-For this intermediate stage, `latent_types.py` deliberately remains the shared
-eight-type structural interface. The auxiliary checkpoint/results contain the
-full sixteen-column posterior and also save an explicit posterior collapsed over
-the loan dimension as `auxiliary_q_eight_types.npy`. Structural estimation and
-simulation should not consume the full sixteen-type result until their separate
-loan-type conversion is implemented.
+`latent_types.py` is now the shared sixteen-type structural interface. The
+auxiliary checkpoint/results contain the authoritative full sixteen-column
+posterior and also save an explicit posterior collapsed over the loan dimension
+as `auxiliary_q_eight_types.npy` for reporting and compatibility only.
+Structural estimation consumes the full posterior. Loan type is reserved to
+shift the budget-shock distribution; until that refinement is estimated, L0/L1
+pairs with the same S, G, and T components have identical value functions.
 
 The active auxiliary choice objective keeps the exact closed-form score but
 evaluates all individual-by-type softmax rows in a Numba-parallel kernel. It
@@ -88,24 +89,27 @@ the likelihood definition.
    `model_interpolate_terminal.build_interp_cache` builds the terminal-value
    interpolators.
 3. Optionally, `model_em_algorithm.perform_em` estimates posterior weights for
-   the eight auxiliary joint types. `model_predict_ccps` constructs the initial
-   auxiliary CCPs. Downstream structural code continues to collapse/use only
-   the schooling dimension until the resource types are deliberately added in
-   a later step.
+   the sixteen auxiliary joint types. `model_predict_ccps` constructs initial
+   auxiliary CCPs for all sixteen IDs using the corresponding school, grant,
+   and transfer components. At this stage adjacent L0/L1 CCPs are identical
+   because loan type has not yet entered the budget-shock distribution.
 4. When `get_budget=True`, `model_getccp_sequence` converts the auxiliary CCPs
    into debt-indexed expected-value sequences. Then
    `model_fitloans_dynamic.estimate_budget_shock` fits the loan block and saves
    its parameters. `model_solution_em.reload_budgetshock_params` makes those
    parameters available to worker processes.
 5. `model_solution_em.get_all_evt` solves the dynamic model backward for every
-   invariant state and both education types.
+   invariant state and all sixteen permanent joint types.
 6. `model_em_algorithm.prepare_vjt_feasible` maps solved values to observed
    person-period choices. `model_em_algorithm.likelihood` updates flow-utility
    parameters. The resulting CCPs feed the next NPL iteration.
 
-The four switches near the top of `estimation_all_em.py` control expensive
-prerequisites: `solve_continuation`, `solve_model`, `solve_qs`, and `get_budget`.
-The default values reuse existing artifacts.
+The five switches near the top of `estimation_all_em.py` control expensive
+prerequisites: `solve_continuation`, `solve_model`, `solve_qs`,
+`solve_initial_ccps`, and `get_budget`. The initial-CCP switch is separate from
+the auxiliary-EM switch so a saved sixteen-type EM result can be reused while
+regenerating `_em1` through `_em16` CCP artifacts. Set it back to `False` after
+the first complete sixteen-type run.
 
 ## Main simulation flow
 

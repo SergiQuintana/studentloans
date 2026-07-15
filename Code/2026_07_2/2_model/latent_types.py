@@ -9,36 +9,27 @@ zero/one because they multiply the type shifts estimated by the auxiliary EM.
 import numpy as np
 
 
-TYPE_NAMES = np.array(
+TYPE_COMPONENTS = np.asarray(
     [
-        "S0G0T0",
-        "S0G0T1",
-        "S0G1T0",
-        "S0G1T1",
-        "S1G0T0",
-        "S1G0T1",
-        "S1G1T0",
-        "S1G1T1",
-    ]
-)
-
-TYPE_COMPONENTS = np.array(
-    [
-        [0, 0, 0],
-        [0, 0, 1],
-        [0, 1, 0],
-        [0, 1, 1],
-        [1, 0, 0],
-        [1, 0, 1],
-        [1, 1, 0],
-        [1, 1, 1],
+        (school, grant, transfer, loan)
+        for school in (0, 1)
+        for grant in (0, 1)
+        for transfer in (0, 1)
+        for loan in (0, 1)
     ],
     dtype=np.int64,
+)
+TYPE_NAMES = np.asarray(
+    [
+        f"S{school}G{grant}T{transfer}L{loan}"
+        for school, grant, transfer, loan in TYPE_COMPONENTS
+    ]
 )
 
 TYPE_SCHOOL = TYPE_COMPONENTS[:, 0]
 TYPE_GRANT = TYPE_COMPONENTS[:, 1]
 TYPE_TRANSFER = TYPE_COMPONENTS[:, 2]
+TYPE_LOAN = TYPE_COMPONENTS[:, 3]
 N_TYPES = len(TYPE_COMPONENTS)
 TYPE_IDS = tuple(range(1, N_TYPES + 1))
 
@@ -56,9 +47,15 @@ def type_index(type_id):
 
 
 def type_components(type_id):
-    """Return ``(school_type, grant_type, transfer_type)`` for ``type_id``."""
-    school, grant, transfer = TYPE_COMPONENTS[type_index(type_id)]
-    return int(school), int(grant), int(transfer)
+    """Return ``(school, grant, transfer, loan)`` for ``type_id``."""
+    school, grant, transfer, loan = TYPE_COMPONENTS[type_index(type_id)]
+    return int(school), int(grant), int(transfer), int(loan)
+
+
+def sgt_index(type_id):
+    """Return the zero-based S x G x T cell after collapsing loan type."""
+    school, grant, transfer, _ = type_components(type_id)
+    return 4 * school + 2 * grant + transfer
 
 
 def validate_q(q, n_individuals=None, atol=1.0e-8):
@@ -83,16 +80,31 @@ def validate_q(q, n_individuals=None, atol=1.0e-8):
     return q
 
 
-def validate_saved_layout(type_names, type_school, type_grant, type_transfer):
+def validate_saved_layout(
+    type_names, type_school, type_grant, type_transfer, type_loan
+):
     """Ensure a saved EM artifact uses the structural model's type ordering."""
     saved = (
         np.asarray(type_names).astype(str),
         np.asarray(type_school, dtype=np.int64),
         np.asarray(type_grant, dtype=np.int64),
         np.asarray(type_transfer, dtype=np.int64),
+        np.asarray(type_loan, dtype=np.int64),
     )
-    expected = (TYPE_NAMES.astype(str), TYPE_SCHOOL, TYPE_GRANT, TYPE_TRANSFER)
-    labels = ("type_names", "type_school", "type_grant", "type_transfer")
+    expected = (
+        TYPE_NAMES.astype(str),
+        TYPE_SCHOOL,
+        TYPE_GRANT,
+        TYPE_TRANSFER,
+        TYPE_LOAN,
+    )
+    labels = (
+        "type_names",
+        "type_school",
+        "type_grant",
+        "type_transfer",
+        "type_loan",
+    )
     for label, observed, target in zip(labels, saved, expected):
         if not np.array_equal(observed, target):
             raise ValueError(

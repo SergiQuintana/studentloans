@@ -102,6 +102,7 @@ def load_full_em_posteriors():
             results["type_school"],
             results["type_grant"],
             results["type_transfer"],
+            results["type_loan"],
         )
         return validate_q(results["q"])
 
@@ -123,6 +124,7 @@ def load_full_em_posteriors():
 solve_model = False
 solve_continuation = False 
 solve_qs = False
+solve_initial_ccps = True
 get_budget = False
 
 if __name__ == '__main__':
@@ -197,14 +199,19 @@ if __name__ == '__main__':
         pi, xnew, q = me.perform_em(2)
         q = validate_q(q)
     
-        print("Predict CCPs after auxiliary model")
-    
+    else:
+        print("Using previously generated EM weights")
+        q = load_full_em_posteriors()
+
+    if solve_initial_ccps == True:
+        print("Predicting initial CCPs for all joint types")
+
         auxiliary_ccp_parameters = {
             type_id: mccp.load_utility_parameters(type_id)
             for type_id in TYPE_IDS
         }
         debt_range = ms.debt_range
-    
+
         pool_obj = multiprocessing.Pool(processes=10)
         args = [
             (
@@ -217,13 +224,11 @@ if __name__ == '__main__':
             for type_id in TYPE_IDS
             for i in range(np.shape(ms.invariant_states)[0])
         ]
-    
+
         results = pool_obj.starmap(mccp.get_all_ccps, args, chunksize=1)
         pool_obj.close()
-    
     else:
-        print("Using previously generated EM weights")
-        q = load_full_em_posteriors()
+        print("Using previously generated initial CCPs")
     
     
     # Generate the amount of aguirregabiria_mira iterations.

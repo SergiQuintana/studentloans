@@ -73,7 +73,7 @@ def get_type_financial_parameters(type_id):
     """
     global _auxiliary_financial_process
 
-    _, grant_type, transfer_type = type_components(type_id)
+    _, grant_type, transfer_type, _ = type_components(type_id)
     if type_id not in _type_financial_parameters:
         if _auxiliary_financial_process is None:
             _auxiliary_financial_process = load_auxiliary_financial_process(
@@ -2413,7 +2413,7 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
 
     """Solve and save one invariant state's Bellman problem for one joint type.
 
-    ``em_type`` is the permanent joint type ID in ``1, ..., 8``. Its schooling
+    ``em_type`` is the permanent joint type ID in ``1, ..., 16``. Its schooling
     component is already encoded in ``utility_parameters`` by ``build_param_g``.
     Grant and transfer components are mapped once here and passed downward as
     a preselected tuple of numeric arrays.
@@ -3037,7 +3037,7 @@ def build_param_g(em_type,param_utility):
     
     """
 
-    school_type, _, _ = type_components(em_type)
+    school_type, _, _, _ = type_components(em_type)
     
     size = np.shape(get_total_choices())[0]
      

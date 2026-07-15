@@ -55,7 +55,7 @@ AUXILIARY_RESULTS_FILE = f"{path_estimates}/auxiliary_em_results.npz"
 
 def get_expected_consumption(x1_new, x2, Jx, type_id, model_parameters):
     """Reproduce the auxiliary EM expected-consumption index for one state."""
-    _, grant_type, transfer_type = type_components(type_id)
+    _, grant_type, transfer_type, _ = type_components(type_id)
     choices = np.asarray(Jx, dtype=np.int64)
     x1_design = np.asarray(x1_new, dtype=float).reshape(1, -1)
     state = np.asarray(x2, dtype=float).reshape(1, -1)
