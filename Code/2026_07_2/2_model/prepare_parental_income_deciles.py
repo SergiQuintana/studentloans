@@ -1,8 +1,7 @@
 """Build globally defined parental-income deciles aligned to model panels.
 
-Run this after the Stata data build. The continuous invariant parental-income
-measure is read once from ``demographic_invariant.dta``; the resulting decile
-is then matched by PUBID to every superfeasible model period.
+The canonical input is ``Model/Inputs/real_data/parental_income_by_pubid.npz``.
+The resulting decile is matched by PUBID to every superfeasible model period.
 """
 
 from pathlib import Path
@@ -14,14 +13,31 @@ from config import DIR, RDATA
 
 
 def build_parental_income_deciles(source_path=None):
-    project_root = Path(__file__).resolve().parents[3]
     if source_path is None:
-        source_path = project_root / "Data" / "temporary" / "demographic_invariant.dta"
+        source_path = Path(RDATA("parental_income_by_pubid.npz"))
     source_path = Path(source_path)
     if not source_path.exists():
-        raise FileNotFoundError(f"Missing continuous parental-income data: {source_path}")
+        raise FileNotFoundError(
+            f"Missing canonical parental-income input: {source_path}. "
+            "Run sync_parental_income_input.py once from the local project."
+        )
 
-    data = pd.read_stata(source_path, columns=["PUBID", "aveparinc"], convert_categoricals=False)
+    if source_path.suffix.lower() == ".npz":
+        with np.load(source_path, allow_pickle=False) as source:
+            data = pd.DataFrame(
+                {
+                    "PUBID": np.asarray(source["pubid"], dtype=np.int64),
+                    "aveparinc": np.asarray(source["aveparinc"], dtype=float),
+                }
+            )
+    elif source_path.suffix.lower() == ".dta":
+        data = pd.read_stata(
+            source_path,
+            columns=["PUBID", "aveparinc"],
+            convert_categoricals=False,
+        )
+    else:
+        raise ValueError("Parental-income source must be .npz or .dta.")
     data = data.dropna(subset=["PUBID", "aveparinc"]).drop_duplicates("PUBID")
     if data["PUBID"].duplicated().any():
         raise ValueError("Parental-income source must contain one row per PUBID.")
