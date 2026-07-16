@@ -84,6 +84,7 @@ CCP_CELL_CACHE_SCHEMA = 1
 EDUCATION_CELL_SPECIFICATIONS = ("parental_income_basic", "joint_type")
 TYPE_INTEGRATION_MODES = ("sampled", "exact")
 PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock")
+EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
 DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
 UNCAPPED_EDUCATION_CELL_MAXITER = np.iinfo(np.int32).max
@@ -1771,12 +1772,20 @@ def solve_all_draws_debt_idx_pooled(
 
 def prepare_education_cell_crns(
     packs, draws=20, seed=12345, type_integration="sampled",
+    resource_mode="simulated",
 ):
     """Pre-draw every resource shock once and reuse it in all SMM evaluations."""
     if type_integration not in TYPE_INTEGRATION_MODES:
         raise ValueError(f"type_integration must be one of {TYPE_INTEGRATION_MODES}.")
-    wage_parameters = load_fixed_wage_parameters()
-    financial = load_auxiliary_financial_process(EST("auxiliary_em_results.npz"))
+    if resource_mode not in EDUCATION_CELL_RESOURCE_MODES:
+        raise ValueError(f"resource_mode must be one of {EDUCATION_CELL_RESOURCE_MODES}.")
+    wage_parameters = (
+        load_fixed_wage_parameters() if resource_mode == "simulated" else None
+    )
+    financial = (
+        load_auxiliary_financial_process(EST("auxiliary_em_results.npz"))
+        if resource_mode == "simulated" else None
+    )
     prepared = {}
     for pack in packs:
         period = pack["period"]
@@ -1795,9 +1804,6 @@ def prepare_education_cell_crns(
         }
 
         x1_design = expand_x1(x1)
-        state_design = _state_wage_design(state)
-        wage_mu = np.column_stack((x1_design, state_design[:, :-1])) @ wage_parameters["school"]
-        wage_sigma = float(wage_parameters["sigmas"][0])
         education = choice[:, 1].astype(np.int64)
         work = choice[:, 2].astype(np.int64)
         tuition = np.asarray(tuition_agents(0, choice), dtype=np.float64).reshape(-1)
@@ -1811,58 +1817,78 @@ def prepare_education_cell_crns(
         else:
             base_budget = np.empty((draws, N_TYPES, n), dtype=np.float64)
 
-        for draw_index in range(draws):
-            wage = (
-                np.exp(np.clip(wage_mu + wage_sigma * crn["wage_z"][draw_index], -20.0, 20.0))
-                * work * 0.5 * (40 * 52)
-            )
-            if type_integration == "sampled":
-                grant = np.zeros(n, dtype=np.float64)
-                transfer = np.zeros(n, dtype=np.float64)
-                sampled_grant = TYPE_GRANT[sampled_type]
-                sampled_transfer = TYPE_TRANSFER[sampled_type]
-                for financial_type in (0, 1):
-                    idx = np.flatnonzero(sampled_grant == financial_type)
-                    if idx.size:
-                        grant[idx] = draw_grants_vectorized(
-                            x1_design[idx], education[idx], work[idx], financial["grant"],
-                            grant_type=financial_type,
-                            receipt_uniform=crn["grant_u"][draw_index, idx],
-                            amount_standard_normal=crn["grant_z"][draw_index, idx],
-                        )
-                    idx = np.flatnonzero(sampled_transfer == financial_type)
-                    if idx.size:
-                        transfer[idx] = draw_transfers_vectorized(
-                            x1_design[idx], education[idx], work[idx], financial["transfer"],
-                            transfer_type=financial_type,
-                            receipt_uniform=crn["transfer_u"][draw_index, idx],
-                            amount_standard_normal=crn["transfer_z"][draw_index, idx],
-                        )
-                base_budget[draw_index] = (
-                    wage + grant + transfer - tuition - (1.0 + r) * pack["debt"]
+        if resource_mode == "observed":
+            observed_budget = np.asarray(pack["observed_budget"], dtype=np.float64)
+            if observed_budget.shape != (n,) or not np.all(np.isfinite(observed_budget)):
+                raise ValueError(
+                    f"Observed pre-choice budget is invalid in model period {period}."
                 )
+            if type_integration == "sampled":
+                base_budget[:] = observed_budget[None, :]
             else:
-                for type_index in range(N_TYPES):
-                    grant = draw_grants_vectorized(
-                        x1_design, education, work, financial["grant"],
-                        grant_type=int(TYPE_GRANT[type_index]),
-                        receipt_uniform=crn["grant_u"][draw_index],
-                        amount_standard_normal=crn["grant_z"][draw_index],
-                    )
-                    transfer = draw_transfers_vectorized(
-                        x1_design, education, work, financial["transfer"],
-                        transfer_type=int(TYPE_TRANSFER[type_index]),
-                        receipt_uniform=crn["transfer_u"][draw_index],
-                        amount_standard_normal=crn["transfer_z"][draw_index],
-                    )
-                    base_budget[draw_index, type_index] = (
+                base_budget[:] = observed_budget[None, None, :]
+        else:
+            state_design = _state_wage_design(state)
+            wage_mu = (
+                np.column_stack((x1_design, state_design[:, :-1]))
+                @ wage_parameters["school"]
+            )
+            wage_sigma = float(wage_parameters["sigmas"][0])
+            for draw_index in range(draws):
+                wage = (
+                    np.exp(np.clip(
+                        wage_mu + wage_sigma * crn["wage_z"][draw_index], -20.0, 20.0
+                    ))
+                    * work * 0.5 * (40 * 52)
+                )
+                if type_integration == "sampled":
+                    grant = np.zeros(n, dtype=np.float64)
+                    transfer = np.zeros(n, dtype=np.float64)
+                    sampled_grant = TYPE_GRANT[sampled_type]
+                    sampled_transfer = TYPE_TRANSFER[sampled_type]
+                    for financial_type in (0, 1):
+                        idx = np.flatnonzero(sampled_grant == financial_type)
+                        if idx.size:
+                            grant[idx] = draw_grants_vectorized(
+                                x1_design[idx], education[idx], work[idx], financial["grant"],
+                                grant_type=financial_type,
+                                receipt_uniform=crn["grant_u"][draw_index, idx],
+                                amount_standard_normal=crn["grant_z"][draw_index, idx],
+                            )
+                        idx = np.flatnonzero(sampled_transfer == financial_type)
+                        if idx.size:
+                            transfer[idx] = draw_transfers_vectorized(
+                                x1_design[idx], education[idx], work[idx], financial["transfer"],
+                                transfer_type=financial_type,
+                                receipt_uniform=crn["transfer_u"][draw_index, idx],
+                                amount_standard_normal=crn["transfer_z"][draw_index, idx],
+                            )
+                    base_budget[draw_index] = (
                         wage + grant + transfer - tuition - (1.0 + r) * pack["debt"]
                     )
+                else:
+                    for type_index in range(N_TYPES):
+                        grant = draw_grants_vectorized(
+                            x1_design, education, work, financial["grant"],
+                            grant_type=int(TYPE_GRANT[type_index]),
+                            receipt_uniform=crn["grant_u"][draw_index],
+                            amount_standard_normal=crn["grant_z"][draw_index],
+                        )
+                        transfer = draw_transfers_vectorized(
+                            x1_design, education, work, financial["transfer"],
+                            transfer_type=int(TYPE_TRANSFER[type_index]),
+                            receipt_uniform=crn["transfer_u"][draw_index],
+                            amount_standard_normal=crn["transfer_z"][draw_index],
+                        )
+                        base_budget[draw_index, type_index] = (
+                            wage + grant + transfer - tuition - (1.0 + r) * pack["debt"]
+                        )
 
         prepared_pack = dict(pack)
         prepared_pack["base_budget_crn"] = np.ascontiguousarray(base_budget)
         prepared_pack["budget_z"] = np.ascontiguousarray(crn["budget_z"])
         prepared_pack["type_integration"] = type_integration
+        prepared_pack["resource_mode"] = resource_mode
         if type_integration == "sampled":
             prepared_pack["ccp_sampled"] = np.ascontiguousarray(
                 pack["ccp_by_type"][sampled_type, np.arange(n)], dtype=np.float64
@@ -2273,6 +2299,7 @@ def fit_education_cell(
     fixed_common=None, specification="parental_income_basic",
     type_integration="sampled", moment_spec="fast_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
+    resource_mode="simulated",
 ):
     """Estimate a single program-year cell without changing the dynamic solver."""
     if not packs:
@@ -2285,6 +2312,8 @@ def fit_education_cell(
         raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
     if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
         raise ValueError("primary_moment_weight must be positive and finite.")
+    if resource_mode not in EDUCATION_CELL_RESOURCE_MODES:
+        raise ValueError(f"resource_mode must be one of {EDUCATION_CELL_RESOURCE_MODES}.")
     if specification == "joint_type" and type_integration != "exact":
         raise ValueError("The retained joint_type specification requires exact integration.")
     data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(
@@ -2300,8 +2329,10 @@ def fit_education_cell(
         else:
             sampled.append(_subset_cell_pack(pack, rng.choice(len(pack["x1"]), n_sample, replace=True)))
     sample_by_period = prepare_education_cell_crns(
-        sampled, draws=draws, seed=seed, type_integration=type_integration
+        sampled, draws=draws, seed=seed, type_integration=type_integration,
+        resource_mode=resource_mode,
     )
+    print(f"[current resources] {resource_mode}")
     if type_integration == "sampled":
         pooled_n = sum(len(pack["x1"]) for pack in sample_by_period.values())
         print(
@@ -2451,6 +2482,7 @@ def estimate_budget_shock_education_cell(
     type_integration="sampled",
     moment_spec="fast_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
+    resource_mode="simulated",
     draws=20,
     n_sample=None,
     maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
@@ -2485,12 +2517,14 @@ def estimate_budget_shock_education_cell(
         fixed_common=fixed_common, specification=specification,
         type_integration=type_integration, moment_spec=moment_spec,
         primary_moment_weight=primary_moment_weight,
+        resource_mode=resource_mode,
     )
     if save:
         cell_code = bs.education_cell_code(education, program_year)
         prefix = (
             f"budgetshock_educ{education}_year{program_year}_parental_income_basic_"
             f"{type_integration}_{moment_spec}"
+            f"{'_observed_resources' if resource_mode == 'observed' else ''}"
             if specification == "parental_income_basic"
             else f"budgetshock_educ{education}_year{program_year}_{shock_heterogeneity}"
         )
@@ -2503,6 +2537,7 @@ def estimate_budget_shock_education_cell(
                 "smm_type_integration": type_integration,
                 "smm_moment_spec": moment_spec,
                 "smm_primary_moment_weight": float(primary_moment_weight),
+                "smm_resource_mode": resource_mode,
                 "smm_draws": int(draws),
                 "smm_seed": int(seed),
                 "smm_n_sample": None if n_sample is None else int(n_sample),

@@ -12,6 +12,7 @@ from model_fitloans_dynamic import (
     DEFAULT_CCP_WORKERS,
     DEFAULT_EDUCATION_CELL_MAXITER,
     DEFAULT_PRIMARY_MOMENT_WEIGHT,
+    EDUCATION_CELL_RESOURCE_MODES,
     EDUCATION_CELL_SPECIFICATIONS,
     PARENTAL_INCOME_MOMENT_SPECS,
     TYPE_INTEGRATION_MODES,
@@ -58,6 +59,16 @@ def build_parser():
         help=(
             "Loss weight on mean positive loans and share indebted in every "
             "parinc group; std and p80 each retain weight 1 (default: 4)."
+        ),
+    )
+    parser.add_argument(
+        "--resource-mode",
+        choices=EDUCATION_CELL_RESOURCE_MODES,
+        default="simulated",
+        help=(
+            "simulated draws wages/grants/transfers from estimated processes; "
+            "observed uses their realized superfeasible-data values and draws "
+            "only the residual budget shock."
         ),
     )
     parser.add_argument("--draws", type=int, default=20)
@@ -161,6 +172,7 @@ def main():
         type_integration=args.type_integration,
         moment_spec=args.moment_spec,
         primary_moment_weight=args.primary_moment_weight,
+        resource_mode=args.resource_mode,
         shock_heterogeneity=args.heterogeneity,
         draws=args.draws,
         n_sample=args.n_sample,

@@ -47,12 +47,13 @@ class Tee:
 
 def result_prefix(
     education, program_year, heterogeneity, specification,
-    type_integration="sampled", moment_spec="fast_stock",
+    type_integration="sampled", moment_spec="fast_stock", resource_mode="simulated",
 ):
     if specification == "parental_income_basic":
         return (
             f"budgetshock_educ{education}_year{program_year}_parental_income_basic_"
             f"{type_integration}_{moment_spec}"
+            f"{'_observed_resources' if resource_mode == 'observed' else ''}"
         )
     return f"budgetshock_educ{education}_year{program_year}_{heterogeneity}"
 
@@ -113,6 +114,7 @@ def print_parameter_report(paths, bestx, spec):
             "primary moment weight: "
             f"{spec.get('smm_primary_moment_weight', 1.0)}"
         )
+        print(f"current resources:    {spec.get('smm_resource_mode', 'simulated')}")
         print(f"estimation draws:     {spec['smm_draws']}")
         print(f"estimation seed:      {spec['smm_seed']}")
         print(f"estimation n_sample:  {spec['smm_n_sample']}")
@@ -190,6 +192,7 @@ def reevaluate_model_fit(bestx, args):
     print(f"ccp workers: {args.ccp_workers}")
     print(f"ccp cache:   {args.ccp_cache_mode}")
     print(f"primary moment weight: {args.primary_moment_weight:g}")
+    print(f"current resources: {args.resource_mode}")
     print(
         "This reproduces the original reported fit exactly only when these "
         "settings equal those used in estimation."
@@ -231,6 +234,7 @@ def reevaluate_model_fit(bestx, args):
     sample_by_period = fit.prepare_education_cell_crns(
         sampled, draws=args.draws, seed=args.seed,
         type_integration=args.type_integration,
+        resource_mode=args.resource_mode,
     )
     cell_code = bs.education_cell_code(args.education, args.program_year)
 
@@ -282,6 +286,11 @@ def build_parser():
         default=None,
         help="Override the saved primary-moment loss weight when reevaluating.",
     )
+    parser.add_argument(
+        "--resource-mode",
+        choices=("simulated", "observed"),
+        default="simulated",
+    )
     parser.add_argument("--draws", type=int, default=20)
     parser.add_argument("--n-sample", type=int, default=None)
     parser.add_argument("--seed", type=int, default=12345)
@@ -314,7 +323,7 @@ def main():
         raise ValueError("--specification joint_type requires --type-integration exact.")
     prefix = result_prefix(
         args.education, args.program_year, args.heterogeneity, args.specification,
-        args.type_integration, args.moment_spec,
+        args.type_integration, args.moment_spec, args.resource_mode,
     )
     report_path = Path(
         args.report_path
