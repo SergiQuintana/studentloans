@@ -151,6 +151,8 @@ def reevaluate_model_fit(bestx, args):
     print(f"draws:       {args.draws}")
     print(f"seed:        {args.seed}")
     print(f"n_sample:    {args.n_sample if args.n_sample is not None else 'all'}")
+    print(f"ccp workers: {args.ccp_workers}")
+    print(f"ccp cache:   {args.ccp_cache_mode}")
     print(
         "This reproduces the original reported fit exactly only when these "
         "settings equal those used in estimation."
@@ -165,6 +167,8 @@ def reevaluate_model_fit(bestx, args):
             interp_dict,
             education=args.education,
             program_year=args.program_year,
+            ccp_workers=args.ccp_workers,
+            ccp_cache_mode=args.ccp_cache_mode,
         )
         if len(pack["x1"]):
             print(f"  retained {len(pack['x1'])} enrolled observations")
@@ -218,6 +222,12 @@ def build_parser():
     parser.add_argument("--draws", type=int, default=20)
     parser.add_argument("--n-sample", type=int, default=None)
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--ccp-workers", type=int, default=16)
+    parser.add_argument(
+        "--ccp-cache-mode",
+        choices=("off", "reuse", "rebuild"),
+        default="reuse",
+    )
     parser.add_argument(
         "--parameters-only",
         action="store_true",

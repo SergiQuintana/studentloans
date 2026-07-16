@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 
 from config import EST
-from model_fitloans_dynamic import estimate_budget_shock_education_cell
+from model_fitloans_dynamic import (
+    CCP_CACHE_MODES,
+    DEFAULT_CCP_WORKERS,
+    estimate_budget_shock_education_cell,
+)
 from prepare_fitloans_ccp_sequences import prepare_fitloans_ccp_sequences
 
 
@@ -25,6 +29,21 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--ccp-processes", type=int, default=10)
+    parser.add_argument(
+        "--ccp-workers",
+        type=int,
+        default=DEFAULT_CCP_WORKERS,
+        help="Processes used to extract the 16 type-specific CCP paths.",
+    )
+    parser.add_argument(
+        "--ccp-cache-mode",
+        choices=CCP_CACHE_MODES,
+        default="reuse",
+        help=(
+            "Education-cell test cache: off always reads current sequences; "
+            "reuse validates/reuses; rebuild replaces it."
+        ),
+    )
     parser.add_argument(
         "--skip-preparation",
         action="store_true",
@@ -61,6 +80,8 @@ def main():
         seed=args.seed,
         save=args.save,
         fixed_common=fixed_common,
+        ccp_workers=args.ccp_workers,
+        ccp_cache_mode=args.ccp_cache_mode,
     )
     print("\nOptimization finished")
     print("success:", result.success)

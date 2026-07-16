@@ -21,6 +21,10 @@ ADJUSTED (as requested):
 import numpy as np
 import joblib
 import os
+import hashlib
+import json
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 from numba import njit, prange
 from scipy.optimize import minimize
@@ -73,6 +77,9 @@ beta = 0.98
 
 debt_range = get_debt_range()
 _EM_POSTERIORS = None
+DEFAULT_CCP_WORKERS = max(1, min(16, os.cpu_count() or 1))
+CCP_CACHE_MODES = ("off", "reuse", "rebuild")
+CCP_CELL_CACHE_SCHEMA = 1
 
 
 def load_full_em_posteriors():
@@ -164,46 +171,98 @@ def get_interp_dict_cached(force_rebuild=False):
 # ==============================================================================
 # Continuation / CCP path
 
+def _ccp_bundle_path(period, x1i, em_type):
+    return Path(OUT(
+        "evt_ccp", str(period + 1),
+        f"evt_ccp_sequence_t{period+1}_{x1i}_em{em_type}.npz",
+    ))
+
+
+def _continuation_from_bundle(x1i, x2i, ji, period, bundle):
+    """Extract the same individual continuation as the legacy loader."""
+    graduation_possible = (
+        ((x2i[1] >= 1) & (ji[1] == 1) & (x2i[4] == 0))
+        | ((x2i[2] >= 3) & (ji[1] == 2) & (x2i[5] == 0))
+        | (ji[1] == 3)
+    )
+    notgrad_x2 = move_state_grad(x2i, ji, period)
+    nograd_key = f"evt_ccp_sequence_t{period+1}_{x1i}_{notgrad_x2}"
+    evt_nograd = np.asarray(bundle[nograd_key], dtype=np.float64)
+    if not graduation_possible:
+        return evt_nograd
+
+    grad_x2 = move_state_grad(x2i, ji, period, grad=1)
+    grad_key = f"evt_ccp_sequence_t{period+1}_{x1i}_{grad_x2}"
+    evt_grad = np.asarray(bundle[grad_key], dtype=np.float64)
+    p_grad = probability_graduation(get_x1_new(x1i), x2i, ji)
+    return p_grad * evt_grad + (1.0 - p_grad) * evt_nograd
+
+
 def get_individual_continuation(i, x1, x2, j, period, em_type):
-    """
-    Loads sequence EVT (ccp-path) for period+1, taking graduation expectation if needed.
-    """
-    x1i = x1[i, :].astype("int")
-    x2i = x2[i, :].astype("int")
-    ji  = j[i, :]
+    """Compatibility wrapper for a single continuation lookup."""
+    x1i = x1[i, :].astype(np.int64)
+    x2i = x2[i, :].astype(np.int64)
+    ji = j[i, :]
+    with np.load(_ccp_bundle_path(period, x1i, em_type)) as bundle:
+        return _continuation_from_bundle(x1i, x2i, ji, period, bundle)
 
-    # graduation possible?
-    if ((x2i[1] >= 1) & (ji[1] == 1) & (x2i[4] == 0)) | ((x2i[2] >= 3) & (ji[1] == 2) & (x2i[5] == 0)) | (ji[1] == 3):
-        grad_x2    = move_state_grad(x2i, ji, period, grad=1)
-        notgrad_x2 = move_state_grad(x2i, ji, period)
-
-        evti = np.load(OUT("evt_ccp", str(period + 1), f"evt_ccp_sequence_t{period+1}_{x1i}_em{em_type}.npz"))
-        evt_grad   = evti[f"evt_ccp_sequence_t{period+1}_{x1i}_{grad_x2}"]
-        evt_nograd = evti[f"evt_ccp_sequence_t{period+1}_{x1i}_{notgrad_x2}"]
-
-        x1_new = get_x1_new(x1i)
-        p_grad = probability_graduation(x1_new, x2i, ji)
-
-        vt = p_grad * evt_grad + (1 - p_grad) * evt_nograd
-    else:
-        evti = np.load(OUT("evt_ccp", str(period + 1), f"evt_ccp_sequence_t{period+1}_{x1i}_em{em_type}.npz"))
-        notgrad_x2 = move_state_grad(x2i, ji, period)
-        vt = evti[f"evt_ccp_sequence_t{period+1}_{x1i}_{notgrad_x2}"]
-
-    return vt
 
 def load_ccp_path(x1, state, choices, period, em_type):
+    """Load one type's N x 100 path, opening each x1 archive only once.
+
+    Results are numerically identical to the original individual loop. Within
+    an invariant-state group, repeated (x2, choice) requests are also reused.
     """
-    Loads the EVT-ccp path matrix (N x 100) for this period.
-    """
-    sequence = np.zeros((x1.shape[0], 100), dtype=np.float64)
-    if period == 9:
+    x1 = np.asarray(x1)
+    state = np.asarray(state)
+    choices = np.asarray(choices)
+    sequence = np.zeros((x1.shape[0], debt_range.size), dtype=np.float64)
+    if period == 9 or x1.shape[0] == 0:
         return sequence
 
-    for i in range(x1.shape[0]):
-        sequence[i, :] = get_individual_continuation(i, x1, state, choices, period, em_type)
-
+    x1_integer = x1.astype(np.int64)
+    unique_x1, group_index = np.unique(x1_integer, axis=0, return_inverse=True)
+    for group, x1i in enumerate(unique_x1):
+        rows = np.flatnonzero(group_index == group)
+        continuation_cache = {}
+        with np.load(_ccp_bundle_path(period, x1i, em_type)) as bundle:
+            for row in rows:
+                x2i = state[row].astype(np.int64)
+                ji = choices[row]
+                request = (
+                    tuple(x2i.tolist()),
+                    tuple(np.asarray(ji).tolist()),
+                )
+                value = continuation_cache.get(request)
+                if value is None:
+                    value = _continuation_from_bundle(x1i, x2i, ji, period, bundle)
+                    continuation_cache[request] = value
+                sequence[row] = value
     return sequence
+
+
+def _load_ccp_type_worker(arguments):
+    type_index, x1, state, choices, period, em_type = arguments
+    return type_index, load_ccp_path(x1, state, choices, period, em_type)
+
+
+def load_ccp_paths_parallel(x1, state, choices, period, workers=DEFAULT_CCP_WORKERS):
+    """Build all 16 type paths, parallelizing independent type files."""
+    workers = max(1, min(int(workers), len(TYPE_IDS)))
+    arguments = [
+        (type_index, x1, state, choices, period, em_type)
+        for type_index, em_type in enumerate(TYPE_IDS)
+    ]
+    if workers == 1 or period == 9 or len(x1) == 0:
+        results = map(_load_ccp_type_worker, arguments)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            results = executor.map(_load_ccp_type_worker, arguments, chunksize=1)
+            results = list(results)
+    ordered = [None] * len(TYPE_IDS)
+    for type_index, path in results:
+        ordered[type_index] = path
+    return np.ascontiguousarray(np.stack(ordered, axis=0), dtype=np.float64)
 
 # ==============================================================================
 # Budget construction from observed data
@@ -295,7 +354,9 @@ def get_continuation(x1, state, choices, period, interp_dict):
 # ==============================================================================
 # Load fundamentals per period
 
-def load_fundamentals(period, interp_dict, clear_data=False):
+def load_fundamentals(
+    period, interp_dict, clear_data=False, ccp_workers=DEFAULT_CCP_WORKERS,
+):
     """
     Loads and returns everything needed for estimation for a given period.
     """
@@ -321,10 +382,8 @@ def load_fundamentals(period, interp_dict, clear_data=False):
     debtchoice = debt_range[debtchoice.astype("int")]
 
     # First axis follows the same type ordering as the posterior columns.
-    ccp_path = np.stack(
-        [load_ccp_path(x1, state, choices, period, em_type)
-         for em_type in TYPE_IDS],
-        axis=0,
+    ccp_path = load_ccp_paths_parallel(
+        x1, state, choices, period, workers=ccp_workers
     )
 
     # budget w/o shock
@@ -336,7 +395,102 @@ def load_fundamentals(period, interp_dict, clear_data=False):
     return x1, state, types, debt, debtchoice, choices, ccp_path, budget, terminal_data
 
 
-def load_education_cell(period, interp_dict, education=2, program_year=1):
+def _hash_arrays(*arrays):
+    digest = hashlib.sha256()
+    for array in arrays:
+        array = np.ascontiguousarray(array)
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _ccp_source_fingerprint(period, x1):
+    """Fingerprint every general sequence bundle needed by this sample."""
+    digest = hashlib.sha256()
+    if period == 9:
+        digest.update(b"terminal-period-zero-ccp")
+        return digest.hexdigest()
+    for x1i in np.unique(np.asarray(x1, dtype=np.int64), axis=0):
+        for em_type in TYPE_IDS:
+            path = _ccp_bundle_path(period, x1i, em_type)
+            stat = path.stat()
+            digest.update(str(path).encode("utf-8"))
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _cell_ccp_cache_paths(period, education, program_year):
+    directory = Path(OUT("cache", "fitloans_ccp"))
+    stem = f"ccp_educ{education}_year{program_year}_t{period}"
+    return directory / f"{stem}.npy", directory / f"{stem}.json"
+
+
+def _write_cell_ccp_cache(array_path, metadata_path, ccp, metadata):
+    array_path.parent.mkdir(parents=True, exist_ok=True)
+    array_temp = array_path.with_suffix(array_path.suffix + ".tmp")
+    metadata_temp = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    with array_temp.open("wb") as handle:
+        np.save(handle, np.asarray(ccp, dtype=np.float64), allow_pickle=False)
+    with metadata_temp.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(array_temp, array_path)
+    os.replace(metadata_temp, metadata_path)
+
+
+def load_education_cell_ccp(
+    x1, state, choices, period, education, program_year,
+    workers=DEFAULT_CCP_WORKERS, cache_mode="reuse",
+):
+    """Load/build the compact test cache for one education-program cell."""
+    cache_mode = str(cache_mode).lower()
+    if cache_mode not in CCP_CACHE_MODES:
+        raise ValueError(f"ccp_cache_mode must be one of {CCP_CACHE_MODES}")
+    if cache_mode == "off":
+        return load_ccp_paths_parallel(x1, state, choices, period, workers=workers)
+
+    array_path, metadata_path = _cell_ccp_cache_paths(
+        period, education, program_year
+    )
+    expected = {
+        "schema": CCP_CELL_CACHE_SCHEMA,
+        "period": int(period),
+        "education": int(education),
+        "program_year": int(program_year),
+        "type_ids": list(TYPE_IDS),
+        "shape": [len(TYPE_IDS), int(len(x1)), int(debt_range.size)],
+        "data_fingerprint": _hash_arrays(x1, state, choices),
+        "source_fingerprint": _ccp_source_fingerprint(period, x1),
+    }
+    if cache_mode == "reuse" and array_path.exists() and metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                observed = json.load(handle)
+            if observed == expected:
+                cached = np.load(array_path, allow_pickle=False)
+                if list(cached.shape) == expected["shape"]:
+                    print(f"  [CCP cell cache] reuse {array_path}")
+                    return np.ascontiguousarray(cached, dtype=np.float64)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        print(f"  [CCP cell cache] stale or invalid: {array_path}")
+
+    print(
+        f"  [CCP cell cache] build period={period} with {workers} workers "
+        f"for {len(x1)} observations"
+    )
+    ccp = load_ccp_paths_parallel(x1, state, choices, period, workers=workers)
+    _write_cell_ccp_cache(array_path, metadata_path, ccp, expected)
+    print(f"  [CCP cell cache] saved {array_path}")
+    return ccp
+
+
+def load_education_cell(
+    period, interp_dict, education=2, program_year=1,
+    ccp_workers=DEFAULT_CCP_WORKERS, ccp_cache_mode="reuse",
+):
     """Load an observed education cell while preserving model-period continuation.
 
     Program year is read from the pre-choice experience stored in ``state``.
@@ -344,43 +498,58 @@ def load_education_cell(period, interp_dict, education=2, program_year=1):
     end-of-period stock.  The two are deliberately not reconstructed from one
     another in the data.
     """
-    data = load_fundamentals(period, interp_dict, clear_data=False)
-    x1, state, q, debt, debtchoice, choices, ccp, budget, terminal = data
-    raw_choices = np.load(RDATA(f"choice_superfeasible_t{period}.npy"))
-    education_mask = raw_choices[:, 1] > 0
-
+    x1, state, debt_index, debtchoice_index, choices, income = (
+        load_data_superfeasible(period, return_income=True)
+    )
+    q = load_full_em_posteriors()
     flow_path = RDATA(f"loanflow_superfeasible_t{period}.npy")
     if not os.path.exists(flow_path):
         raise FileNotFoundError(
             f"Missing {flow_path}. Rebuild superfeasible data with "
             "model_em_algorithm.get_data_superfeasible()."
         )
-    loan_flow = np.asarray(np.load(flow_path), dtype=np.float64)[education_mask]
+    loan_flow = np.asarray(np.load(flow_path), dtype=np.float64)
+    lengths = {
+        "x1": len(x1), "state": len(state), "debt": len(debt_index),
+        "debtchoice": len(debtchoice_index), "choices": len(choices),
+        "income": len(income), "q": len(q), "loan_flow": len(loan_flow),
+    }
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Education-cell inputs are misaligned in period {period}: {lengths}")
 
     cell_code = bs.education_cell_code(education, program_year)
     observed_code = bs.education_cell_from_state(state, education)
-    cell = (choices[:, 1].astype(int) == int(education)) & (observed_code == cell_code)
-
-    term_g, term_ng, p_grad = terminal
-    idx = np.flatnonzero(cell)
-    terminal_cell = [
-        [term_g[i] for i in idx],
-        [term_ng[i] for i in idx],
-        p_grad[idx],
-    ]
+    cell = (
+        (choices[:, 1].astype(np.int64) == int(education))
+        & (observed_code == cell_code)
+    )
+    x1 = np.ascontiguousarray(x1[cell])
+    state = np.ascontiguousarray(state[cell])
+    choices = np.ascontiguousarray(choices[cell])
+    income = np.ascontiguousarray(income[cell])
+    debt = debt_range[np.asarray(debt_index[cell], dtype=np.int64)]
+    debtchoice = debt_range[np.asarray(debtchoice_index[cell], dtype=np.int64)]
+    q = validate_q(q[cell], n_individuals=int(cell.sum()))
+    loan_flow = np.ascontiguousarray(loan_flow[cell], dtype=np.float64)
+    ccp = load_education_cell_ccp(
+        x1, state, choices, period, education, program_year,
+        workers=ccp_workers, cache_mode=ccp_cache_mode,
+    )
+    budget = get_budget(income, debt, choices)
+    terminal_cell = list(get_continuation(x1, state, choices, period, interp_dict))
     return {
         "period": int(period),
         "cell_code": int(cell_code),
-        "x1": np.ascontiguousarray(x1[cell]),
-        "state": np.ascontiguousarray(state[cell]),
-        "q": validate_q(q[cell], n_individuals=int(cell.sum())),
-        "debt": np.ascontiguousarray(debt[cell], dtype=np.float64),
-        "debtchoice": np.ascontiguousarray(debtchoice[cell], dtype=np.float64),
-        "loan_flow": np.ascontiguousarray(loan_flow[cell], dtype=np.float64),
-        "parinc": np.ascontiguousarray(x1[cell, 0], dtype=np.int64),
-        "choice": np.ascontiguousarray(choices[cell]),
-        "ccp_by_type": np.ascontiguousarray(ccp[:, cell, :], dtype=np.float64),
-        "observed_budget": np.ascontiguousarray(budget[cell], dtype=np.float64),
+        "x1": x1,
+        "state": state,
+        "q": q,
+        "debt": np.ascontiguousarray(debt, dtype=np.float64),
+        "debtchoice": np.ascontiguousarray(debtchoice, dtype=np.float64),
+        "loan_flow": loan_flow,
+        "parinc": np.ascontiguousarray(x1[:, 0], dtype=np.int64),
+        "choice": choices,
+        "ccp_by_type": ccp,
+        "observed_budget": np.ascontiguousarray(budget, dtype=np.float64),
         "terminal_data": terminal_cell,
     }
 
@@ -1625,6 +1794,8 @@ def estimate_budget_shock_education_cell(
     save=False,
     initial=None,
     fixed_common=None,
+    ccp_workers=DEFAULT_CCP_WORKERS,
+    ccp_cache_mode="reuse",
 ):
     """Run the dynamic estimator as a one-program-year pre-test.
 
@@ -1637,7 +1808,8 @@ def estimate_budget_shock_education_cell(
     for period in range(1, T):
         print(f"[load education cell] model period={period}")
         pack = load_education_cell(
-            period, interp_dict, education=education, program_year=program_year
+            period, interp_dict, education=education, program_year=program_year,
+            ccp_workers=ccp_workers, ccp_cache_mode=ccp_cache_mode,
         )
         if len(pack["x1"]):
             print(f"  retained {len(pack['x1'])} enrolled observations")
