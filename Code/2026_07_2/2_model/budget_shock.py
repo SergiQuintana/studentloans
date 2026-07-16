@@ -29,7 +29,7 @@ INDEX_KINDS = ("model_period", "education_cell")
 EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
 LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
 PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 14
-PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE = 15
+PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE = 18
 BUDGET_RESOURCE_SCALE = 10000.0
 
 
@@ -194,10 +194,11 @@ def unpack_parental_income_loan_type_estimation_vector(
     periods,
     index_kind: str = "education_cell",
 ) -> dict[str, Any]:
-    """Add one high-loan-type mean shift to the 14-parameter parinc model.
+    """Add four high-loan-type risk-aversion levels to the parinc model.
 
-    The first 14 entries retain exactly the baseline ordering. Entry 15 is
-    the high-loan-type mean shift; the low-loan type is normalized to zero.
+    The first 14 entries retain exactly the baseline ordering and their four
+    risk-aversion levels apply to the low-loan type. Entries 15--18 are the
+    corresponding high-loan-type levels. Budget-shock means remain common.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     if vector.size != PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE:
@@ -210,8 +211,11 @@ def unpack_parental_income_loan_type_estimation_vector(
         periods,
         index_kind=index_kind,
     )
-    spec["loan_heterogeneity"] = "mean"
-    spec["loan_mean_shift"] = np.asarray([vector[14]], dtype=np.float64)
+    spec["loan_heterogeneity"] = "homogeneous"
+    spec["loan_mean_shift"] = np.zeros(1, dtype=np.float64)
+    spec["risk_aversion_by_loan_type"] = np.vstack(
+        (spec["risk_aversion"], vector[14:18])
+    ).astype(np.float64)
     spec["estimation_parameterization"] = "parental_income_loan_type"
     return spec
 
@@ -236,6 +240,10 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     )
     if "risk_aversion" in out:
         out["risk_aversion"] = np.asarray(out["risk_aversion"], dtype=np.float64)
+    if "risk_aversion_by_loan_type" in out:
+        out["risk_aversion_by_loan_type"] = np.asarray(
+            out["risk_aversion_by_loan_type"], dtype=np.float64
+        )
 
     p = out["periods"].size
     out["loan_mean_shift"] = np.asarray(
@@ -255,6 +263,11 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("debt_pen_parinc must have three legacy or four current entries")
     if "risk_aversion" in out and out["risk_aversion"].shape != (N_RISK_PARAMETERS,):
         raise ValueError("risk_aversion must have four entries")
+    if (
+        "risk_aversion_by_loan_type" in out
+        and out["risk_aversion_by_loan_type"].shape != (2, N_RISK_PARAMETERS)
+    ):
+        raise ValueError("risk_aversion_by_loan_type must have shape (2, 4)")
     if out["loan_mean_shift"].shape != (p,):
         raise ValueError("loan_mean_shift must contain one value per period")
     if out["loan_log_sigma_ratio"].shape != (p,):
@@ -267,6 +280,11 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("loan_log_sigma_ratio contains non-finite values")
     if not np.all(np.isfinite(out["budget_resource_slope"])):
         raise ValueError("budget_resource_slope contains non-finite values")
+    if (
+        "risk_aversion_by_loan_type" in out
+        and not np.all(np.isfinite(out["risk_aversion_by_loan_type"]))
+    ):
+        raise ValueError("risk_aversion_by_loan_type contains non-finite values")
     return out
 
 
@@ -401,10 +419,22 @@ def conditional_sigma(
     return float(result) if result.ndim == 0 else result
 
 
-def risk_aversion(spec: dict[str, Any], x1: np.ndarray) -> np.ndarray:
+def risk_aversion(
+    spec: dict[str, Any], x1: np.ndarray, loan_type=None,
+) -> np.ndarray:
     if "risk_aversion" not in spec:
         raise ValueError("Budget-shock specification has no risk_aversion parameters")
     par = np.asarray(x1)[..., 0].astype(np.int64)
+    if "risk_aversion_by_loan_type" in spec:
+        if loan_type is None:
+            raise ValueError(
+                "loan_type is required for loan-type-specific risk aversion"
+            )
+        loan = np.asarray(loan_type, dtype=np.int64)
+        if not np.all(np.isin(loan, (0, 1))):
+            raise ValueError("loan_type must contain only 0 and 1")
+        loan, par = np.broadcast_arrays(loan, par)
+        return spec["risk_aversion_by_loan_type"][loan, par - 1]
     return spec["risk_aversion"][par - 1]
 
 

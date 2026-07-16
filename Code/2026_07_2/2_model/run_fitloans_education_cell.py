@@ -33,7 +33,8 @@ def build_parser():
         help=(
             "parental_income_basic estimates the parinc shock/risk parameters, "
             "while parental_income_loan_type adds 32 type-by-parinc moments and "
-            "one normalized high-loan-type shock-mean shift."
+            "eight loan-type-by-parinc risk-aversion levels while keeping the "
+            "budget-shock mean common across loan types."
         ),
     )
     parser.add_argument(
@@ -140,7 +141,7 @@ def main():
     ) and args.heterogeneity != "homogeneous":
         raise ValueError(
             "Parental-income specifications require --heterogeneity homogeneous; "
-            "the loan-type version adds its mean shift internally."
+            "the loan-type version adds risk-aversion heterogeneity internally."
         )
     if args.specification in (
         "parental_income_basic", "parental_income_loan_type",

@@ -94,6 +94,14 @@ def load_saved_bundle(prefix, heterogeneity, education, program_year, specificat
     for field in fields:
         if not np.allclose(saved_spec[field], vector_spec[field], equal_nan=True):
             raise ValueError(f"{paths['params']} disagrees with bestx for {field}.")
+    if specification == "parental_income_loan_type":
+        if not np.allclose(
+            saved_spec["risk_aversion_by_loan_type"],
+            vector_spec["risk_aversion_by_loan_type"],
+        ):
+            raise ValueError(
+                f"{paths['params']} disagrees with bestx for loan-type risk aversion."
+            )
     if not np.allclose(separate_risk, saved_spec["risk_aversion"]):
         raise ValueError("The separate risk-aversion array disagrees with the parameter bundle.")
     return paths, bestx, saved_spec
@@ -143,9 +151,20 @@ def print_parameter_report(paths, bestx, spec):
     print(f"  high-loan type sigma                       {sigma_low * sigma_ratio:>14.6f}")
     print(f"  high/low sigma ratio                       {sigma_ratio:>14.6f}")
 
-    print("\nRisk-aversion levels by model parinc=x1[:,0]")
-    for level, value in enumerate(spec["risk_aversion"], start=1):
-        print(f"  parinc={level}                              {value:>14.6f}")
+    if "risk_aversion_by_loan_type" in spec:
+        print("\nRisk-aversion levels by loan type and model parinc=x1[:,0]")
+        for loan_type, type_name in ((0, "low"), (1, "high")):
+            for level, value in enumerate(
+                spec["risk_aversion_by_loan_type"][loan_type], start=1
+            ):
+                print(
+                    f"  {type_name}-loan, parinc={level}"
+                    f"                         {value:>14.6f}"
+                )
+    else:
+        print("\nRisk-aversion levels by model parinc=x1[:,0]")
+        for level, value in enumerate(spec["risk_aversion"], start=1):
+            print(f"  parinc={level}                              {value:>14.6f}")
 
     coefficients = np.asarray(spec["debt_pen_parinc"], dtype=np.float64)
     implied = coefficients[0] + np.r_[0.0, coefficients[1:]]
@@ -171,7 +190,10 @@ def print_parameter_report(paths, bestx, spec):
         if bestx.size > bs.LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
             raw_labels += ["common pre-choice-resource slope (per $10,000)"]
         if spec.get("estimation_parameterization") == "parental_income_loan_type":
-            raw_labels += ["high-loan-type shock mean shift"]
+            raw_labels += [
+                f"risk aversion: high-loan type, parinc={level}"
+                for level in range(1, 5)
+            ]
     else:
         raw_labels = list(MEAN_LABELS)
         raw_labels += ["sigma: low-loan type"]

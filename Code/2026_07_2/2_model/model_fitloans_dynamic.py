@@ -2250,13 +2250,23 @@ def _pool_sampled_education_cell_evaluation(
         x1 = pack["x1"]
         terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
         parental_group = x1[:, 0].astype(np.int64) - 1
-        for group_index in range(4):
-            idx = np.flatnonzero(parental_group == group_index)
-            if idx.size:
-                terminal[idx] = get_relevant_terminal_subset_cached(
-                    pack["terminal_data"], spec["risk_aversion"][group_index],
-                    idx, curve_cache,
-                )
+        has_loan_risk = "risk_aversion_by_loan_type" in spec
+        loan_levels = (0, 1) if has_loan_risk else (None,)
+        for loan_level in loan_levels:
+            for group_index in range(4):
+                selected = parental_group == group_index
+                if loan_level is not None:
+                    selected &= pack["sampled_loan_type"] == loan_level
+                idx = np.flatnonzero(selected)
+                if idx.size:
+                    risk_level = (
+                        spec["risk_aversion_by_loan_type"][loan_level, group_index]
+                        if loan_level is not None
+                        else spec["risk_aversion"][group_index]
+                    )
+                    terminal[idx] = get_relevant_terminal_subset_cached(
+                        pack["terminal_data"], risk_level, idx, curve_cache,
+                    )
         terminals.append(terminal)
 
     pooled = dict(static)
@@ -2265,7 +2275,13 @@ def _pool_sampled_education_cell_evaluation(
     )
     x1 = pooled["x1"]
     pooled["sigma_i"] = np.ascontiguousarray(
-        bs.risk_aversion(spec, x1), dtype=np.float64
+        bs.risk_aversion(
+            spec, x1,
+            loan_type=(
+                pooled["loan_type"]
+                if "risk_aversion_by_loan_type" in spec else None
+            ),
+        ), dtype=np.float64
     )
     pooled["debtpen_i"] = np.ascontiguousarray(
         bs.debt_penalty(spec, x1), dtype=np.float64
@@ -2293,7 +2309,7 @@ def minimize_distance_education_cell_parental_income(
     moment_spec="fast_stock", primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     specification="parental_income_basic", integrated_data=None,
 ):
-    """Basic parinc SMM with one common pre-choice-resource slope."""
+    """Parinc SMM, optionally with loan-type-specific risk aversion."""
     global EVAL_COUNTER
     EVAL_COUNTER += 1
     if type_integration not in TYPE_INTEGRATION_MODES:
@@ -2370,19 +2386,44 @@ def minimize_distance_education_cell_parental_income(
         evaluation_by_period = {}
         for period, pack in sample_by_period.items():
             x1 = pack["x1"]
-            terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
             cache = {}
             parental_group = x1[:, 0].astype(int) - 1
-            for group_index in range(4):
-                idx = np.flatnonzero(parental_group == group_index)
-                if idx.size:
-                    terminal[idx] = get_relevant_terminal_subset_cached(
-                        pack["terminal_data"], spec["risk_aversion"][group_index],
-                        idx, cache,
+            if "risk_aversion_by_loan_type" in spec:
+                terminal = np.zeros(
+                    (2, len(x1), debt_range.size), dtype=np.float64
+                )
+                sigma_i = np.empty((2, len(x1)), dtype=np.float64)
+                for loan_level in (0, 1):
+                    sigma_i[loan_level] = bs.risk_aversion(
+                        spec, x1, loan_type=loan_level
                     )
+                    for group_index in range(4):
+                        idx = np.flatnonzero(parental_group == group_index)
+                        if idx.size:
+                            terminal[loan_level, idx] = (
+                                get_relevant_terminal_subset_cached(
+                                    pack["terminal_data"],
+                                    spec["risk_aversion_by_loan_type"][
+                                        loan_level, group_index
+                                    ],
+                                    idx, cache,
+                                )
+                            )
+            else:
+                terminal = np.zeros(
+                    (len(x1), debt_range.size), dtype=np.float64
+                )
+                for group_index in range(4):
+                    idx = np.flatnonzero(parental_group == group_index)
+                    if idx.size:
+                        terminal[idx] = get_relevant_terminal_subset_cached(
+                            pack["terminal_data"],
+                            spec["risk_aversion"][group_index], idx, cache,
+                        )
+                sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
             evaluation_by_period[period] = {
                 "terminal": terminal,
-                "sigma_i": bs.risk_aversion(spec, x1).astype(np.float64),
+                "sigma_i": sigma_i,
                 "debtpen_i": bs.debt_penalty(spec, x1).astype(np.float64),
             }
 
@@ -2393,6 +2434,8 @@ def minimize_distance_education_cell_parental_income(
                 evaluation = evaluation_by_period[period]
                 stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
                 for type_index in range(N_TYPES):
+                    loan_level = int(TYPE_LOAN[type_index])
+                    type_specific_risk = "risk_aversion_by_loan_type" in spec
                     shock_type = bs.realization(
                         spec, x1, None, pack["budget_z"][draw_index],
                         loan_type=(
@@ -2407,10 +2450,16 @@ def minimize_distance_education_cell_parental_income(
                     debt_index = solve_one_draw_debt_idx_terminal_only(
                         budget=pack["base_budget_crn"][draw_index, type_index],
                         e=shock_type, debt_grid=debt_range,
-                        sigma_i=evaluation["sigma_i"],
+                        sigma_i=(
+                            evaluation["sigma_i"][loan_level]
+                            if type_specific_risk else evaluation["sigma_i"]
+                        ),
                         debtpen_i=evaluation["debtpen_i"],
                         ccp_path_row=pack["ccp_by_type"][type_index],
-                        terminal_row=evaluation["terminal"],
+                        terminal_row=(
+                            evaluation["terminal"][loan_level]
+                            if type_specific_risk else evaluation["terminal"]
+                        ),
                         b_idx=pack["b_idx"], max_idx=pack["max_idx"],
                         beta_term=float(beta ** (T - period)), c_floor=2000.0,
                         fallback_idx=debt_range.size - 1,
@@ -2486,17 +2535,23 @@ def minimize_distance_education_cell_parental_income(
         print("type integration:", type_integration, "moment specification:", moment_spec)
         print("shock means by parinc:", np.round(np.asarray(params)[0:4], 3),
               "common sigma:", round(float(np.asarray(params)[4]), 3))
-        print("risk aversion:", np.round(spec["risk_aversion"], 4),
-              "debt penalties:", np.round(np.asarray(params)[9:13], 4))
+        if specification == "parental_income_loan_type":
+            print(
+                "risk aversion low-loan type:",
+                np.round(spec["risk_aversion_by_loan_type"][0], 4),
+            )
+            print(
+                "risk aversion high-loan type:",
+                np.round(spec["risk_aversion_by_loan_type"][1], 4),
+            )
+            print("debt penalties:", np.round(np.asarray(params)[9:13], 4))
+        else:
+            print("risk aversion:", np.round(spec["risk_aversion"], 4),
+                  "debt penalties:", np.round(np.asarray(params)[9:13], 4))
         print(
             "common pre-choice-resource slope ($ shock per $10,000 resources):",
             round(float(spec["budget_resource_slope"][0]), 4),
         )
-        if specification == "parental_income_loan_type":
-            print(
-                "high-loan-type shock mean shift (low type normalized to zero):",
-                round(float(spec["loan_mean_shift"][0]), 4),
-            )
         if float(spec["sigma_e"][0]) <= 1.000001:
             print("WARNING: common budget-shock sigma is at its lower bound (1.0).")
     return loss
@@ -2579,15 +2634,18 @@ def fit_education_cell(
                 dtype=np.float64,
             )
             if specification == "parental_income_loan_type":
-                initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
+                initial = np.concatenate((initial, initial[5:9].copy()))
         initial = np.asarray(initial, dtype=np.float64).reshape(-1)
         if initial.size == bs.LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
             print("[initial] Appending a zero budget-resource slope to legacy 13 parameters.")
             initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
         if specification == "parental_income_loan_type":
             if initial.size == bs.PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
-                print("[initial] Appending a zero high-loan-type mean shift.")
-                initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
+                print(
+                    "[initial] Appending four high-loan-type risk-aversion "
+                    "levels initialized at the low-type levels."
+                )
+                initial = np.concatenate((initial, initial[5:9].copy()))
             bs.unpack_parental_income_loan_type_estimation_vector(
                 initial, [cell_code], index_kind="education_cell"
             )
@@ -2601,7 +2659,7 @@ def fit_education_cell(
             + [(-50000.0, 50000.0)]
         )
         if specification == "parental_income_loan_type":
-            bounds += [(-50000.0, 50000.0)]
+            bounds += [(0.1001, 2.9999)] * 4
         args = (
             data_moments, data_new_share, data_weights, labels, sample_by_period,
             cell_code, education, program_year, type_integration, moment_spec,
