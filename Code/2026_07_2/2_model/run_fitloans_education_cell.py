@@ -32,7 +32,8 @@ def build_parser():
         default="parental_income_basic",
         help=(
             "parental_income_basic estimates the parinc shock/risk parameters, "
-            "optionally debt penalties, and imposes a common shock across latent types."
+            "while parental_income_loan_type adds 32 type-by-parinc moments and "
+            "one normalized high-loan-type shock-mean shift."
         ),
     )
     parser.add_argument(
@@ -134,11 +135,16 @@ def main():
             raise ValueError("--numba-threads must be positive.")
         set_num_threads(args.numba_threads)
     print(f"Numba debt-solver threads: {get_num_threads()}")
-    if args.specification == "parental_income_basic" and args.heterogeneity != "homogeneous":
+    if args.specification in (
+        "parental_income_basic", "parental_income_loan_type",
+    ) and args.heterogeneity != "homogeneous":
         raise ValueError(
-            "--specification parental_income_basic requires --heterogeneity homogeneous."
+            "Parental-income specifications require --heterogeneity homogeneous; "
+            "the loan-type version adds its mean shift internally."
         )
-    if args.specification == "parental_income_basic" and args.fixed_common:
+    if args.specification in (
+        "parental_income_basic", "parental_income_loan_type",
+    ) and args.fixed_common:
         raise ValueError("--fixed-common is only available with --specification joint_type.")
     if args.specification == "joint_type" and args.type_integration != "exact":
         raise ValueError("--specification joint_type requires --type-integration exact.")

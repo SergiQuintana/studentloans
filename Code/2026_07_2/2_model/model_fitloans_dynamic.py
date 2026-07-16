@@ -81,7 +81,9 @@ _EM_POSTERIORS = None
 DEFAULT_CCP_WORKERS = max(1, min(16, os.cpu_count() or 1))
 CCP_CACHE_MODES = ("off", "reuse", "rebuild")
 CCP_CELL_CACHE_SCHEMA = 1
-EDUCATION_CELL_SPECIFICATIONS = ("parental_income_basic", "joint_type")
+EDUCATION_CELL_SPECIFICATIONS = (
+    "parental_income_basic", "parental_income_loan_type", "joint_type",
+)
 TYPE_INTEGRATION_MODES = ("sampled", "exact")
 PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock")
 EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
@@ -138,6 +140,10 @@ def save_budgetshock_estimates(
         budget_params = bs.unpack_parental_income_estimation_vector(
             best_x, periods, index_kind=index_kind
         )
+    elif estimation_parameterization == "parental_income_loan_type":
+        budget_params = bs.unpack_parental_income_loan_type_estimation_vector(
+            best_x, periods, index_kind=index_kind
+        )
     elif estimation_parameterization == "joint_type":
         budget_params = bs.unpack_estimation_vector(
             best_x,
@@ -147,7 +153,7 @@ def save_budgetshock_estimates(
         )
     else:
         raise ValueError(
-            "estimation_parameterization must be 'parental_income_basic' or 'joint_type'."
+            "Unknown estimation_parameterization."
         )
     if estimation_metadata:
         budget_params.update(dict(estimation_metadata))
@@ -738,6 +744,88 @@ def parental_income_distribution_moments(
         flow_share.append(np.sum(w * (flows > 0.0)) / total if total > 0.0 else np.nan)
         effective_weight.append(total)
         labels.append(level)
+    return (
+        np.asarray(output), np.asarray(flow_share),
+        np.asarray(effective_weight), tuple(labels),
+    )
+
+
+def parental_income_loan_type_distribution_moments(
+    parinc, flow, stock, moment_spec="fast_stock", loan_type=None, q=None,
+    eps=0.01,
+):
+    """Four moments for each loan-type by parental-income cell.
+
+    One-dimensional outcomes use one persistent sampled loan type per person.
+    ``(16, N)`` outcomes use the full posterior and the shared joint-type map;
+    this is used for posterior-weighted data targets and exact validation.
+    Ordering is low type parinc 1--4, then high type parinc 1--4.
+    """
+    if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
+        raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    flow = np.asarray(flow, dtype=np.float64)
+    stock = np.asarray(stock, dtype=np.float64)
+    if flow.shape != stock.shape:
+        raise ValueError("flow and stock must have the same shape.")
+
+    sampled = flow.ndim == 1
+    if sampled:
+        loan_type = np.asarray(loan_type, dtype=np.int64).reshape(-1)
+        if flow.shape != (parinc.size,) or loan_type.shape != (parinc.size,):
+            raise ValueError("Sampled outcomes, parinc, and loan_type must align.")
+        if not np.all(np.isin(loan_type, (0, 1))):
+            raise ValueError("loan_type must contain only zero and one.")
+    else:
+        if flow.shape != (N_TYPES, parinc.size):
+            raise ValueError(f"Exact outcomes must have shape {(N_TYPES, parinc.size)}.")
+        q = validate_q(q, n_individuals=parinc.size)
+
+    output, flow_share, effective_weight, labels = [], [], [], []
+    for loan_level in (0, 1):
+        for parinc_level in range(1, 5):
+            selected_i = parinc == parinc_level
+            if sampled:
+                selected = selected_i & (loan_type == loan_level)
+                weights = np.ones(np.sum(selected), dtype=np.float64)
+                flow_values = flow[selected]
+                stock_values = stock[selected]
+            else:
+                rows = np.flatnonzero(TYPE_LOAN == loan_level)
+                weights = q[selected_i][:, rows].T.reshape(-1)
+                flow_values = flow[rows][:, selected_i].reshape(-1)
+                stock_values = stock[rows][:, selected_i].reshape(-1)
+
+            distribution_values = (
+                stock_values if moment_spec == "fast_stock" else flow_values
+            )
+            total = weights.sum()
+            positive = distribution_values > 0.0
+            positive_weight = weights[positive].sum()
+            share = (
+                np.sum(weights * (stock_values > 0.0)) / total
+                if total > 0.0 else eps
+            )
+            if total <= 0.0 or positive_weight <= 0.0:
+                mean, std, p80 = eps, eps, eps
+                if moment_spec == "fast_stock":
+                    share = eps
+            else:
+                positive_values = distribution_values[positive]
+                positive_weights = weights[positive]
+                mean = np.sum(positive_weights * positive_values) / positive_weight
+                variance = np.sum(
+                    positive_weights * (positive_values - mean) ** 2
+                ) / positive_weight
+                std = np.sqrt(max(float(variance), 0.0))
+                p80 = _weighted_quantile(positive_values, positive_weights, 0.80)
+            output.extend((mean, share, std, p80))
+            flow_share.append(
+                np.sum(weights * (flow_values > 0.0)) / total
+                if total > 0.0 else np.nan
+            )
+            effective_weight.append(total)
+            labels.append((loan_level, parinc_level))
     return (
         np.asarray(output), np.asarray(flow_share),
         np.asarray(effective_weight), tuple(labels),
@@ -1893,6 +1981,9 @@ def prepare_education_cell_crns(
             prepared_pack["ccp_sampled"] = np.ascontiguousarray(
                 pack["ccp_by_type"][sampled_type, np.arange(n)], dtype=np.float64
             )
+            prepared_pack["sampled_loan_type"] = np.ascontiguousarray(
+                TYPE_LOAN[sampled_type], dtype=np.int64
+            )
         prepared_pack["b_idx"], prepared_pack["max_idx"] = precompute_bounds_indices(
             pack["debt"].astype(np.float64),
             pack["state"].astype(np.int64),
@@ -1912,6 +2003,10 @@ def prepare_education_cell_crns(
             "debt": np.ascontiguousarray(
                 np.concatenate([pack["debt"] for pack in packs_in_order]),
                 dtype=np.float64,
+            ),
+            "loan_type": np.ascontiguousarray(
+                np.concatenate([pack["sampled_loan_type"] for pack in packs_in_order]),
+                dtype=np.int64,
             ),
             "base_budget": np.ascontiguousarray(
                 np.concatenate([pack["base_budget_crn"] for pack in packs_in_order], axis=1),
@@ -1960,6 +2055,14 @@ def _pooled_observed_cell_moments(
     if specification == "parental_income_basic":
         return parental_income_distribution_moments(
             parinc, flow, stock, moment_spec=moment_spec
+        )
+    if specification == "parental_income_loan_type":
+        return parental_income_loan_type_distribution_moments(
+            parinc,
+            np.broadcast_to(flow, (N_TYPES, len(flow))),
+            np.broadcast_to(stock, (N_TYPES, len(stock))),
+            moment_spec=moment_spec,
+            q=q,
         )
     return posterior_loan_moments(
         parinc, np.broadcast_to(flow, (N_TYPES, len(flow))),
@@ -2021,6 +2124,41 @@ def _print_parental_income_fit(
         f"parinc {level}: {weights[row]:.1f}" for row, level in enumerate(labels)
     ))
     print("=" * 132 + "\n")
+
+
+def _print_parental_income_loan_type_fit(
+    data, simulated, data_new_share, sim_new_share, weights, labels, loss,
+    moment_spec, primary_moment_weight,
+):
+    print("\n" + "=" * 144)
+    print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    print(
+        " TARGETED LOAN-TYPE MOMENTS; loss weights per cell: "
+        f"mean positive={primary_moment_weight:g}, "
+        f"share indebted={primary_moment_weight:g}, std=1, p80=1"
+    )
+    source = "stock" if moment_spec == "fast_stock" else "annual flow"
+    print(
+        f" loan type | parinc | mean positive {source}: data/sim/diff | "
+        "share end-stock>0: data/sim/diff | std: data/sim/diff | "
+        "p80: data/sim/diff | positive-flow share"
+    )
+    for row, (loan_type, parinc) in enumerate(labels):
+        m = 4 * row
+        type_name = "low" if loan_type == 0 else "high"
+        print(
+            f" {type_name:>9} |   {parinc:>2}   | "
+            f"{data[m]:>8.2f}/{simulated[m]:>8.2f}/{simulated[m]-data[m]:>+8.2f} | "
+            f"{data[m+1]:>6.4f}/{simulated[m+1]:>6.4f}/"
+            f"{simulated[m+1]-data[m+1]:>+7.4f} | "
+            f"{data[m+2]:>8.2f}/{simulated[m+2]:>8.2f}/"
+            f"{simulated[m+2]-data[m+2]:>+8.2f} | "
+            f"{data[m+3]:>8.2f}/{simulated[m+3]:>8.2f}/"
+            f"{simulated[m+3]-data[m+3]:>+8.2f} | "
+            f"{data_new_share[row]:.4f}->{sim_new_share[row]:.4f} "
+            f"(weight={weights[row]:.1f})"
+        )
+    print("=" * 144 + "\n")
 
 
 def minimize_distance_education_cell(
@@ -2134,7 +2272,11 @@ def _pool_sampled_education_cell_evaluation(
     )
     pooled["shock"] = np.ascontiguousarray(
         bs.realization(
-            spec, x1, None, pooled["budget_z"], loan_type=None,
+            spec, x1, None, pooled["budget_z"],
+            loan_type=(
+                pooled["loan_type"]
+                if spec.get("loan_heterogeneity") == "mean" else None
+            ),
             education=education, program_year=program_year,
             pre_choice_resources=pooled["base_budget"],
         ),
@@ -2149,6 +2291,7 @@ def minimize_distance_education_cell_parental_income(
     params, data_moments, data_new_share, data_weights, labels, sample_by_period,
     cell_code, education, program_year, type_integration="sampled",
     moment_spec="fast_stock", primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
+    specification="parental_income_basic", integrated_data=None,
 ):
     """Basic parinc SMM with one common pre-choice-resource slope."""
     global EVAL_COUNTER
@@ -2159,12 +2302,23 @@ def minimize_distance_education_cell_parental_income(
         raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
     if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
         raise ValueError("primary_moment_weight must be positive and finite.")
-    spec = bs.unpack_parental_income_estimation_vector(
-        params, [cell_code], index_kind="education_cell"
-    )
+    if specification == "parental_income_basic":
+        spec = bs.unpack_parental_income_estimation_vector(
+            params, [cell_code], index_kind="education_cell"
+        )
+    elif specification == "parental_income_loan_type":
+        spec = bs.unpack_parental_income_loan_type_estimation_vector(
+            params, [cell_code], index_kind="education_cell"
+        )
+        if integrated_data is None:
+            raise ValueError("integrated_data is required for the loan-type specification.")
+    else:
+        raise ValueError("Unsupported parental-income specification.")
     draws = next(iter(sample_by_period.values()))["budget_z"].shape[0]
     simulated_by_draw = []
     diagnostic_by_draw = []
+    integrated_by_draw = []
+    integrated_diagnostic_by_draw = []
 
     if type_integration == "sampled":
         pooled = _pool_sampled_education_cell_evaluation(
@@ -2187,10 +2341,27 @@ def minimize_distance_education_cell_parental_income(
         stock_by_draw = debt_range[debt_index_by_draw]
         flow_by_draw = stock_by_draw - (1.0 + r) * pooled["debt"][None, :]
         for draw_index in range(draws):
-            moments, new_share, _, _ = parental_income_distribution_moments(
-                pooled["parinc"], flow_by_draw[draw_index],
-                stock_by_draw[draw_index], moment_spec=moment_spec,
-            )
+            if specification == "parental_income_loan_type":
+                moments, new_share, _, _ = (
+                    parental_income_loan_type_distribution_moments(
+                        pooled["parinc"], flow_by_draw[draw_index],
+                        stock_by_draw[draw_index], moment_spec=moment_spec,
+                        loan_type=pooled["loan_type"],
+                    )
+                )
+                integrated, integrated_new_share, _, _ = (
+                    parental_income_distribution_moments(
+                        pooled["parinc"], flow_by_draw[draw_index],
+                        stock_by_draw[draw_index], moment_spec=moment_spec,
+                    )
+                )
+                integrated_by_draw.append(integrated)
+                integrated_diagnostic_by_draw.append(integrated_new_share)
+            else:
+                moments, new_share, _, _ = parental_income_distribution_moments(
+                    pooled["parinc"], flow_by_draw[draw_index],
+                    stock_by_draw[draw_index], moment_spec=moment_spec,
+                )
             simulated_by_draw.append(moments)
             diagnostic_by_draw.append(new_share)
     else:
@@ -2220,16 +2391,22 @@ def minimize_distance_education_cell_parental_income(
             for period, pack in sample_by_period.items():
                 x1 = pack["x1"]
                 evaluation = evaluation_by_period[period]
-                shock_by_type = bs.realization(
-                    spec, x1, None, pack["budget_z"][draw_index],
-                    loan_type=None, education=education, program_year=program_year,
-                    pre_choice_resources=pack["base_budget_crn"][draw_index],
-                ).astype(np.float64)
                 stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
                 for type_index in range(N_TYPES):
+                    shock_type = bs.realization(
+                        spec, x1, None, pack["budget_z"][draw_index],
+                        loan_type=(
+                            int(TYPE_LOAN[type_index])
+                            if specification == "parental_income_loan_type" else None
+                        ),
+                        education=education, program_year=program_year,
+                        pre_choice_resources=(
+                            pack["base_budget_crn"][draw_index, type_index]
+                        ),
+                    ).astype(np.float64)
                     debt_index = solve_one_draw_debt_idx_terminal_only(
                         budget=pack["base_budget_crn"][draw_index, type_index],
-                        e=shock_by_type[type_index], debt_grid=debt_range,
+                        e=shock_type, debt_grid=debt_range,
                         sigma_i=evaluation["sigma_i"],
                         debtpen_i=evaluation["debtpen_i"],
                         ccp_path_row=pack["ccp_by_type"][type_index],
@@ -2243,11 +2420,30 @@ def minimize_distance_education_cell_parental_income(
                 pooled_flow.append(stock_by_type - (1.0 + r) * pack["debt"][None, :])
                 pooled_q.append(pack["q"])
                 pooled_parinc.append(pack["parinc"])
-            moments, new_share, _, _ = parental_income_distribution_moments(
-                np.concatenate(pooled_parinc), np.concatenate(pooled_flow, axis=1),
-                np.concatenate(pooled_stock, axis=1), moment_spec=moment_spec,
-                q=np.concatenate(pooled_q, axis=0),
-            )
+            all_parinc = np.concatenate(pooled_parinc)
+            all_flow = np.concatenate(pooled_flow, axis=1)
+            all_stock = np.concatenate(pooled_stock, axis=1)
+            all_q = np.concatenate(pooled_q, axis=0)
+            if specification == "parental_income_loan_type":
+                moments, new_share, _, _ = (
+                    parental_income_loan_type_distribution_moments(
+                        all_parinc, all_flow, all_stock,
+                        moment_spec=moment_spec, q=all_q,
+                    )
+                )
+                integrated, integrated_new_share, _, _ = (
+                    parental_income_distribution_moments(
+                        all_parinc, all_flow, all_stock,
+                        moment_spec=moment_spec, q=all_q,
+                    )
+                )
+                integrated_by_draw.append(integrated)
+                integrated_diagnostic_by_draw.append(integrated_new_share)
+            else:
+                moments, new_share, _, _ = parental_income_distribution_moments(
+                    all_parinc, all_flow, all_stock,
+                    moment_spec=moment_spec, q=all_q,
+                )
             simulated_by_draw.append(moments)
             diagnostic_by_draw.append(new_share)
 
@@ -2266,10 +2462,27 @@ def minimize_distance_education_cell_parental_income(
     standardized_error = (simulated - data_moments) / scale
     loss = float(np.sum(moment_weights[valid] * standardized_error[valid] ** 2))
     if EVAL_COUNTER % 10 == 0:
-        _print_parental_income_fit(
-            data_moments, simulated, data_new_share, sim_new_share,
-            data_weights, labels, loss, moment_spec, primary_moment_weight,
-        )
+        if specification == "parental_income_loan_type":
+            _print_parental_income_loan_type_fit(
+                data_moments, simulated, data_new_share, sim_new_share,
+                data_weights, labels, loss, moment_spec, primary_moment_weight,
+            )
+            integrated_simulated = np.nanmean(np.asarray(integrated_by_draw), axis=0)
+            integrated_sim_new_share = np.nanmean(
+                np.asarray(integrated_diagnostic_by_draw), axis=0
+            )
+            print("INTEGRATED OVER LOAN TYPE (REPORTING DIAGNOSTIC; NOT IN LOSS)")
+            _print_parental_income_fit(
+                integrated_data[0], integrated_simulated,
+                integrated_data[1], integrated_sim_new_share,
+                integrated_data[2], integrated_data[3], loss,
+                moment_spec, primary_moment_weight,
+            )
+        else:
+            _print_parental_income_fit(
+                data_moments, simulated, data_new_share, sim_new_share,
+                data_weights, labels, loss, moment_spec, primary_moment_weight,
+            )
         print("type integration:", type_integration, "moment specification:", moment_spec)
         print("shock means by parinc:", np.round(np.asarray(params)[0:4], 3),
               "common sigma:", round(float(np.asarray(params)[4]), 3))
@@ -2279,6 +2492,11 @@ def minimize_distance_education_cell_parental_income(
             "common pre-choice-resource slope ($ shock per $10,000 resources):",
             round(float(spec["budget_resource_slope"][0]), 4),
         )
+        if specification == "parental_income_loan_type":
+            print(
+                "high-loan-type shock mean shift (low type normalized to zero):",
+                round(float(spec["loan_mean_shift"][0]), 4),
+            )
         if float(spec["sigma_e"][0]) <= 1.000001:
             print("WARNING: common budget-shock sigma is at its lower bound (1.0).")
     return loss
@@ -2319,7 +2537,14 @@ def fit_education_cell(
     data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(
         packs, specification=specification, moment_spec=moment_spec
     )
-    if specification == "parental_income_basic" and type_integration == "sampled":
+    integrated_data = None
+    if specification == "parental_income_loan_type":
+        integrated_data = _pooled_observed_cell_moments(
+            packs, specification="parental_income_basic", moment_spec=moment_spec
+        )
+    if specification in (
+        "parental_income_basic", "parental_income_loan_type",
+    ) and type_integration == "sampled":
         packs = assign_persistent_joint_types(packs, seed=seed)
     rng = np.random.default_rng(seed)
     sampled = []
@@ -2341,10 +2566,10 @@ def fit_education_cell(
         )
 
     cell_code = bs.education_cell_code(education, program_year)
-    if specification == "parental_income_basic":
+    if specification in ("parental_income_basic", "parental_income_loan_type"):
         if shock_heterogeneity != "homogeneous":
             raise ValueError(
-                "parental_income_basic imposes a common shock across latent loan types."
+                "Parental-income specifications manage loan-type heterogeneity internally."
             )
         if fixed_common is not None:
             raise ValueError("fixed_common is only available for the joint_type specification.")
@@ -2353,22 +2578,34 @@ def fit_education_cell(
                 [5000.0] * 4 + [100.0] + [2.0] * 4 + [-2.0] * 4 + [0.0],
                 dtype=np.float64,
             )
+            if specification == "parental_income_loan_type":
+                initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
         initial = np.asarray(initial, dtype=np.float64).reshape(-1)
         if initial.size == bs.LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
             print("[initial] Appending a zero budget-resource slope to legacy 13 parameters.")
             initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
-        bs.unpack_parental_income_estimation_vector(
-            initial, [cell_code], index_kind="education_cell"
-        )
+        if specification == "parental_income_loan_type":
+            if initial.size == bs.PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
+                print("[initial] Appending a zero high-loan-type mean shift.")
+                initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
+            bs.unpack_parental_income_loan_type_estimation_vector(
+                initial, [cell_code], index_kind="education_cell"
+            )
+        else:
+            bs.unpack_parental_income_estimation_vector(
+                initial, [cell_code], index_kind="education_cell"
+            )
         bounds = (
             [(-50000.0, 50000.0)] * 4 + [(1.0, 50000.0)]
             + [(0.1001, 2.9999)] * 4 + [(-1.0e6, 0.0)] * 4
             + [(-50000.0, 50000.0)]
         )
+        if specification == "parental_income_loan_type":
+            bounds += [(-50000.0, 50000.0)]
         args = (
             data_moments, data_new_share, data_weights, labels, sample_by_period,
             cell_code, education, program_year, type_integration, moment_spec,
-            primary_moment_weight,
+            primary_moment_weight, specification, integrated_data,
         )
         # SciPy gives a parameter initialized at zero an extremely small
         # default simplex step (0.00025). That would barely explore a slope
@@ -2380,8 +2617,9 @@ def fit_education_cell(
             initial_simplex[parameter_index + 1, parameter_index] = (
                 1.05 * value if value != 0.0 else 0.00025
             )
-        if initial[-1] == 0.0:
-            initial_simplex[-1, -1] = 100.0
+        for special_index in range(13, initial.size):
+            if initial[special_index] == 0.0:
+                initial_simplex[special_index + 1, special_index] = 100.0
         result = minimize(
             minimize_distance_education_cell_parental_income,
             initial,
@@ -2521,13 +2759,16 @@ def estimate_budget_shock_education_cell(
     )
     if save:
         cell_code = bs.education_cell_code(education, program_year)
-        prefix = (
-            f"budgetshock_educ{education}_year{program_year}_parental_income_basic_"
-            f"{type_integration}_{moment_spec}"
-            f"{'_observed_resources' if resource_mode == 'observed' else ''}"
-            if specification == "parental_income_basic"
-            else f"budgetshock_educ{education}_year{program_year}_{shock_heterogeneity}"
-        )
+        if specification in ("parental_income_basic", "parental_income_loan_type"):
+            prefix = (
+                f"budgetshock_educ{education}_year{program_year}_{specification}_"
+                f"{type_integration}_{moment_spec}"
+                f"{'_observed_resources' if resource_mode == 'observed' else ''}"
+            )
+        else:
+            prefix = (
+                f"budgetshock_educ{education}_year{program_year}_{shock_heterogeneity}"
+            )
         save_budgetshock_estimates(
             result.x, [cell_code], filename_prefix=prefix,
             loan_heterogeneity=shock_heterogeneity,

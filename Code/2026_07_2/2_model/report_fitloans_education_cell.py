@@ -49,9 +49,9 @@ def result_prefix(
     education, program_year, heterogeneity, specification,
     type_integration="sampled", moment_spec="fast_stock", resource_mode="simulated",
 ):
-    if specification == "parental_income_basic":
+    if specification in ("parental_income_basic", "parental_income_loan_type"):
         return (
-            f"budgetshock_educ{education}_year{program_year}_parental_income_basic_"
+            f"budgetshock_educ{education}_year{program_year}_{specification}_"
             f"{type_integration}_{moment_spec}"
             f"{'_observed_resources' if resource_mode == 'observed' else ''}"
         )
@@ -74,6 +74,10 @@ def load_saved_bundle(prefix, heterogeneity, education, program_year, specificat
     cell_code = bs.education_cell_code(education, program_year)
     if specification == "parental_income_basic":
         vector_spec = bs.unpack_parental_income_estimation_vector(
+            bestx, [cell_code], index_kind="education_cell"
+        )
+    elif specification == "parental_income_loan_type":
+        vector_spec = bs.unpack_parental_income_loan_type_estimation_vector(
             bestx, [cell_code], index_kind="education_cell"
         )
     else:
@@ -157,13 +161,17 @@ def print_parameter_report(paths, bestx, spec):
         print(f"    parinc={level}                            {value:>14.6f}")
 
     print("\nRaw bestx order")
-    if spec.get("estimation_parameterization") == "parental_income_basic":
+    if spec.get("estimation_parameterization") in (
+        "parental_income_basic", "parental_income_loan_type",
+    ):
         raw_labels = [f"shock mean level: parinc={level}" for level in range(1, 5)]
         raw_labels += ["common shock sigma"]
         raw_labels += [f"risk aversion: parinc={level}" for level in range(1, 5)]
         raw_labels += [f"debt penalty level: parinc={level}" for level in range(1, 5)]
         if bestx.size > bs.LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
             raw_labels += ["common pre-choice-resource slope (per $10,000)"]
+        if spec.get("estimation_parameterization") == "parental_income_loan_type":
+            raw_labels += ["high-loan-type shock mean shift"]
     else:
         raw_labels = list(MEAN_LABELS)
         raw_labels += ["sigma: low-loan type"]
@@ -221,7 +229,15 @@ def reevaluate_model_fit(bestx, args):
             packs, specification=args.specification, moment_spec=args.moment_spec
         )
     )
-    if args.specification == "parental_income_basic" and args.type_integration == "sampled":
+    integrated_data = None
+    if args.specification == "parental_income_loan_type":
+        integrated_data = fit._pooled_observed_cell_moments(
+            packs, specification="parental_income_basic",
+            moment_spec=args.moment_spec,
+        )
+    if args.specification in (
+        "parental_income_basic", "parental_income_loan_type",
+    ) and args.type_integration == "sampled":
         packs = fit.assign_persistent_joint_types(packs, seed=args.seed)
     rng = np.random.default_rng(args.seed)
     sampled = []
@@ -243,7 +259,9 @@ def reevaluate_model_fit(bestx, args):
     fit.EVAL_COUNTER = 9
     objective = (
         fit.minimize_distance_education_cell_parental_income
-        if args.specification == "parental_income_basic"
+        if args.specification in (
+            "parental_income_basic", "parental_income_loan_type",
+        )
         else fit.minimize_distance_education_cell
     )
     objective_args = (
@@ -255,6 +273,7 @@ def reevaluate_model_fit(bestx, args):
     else:
         objective_args += (
             args.type_integration, args.moment_spec, args.primary_moment_weight,
+            args.specification, integrated_data,
         )
     loss = objective(bestx, *objective_args)
     print(f"Reevaluated SMM loss: {loss:.10f}")
@@ -266,7 +285,7 @@ def build_parser():
     parser.add_argument("--program-year", type=int, default=1)
     parser.add_argument(
         "--specification",
-        choices=("parental_income_basic", "joint_type"),
+        choices=("parental_income_basic", "parental_income_loan_type", "joint_type"),
         default="parental_income_basic",
     )
     parser.add_argument(
@@ -315,9 +334,11 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    if args.specification == "parental_income_basic" and args.heterogeneity != "homogeneous":
+    if args.specification in (
+        "parental_income_basic", "parental_income_loan_type",
+    ) and args.heterogeneity != "homogeneous":
         raise ValueError(
-            "--specification parental_income_basic requires --heterogeneity homogeneous."
+            "Parental-income specifications require --heterogeneity homogeneous."
         )
     if args.specification == "joint_type" and args.type_integration != "exact":
         raise ValueError("--specification joint_type requires --type-integration exact.")

@@ -29,6 +29,7 @@ INDEX_KINDS = ("model_period", "education_cell")
 EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
 LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
 PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 14
+PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE = 15
 BUDGET_RESOURCE_SCALE = 10000.0
 
 
@@ -186,6 +187,33 @@ def unpack_parental_income_estimation_vector(
         ),
         "estimation_parameterization": "parental_income_basic",
     }
+
+
+def unpack_parental_income_loan_type_estimation_vector(
+    vector: np.ndarray,
+    periods,
+    index_kind: str = "education_cell",
+) -> dict[str, Any]:
+    """Add one high-loan-type mean shift to the 14-parameter parinc model.
+
+    The first 14 entries retain exactly the baseline ordering. Entry 15 is
+    the high-loan-type mean shift; the low-loan type is normalized to zero.
+    """
+    vector = np.asarray(vector, dtype=np.float64).reshape(-1)
+    if vector.size != PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE:
+        raise ValueError(
+            f"Parental-income loan-type vector has {vector.size} entries; "
+            f"expected {PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE}."
+        )
+    spec = unpack_parental_income_estimation_vector(
+        vector[:PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE],
+        periods,
+        index_kind=index_kind,
+    )
+    spec["loan_heterogeneity"] = "mean"
+    spec["loan_mean_shift"] = np.asarray([vector[14]], dtype=np.float64)
+    spec["estimation_parameterization"] = "parental_income_loan_type"
+    return spec
 
 
 def validate(spec: dict[str, Any]) -> dict[str, Any]:
