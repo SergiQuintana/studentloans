@@ -2110,6 +2110,7 @@ def _pool_sampled_education_cell_evaluation(
         bs.realization(
             spec, x1, None, pooled["budget_z"], loan_type=None,
             education=education, program_year=program_year,
+            pre_choice_resources=pooled["base_budget"],
         ),
         dtype=np.float64,
     )
@@ -2123,7 +2124,7 @@ def minimize_distance_education_cell_parental_income(
     cell_code, education, program_year, type_integration="sampled",
     moment_spec="fast_stock", primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
 ):
-    """Basic 13-parameter SMM with sampled types or an exact validation mode."""
+    """Basic parinc SMM with one common pre-choice-resource slope."""
     global EVAL_COUNTER
     EVAL_COUNTER += 1
     if type_integration not in TYPE_INTEGRATION_MODES:
@@ -2193,15 +2194,16 @@ def minimize_distance_education_cell_parental_income(
             for period, pack in sample_by_period.items():
                 x1 = pack["x1"]
                 evaluation = evaluation_by_period[period]
-                shock = bs.realization(
+                shock_by_type = bs.realization(
                     spec, x1, None, pack["budget_z"][draw_index],
                     loan_type=None, education=education, program_year=program_year,
+                    pre_choice_resources=pack["base_budget_crn"][draw_index],
                 ).astype(np.float64)
                 stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
                 for type_index in range(N_TYPES):
                     debt_index = solve_one_draw_debt_idx_terminal_only(
                         budget=pack["base_budget_crn"][draw_index, type_index],
-                        e=shock, debt_grid=debt_range,
+                        e=shock_by_type[type_index], debt_grid=debt_range,
                         sigma_i=evaluation["sigma_i"],
                         debtpen_i=evaluation["debtpen_i"],
                         ccp_path_row=pack["ccp_by_type"][type_index],
@@ -2247,6 +2249,12 @@ def minimize_distance_education_cell_parental_income(
               "common sigma:", round(float(np.asarray(params)[4]), 3))
         print("risk aversion:", np.round(spec["risk_aversion"], 4),
               "debt penalties:", np.round(np.asarray(params)[9:13], 4))
+        print(
+            "common pre-choice-resource slope ($ shock per $10,000 resources):",
+            round(float(spec["budget_resource_slope"][0]), 4),
+        )
+        if float(spec["sigma_e"][0]) <= 1.000001:
+            print("WARNING: common budget-shock sigma is at its lower bound (1.0).")
     return loss
 
 
@@ -2311,29 +2319,48 @@ def fit_education_cell(
             raise ValueError("fixed_common is only available for the joint_type specification.")
         if initial is None:
             initial = np.array(
-                [5000.0] * 4 + [100.0] + [2.0] * 4 + [-2.0] * 4,
+                [5000.0] * 4 + [100.0] + [2.0] * 4 + [-2.0] * 4 + [0.0],
                 dtype=np.float64,
             )
         initial = np.asarray(initial, dtype=np.float64).reshape(-1)
+        if initial.size == bs.LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
+            print("[initial] Appending a zero budget-resource slope to legacy 13 parameters.")
+            initial = np.concatenate((initial, np.zeros(1, dtype=np.float64)))
         bs.unpack_parental_income_estimation_vector(
             initial, [cell_code], index_kind="education_cell"
         )
         bounds = (
             [(-50000.0, 50000.0)] * 4 + [(1.0, 50000.0)]
             + [(0.1001, 2.9999)] * 4 + [(-1.0e6, 0.0)] * 4
+            + [(-50000.0, 50000.0)]
         )
         args = (
             data_moments, data_new_share, data_weights, labels, sample_by_period,
             cell_code, education, program_year, type_integration, moment_spec,
             primary_moment_weight,
         )
+        # SciPy gives a parameter initialized at zero an extremely small
+        # default simplex step (0.00025). That would barely explore a slope
+        # measured in dollars per $10,000. Preserve the usual Nelder-Mead
+        # simplex for every existing parameter, but give the new slope a
+        # modest $100 initial direction when it starts at the null value.
+        initial_simplex = np.tile(initial, (initial.size + 1, 1))
+        for parameter_index, value in enumerate(initial):
+            initial_simplex[parameter_index + 1, parameter_index] = (
+                1.05 * value if value != 0.0 else 0.00025
+            )
+        if initial[-1] == 0.0:
+            initial_simplex[-1, -1] = 100.0
         result = minimize(
             minimize_distance_education_cell_parental_income,
             initial,
             args=args,
             method="Nelder-Mead",
             bounds=bounds,
-            options={"maxiter": int(maxiter), "disp": True},
+            options={
+                "maxiter": int(maxiter), "disp": True,
+                "initial_simplex": initial_simplex,
+            },
         )
         return result, (data_moments, data_new_share, data_weights, labels)
 

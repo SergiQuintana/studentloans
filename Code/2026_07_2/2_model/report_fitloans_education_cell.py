@@ -84,6 +84,7 @@ def load_saved_bundle(prefix, heterogeneity, education, program_year, specificat
     fields = (
         "periods", "mu_blocks", "sigma_e", "risk_aversion",
         "debt_pen_parinc", "loan_mean_shift", "loan_log_sigma_ratio",
+        "budget_resource_slope",
     )
     for field in fields:
         if not np.allclose(saved_spec[field], vector_spec[field], equal_nan=True):
@@ -116,6 +117,11 @@ def print_parameter_report(paths, bestx, spec):
         print(f"estimation seed:      {spec['smm_seed']}")
         print(f"estimation n_sample:  {spec['smm_n_sample']}")
     print(f"raw vector length:    {bestx.size}")
+    print(
+        "budget-resource slope: "
+        f"{float(spec['budget_resource_slope'][0]):.6f} dollars of shock mean "
+        "per $10,000 of pre-choice resources"
+    )
 
     print("\nBudget-shock conditional-mean coefficients")
     for label, value in zip(MEAN_LABELS, spec["mu_blocks"][0]):
@@ -154,6 +160,8 @@ def print_parameter_report(paths, bestx, spec):
         raw_labels += ["common shock sigma"]
         raw_labels += [f"risk aversion: parinc={level}" for level in range(1, 5)]
         raw_labels += [f"debt penalty level: parinc={level}" for level in range(1, 5)]
+        if bestx.size > bs.LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
+            raw_labels += ["common pre-choice-resource slope (per $10,000)"]
     else:
         raw_labels = list(MEAN_LABELS)
         raw_labels += ["sigma: low-loan type"]

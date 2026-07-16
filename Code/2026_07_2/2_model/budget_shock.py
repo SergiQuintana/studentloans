@@ -19,7 +19,7 @@ import numpy as np
 from config import EST, ENSURE_DIR
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 N_MEAN_PARAMETERS = 7
 N_RISK_PARAMETERS = 4
 N_DEBT_PENALTY_PARAMETERS = 4
@@ -27,7 +27,9 @@ DEBT_PENALTY_PARAMETERIZATION = "baseline_plus_deviations"
 LOAN_HETEROGENEITY_MODES = ("homogeneous", "mean", "variance", "both")
 INDEX_KINDS = ("model_period", "education_cell")
 EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
-PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
+LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
+PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 14
+BUDGET_RESOURCE_SCALE = 10000.0
 
 
 def education_cell_code(education: int, program_year: int) -> int:
@@ -112,6 +114,7 @@ def unpack_estimation_vector(
         "loan_heterogeneity": mode,
         "loan_mean_shift": loan_mean_shift,
         "loan_log_sigma_ratio": loan_log_sigma_ratio,
+        "budget_resource_slope": np.zeros(p, dtype=np.float64),
     }
 
 
@@ -120,21 +123,27 @@ def unpack_parental_income_estimation_vector(
     periods,
     index_kind: str = "education_cell",
 ) -> dict[str, Any]:
-    """Map the 13-parameter fast-style vector into the canonical model schema.
+    """Map the fast-style vector into the canonical model schema.
 
     Raw order is four parinc-specific shock means, one common shock sigma,
     four parinc-specific risk-aversion levels, and four parinc-specific debt
-    penalty levels. The returned named specification is consumed unchanged by
-    the solution and simulation code.
+    penalty levels, followed by one common slope on pre-choice resources in
+    $10,000 units. Legacy 13-entry vectors are accepted with a zero slope. The
+    returned named specification is consumed unchanged by the solution and
+    simulation code.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     periods = np.asarray(periods, dtype=np.int64).reshape(-1)
     if periods.size != 1:
         raise ValueError("The parental-income baseline currently supports one education cell.")
-    if vector.size != PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
+    if vector.size not in (
+        LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE,
+        PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE,
+    ):
         raise ValueError(
             f"Parental-income vector has {vector.size} entries; "
-            f"expected {PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE}."
+            f"expected {LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE} "
+            f"(legacy) or {PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE}."
         )
     index_kind = str(index_kind)
     if index_kind not in INDEX_KINDS:
@@ -171,6 +180,10 @@ def unpack_parental_income_estimation_vector(
         "loan_heterogeneity": "homogeneous",
         "loan_mean_shift": np.zeros(1, dtype=np.float64),
         "loan_log_sigma_ratio": np.zeros(1, dtype=np.float64),
+        "budget_resource_slope": np.asarray(
+            [vector[13] if vector.size == PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE else 0.0],
+            dtype=np.float64,
+        ),
         "estimation_parameterization": "parental_income_basic",
     }
 
@@ -203,6 +216,9 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     out["loan_log_sigma_ratio"] = np.asarray(
         out.get("loan_log_sigma_ratio", np.zeros(p)), dtype=np.float64
     )
+    out["budget_resource_slope"] = np.asarray(
+        out.get("budget_resource_slope", np.zeros(p)), dtype=np.float64
+    )
     if out["mu_blocks"].shape != (p, N_MEAN_PARAMETERS):
         raise ValueError("mu_blocks must have shape (number of periods, 7)")
     if out["sigma_e"].shape != (p,) or np.any(out["sigma_e"] <= 0):
@@ -215,10 +231,14 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("loan_mean_shift must contain one value per period")
     if out["loan_log_sigma_ratio"].shape != (p,):
         raise ValueError("loan_log_sigma_ratio must contain one value per period")
+    if out["budget_resource_slope"].shape != (p,):
+        raise ValueError("budget_resource_slope must contain one value per period")
     if not np.all(np.isfinite(out["loan_mean_shift"])):
         raise ValueError("loan_mean_shift contains non-finite values")
     if not np.all(np.isfinite(out["loan_log_sigma_ratio"])):
         raise ValueError("loan_log_sigma_ratio contains non-finite values")
+    if not np.all(np.isfinite(out["budget_resource_slope"])):
+        raise ValueError("budget_resource_slope contains non-finite values")
     return out
 
 
@@ -311,7 +331,7 @@ def _loan_type_array(loan_type, shape):
 
 def conditional_mean(
     spec: dict[str, Any], x1: np.ndarray, period: int | None = None, loan_type=None,
-    *, education=None, state=None, program_year=None,
+    *, education=None, state=None, program_year=None, pre_choice_resources=None,
 ) -> np.ndarray:
     support = support_value(
         spec, period, education=education, state=state, program_year=program_year
@@ -321,7 +341,17 @@ def conditional_mean(
     )
     loan = _loan_type_array(loan_type, np.shape(base))
     shift = spec.get("loan_mean_shift", np.zeros(len(spec["periods"])))
-    return base + float(shift[_period_index(spec, support)]) * loan
+    index = _period_index(spec, support)
+    mean = base + float(shift[index]) * loan
+    slope = float(spec.get("budget_resource_slope", np.zeros(len(spec["periods"])))[index])
+    if slope != 0.0:
+        if pre_choice_resources is None:
+            raise ValueError(
+                "pre_choice_resources is required when budget_resource_slope is nonzero"
+            )
+        resources = np.asarray(pre_choice_resources, dtype=np.float64)
+        mean = mean + slope * (resources / BUDGET_RESOURCE_SCALE)
+    return mean
 
 
 def conditional_sigma(
@@ -388,7 +418,7 @@ def debt_penalty_design_vector(spec: dict[str, Any]) -> np.ndarray:
 
 def realization(spec: dict[str, Any], x1: np.ndarray, period: int,
                 standard_draw: np.ndarray, loan_type=None, *, education=None,
-                state=None, program_year=None) -> np.ndarray:
+                state=None, program_year=None, pre_choice_resources=None) -> np.ndarray:
     """Map fixed standard draws into budget shocks.
 
     The SMM estimator and forward simulation both go through this transform.
@@ -396,20 +426,30 @@ def realization(spec: dict[str, Any], x1: np.ndarray, period: int,
     ``quadrature`` together; no consumer module needs its own distribution
     formula.
     """
-    keywords = dict(education=education, state=state, program_year=program_year)
-    return (conditional_mean(spec, x1, period, loan_type=loan_type, **keywords)
-            + conditional_sigma(spec, period, loan_type=loan_type, **keywords)
+    support_keywords = dict(
+        education=education, state=state, program_year=program_year,
+    )
+    return (conditional_mean(
+                spec, x1, period, loan_type=loan_type,
+                pre_choice_resources=pre_choice_resources, **support_keywords,
+            )
+            + conditional_sigma(
+                spec, period, loan_type=loan_type, **support_keywords,
+            )
             * np.asarray(standard_draw, dtype=np.float64))
 
 
 def draw(
     spec: dict[str, Any], x1: np.ndarray, period: int | None,
     rng: np.random.Generator | None = None, loan_type=None, *, education=None,
-    state=None, program_year=None,
+    state=None, program_year=None, pre_choice_resources=None,
 ) -> np.ndarray:
     """Draw the realized additive budget shock used in forward simulation."""
     rng = np.random.default_rng() if rng is None else rng
-    keywords = dict(education=education, state=state, program_year=program_year)
+    keywords = dict(
+        education=education, state=state, program_year=program_year,
+        pre_choice_resources=pre_choice_resources,
+    )
     shape = np.shape(conditional_mean(
         spec, x1, period, loan_type=loan_type, **keywords
     ))
@@ -422,6 +462,7 @@ def draw(
 def quadrature(
     spec: dict[str, Any], x1: np.ndarray, period: int, degree: int = 5,
     loan_type=None, *, education=None, state=None, program_year=None,
+    pre_choice_resources=None,
 ):
     """Gauss-Hermite nodes and weights for the backward expectation."""
     x1 = np.asarray(x1)
@@ -432,6 +473,7 @@ def quadrature(
         np.asarray(conditional_mean(
             spec, x1, period, loan_type=loan_type, education=education,
             state=state, program_year=program_year,
+            pre_choice_resources=pre_choice_resources,
         )).reshape(-1)[0]
     )
     sigma = float(np.asarray(
