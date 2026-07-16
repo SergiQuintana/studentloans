@@ -4,14 +4,17 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from numba import get_num_threads, set_num_threads
 
 from config import EST
 from model_fitloans_dynamic import (
     CCP_CACHE_MODES,
     DEFAULT_CCP_WORKERS,
+    DEFAULT_EDUCATION_CELL_MAXITER,
     EDUCATION_CELL_SPECIFICATIONS,
     PARENTAL_INCOME_MOMENT_SPECS,
     TYPE_INTEGRATION_MODES,
+    UNCAPPED_EDUCATION_CELL_MAXITER,
     estimate_budget_shock_education_cell,
 )
 from prepare_fitloans_ccp_sequences import prepare_fitloans_ccp_sequences
@@ -26,8 +29,8 @@ def build_parser():
         choices=EDUCATION_CELL_SPECIFICATIONS,
         default="parental_income_basic",
         help=(
-            "parental_income_basic estimates 13 parinc-only parameters and "
-            "imposes a common budget shock across latent types."
+            "parental_income_basic estimates the parinc shock/risk parameters, "
+            "optionally debt penalties, and imposes a common shock across latent types."
         ),
     )
     parser.add_argument(
@@ -48,8 +51,21 @@ def build_parser():
         help="fast_stock exactly matches the four model_fitloans_fast moment definitions.",
     )
     parser.add_argument("--draws", type=int, default=20)
+    parser.add_argument(
+        "--numba-threads",
+        type=int,
+        default=None,
+        help="Threads used by the fused debt solver; default uses all Numba-available threads.",
+    )
     parser.add_argument("--n-sample", type=int, default=None)
-    parser.add_argument("--maxiter", type=int, default=500)
+    parser.add_argument(
+        "--maxiter", type=int, default=DEFAULT_EDUCATION_CELL_MAXITER,
+        help="Maximum Nelder-Mead iterations (default: 5000).",
+    )
+    parser.add_argument(
+        "--no-maxiter", action="store_true",
+        help="Use an effectively unlimited iteration cap; convergence still stops the optimizer.",
+    )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--ccp-processes", type=int, default=10)
@@ -78,11 +94,23 @@ def build_parser():
         default=None,
         help="Path to a 16-parameter homogeneous bestx file.",
     )
+    parser.add_argument(
+        "--initial",
+        default=None,
+        help="Optional path to a saved bestx array used to restart the optimizer.",
+    )
     return parser
 
 
 def main():
     args = build_parser().parse_args()
+    if args.maxiter <= 0:
+        raise ValueError("--maxiter must be positive; use --no-maxiter for no practical cap.")
+    if args.numba_threads is not None:
+        if args.numba_threads <= 0:
+            raise ValueError("--numba-threads must be positive.")
+        set_num_threads(args.numba_threads)
+    print(f"Numba debt-solver threads: {get_num_threads()}")
     if args.specification == "parental_income_basic" and args.heterogeneity != "homogeneous":
         raise ValueError(
             "--specification parental_income_basic requires --heterogeneity homogeneous."
@@ -102,6 +130,18 @@ def main():
             path = Path(EST(path.name))
         fixed_common = np.asarray(np.load(path), dtype=float)
 
+    initial = None
+    if args.initial:
+        path = Path(args.initial)
+        if not path.is_absolute():
+            path = Path(EST(path.name))
+        initial = np.asarray(np.load(path), dtype=float).reshape(-1)
+        print(f"Restarting optimization from {path}")
+
+    maxiter = (
+        UNCAPPED_EDUCATION_CELL_MAXITER if args.no_maxiter else args.maxiter
+    )
+
     result, _ = estimate_budget_shock_education_cell(
         education=args.education,
         program_year=args.program_year,
@@ -111,9 +151,10 @@ def main():
         shock_heterogeneity=args.heterogeneity,
         draws=args.draws,
         n_sample=args.n_sample,
-        maxiter=args.maxiter,
+        maxiter=maxiter,
         seed=args.seed,
         save=args.save,
+        initial=initial,
         fixed_common=fixed_common,
         ccp_workers=args.ccp_workers,
         ccp_cache_mode=args.ccp_cache_mode,

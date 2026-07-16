@@ -26,7 +26,7 @@ import json
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from numba import njit, prange
+from numba import get_num_threads, njit, prange
 from scipy.optimize import minimize
 
 from model_em_algorithm import (
@@ -84,6 +84,8 @@ CCP_CELL_CACHE_SCHEMA = 1
 EDUCATION_CELL_SPECIFICATIONS = ("parental_income_basic", "joint_type")
 TYPE_INTEGRATION_MODES = ("sampled", "exact")
 PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock")
+DEFAULT_EDUCATION_CELL_MAXITER = 5000
+UNCAPPED_EDUCATION_CELL_MAXITER = np.iinfo(np.int32).max
 
 
 def load_full_em_posteriors():
@@ -1705,6 +1707,67 @@ def _subset_cell_pack(pack, indices):
     return out
 
 
+@njit(parallel=True, fastmath=True)
+def solve_all_draws_debt_idx_pooled(
+    budget_by_draw, shock_by_draw, debt_grid,
+    sigma_i, debtpen_i, ccp_path_row, terminal_row,
+    b_idx, max_idx, beta_term_i,
+    c_floor=2000.0, fallback_idx=99,
+):
+    """Solve every sampled individual and simulation draw in one parallel call.
+
+    Model-period differences are retained through ``beta_term_i`` and through
+    each individual's already-selected CCP, terminal, and debt-bound rows.
+    """
+    draws, n = budget_by_draw.shape
+    B = debt_grid.size
+    out = np.empty((draws, n), dtype=np.int64)
+
+    fb = fallback_idx
+    if fb < 0:
+        fb = 0
+    if fb >= B:
+        fb = B - 1
+
+    for flat_index in prange(draws * n):
+        draw_index = flat_index // n
+        i = flat_index - draw_index * n
+        lo = b_idx[i]
+        hi = max_idx[i]
+        if lo < 0:
+            lo = 0
+        if hi >= B:
+            hi = B - 1
+        if hi < lo:
+            hi = lo
+
+        sig = sigma_i[i]
+        pen = debtpen_i[i]
+        beta_i = beta_term_i[i]
+        best_v = -1e30
+        best_j = lo
+        found_feasible = False
+
+        for j in range(lo, hi + 1):
+            c = budget_by_draw[draw_index, i] + shock_by_draw[draw_index, i] + debt_grid[j]
+            if c < c_floor:
+                continue
+            found_feasible = True
+            if abs(sig - 1.0) < 1e-8:
+                u = 0.1 * np.log(0.00001 * c)
+            else:
+                u = 0.1 * ((0.00001 * c) ** (1.0 - sig)) / (1.0 - sig)
+            if debt_grid[j] > 0.0:
+                u += pen
+            v = u + ccp_path_row[i, j] + beta_i * terminal_row[i, j]
+            if v > best_v:
+                best_v = v
+                best_j = j
+
+        out[draw_index, i] = hi if not found_feasible else best_j
+    return out
+
+
 def prepare_education_cell_crns(
     packs, draws=20, seed=12345, type_integration="sampled",
 ):
@@ -1809,6 +1872,52 @@ def prepare_education_cell_crns(
             pack["choice"].astype(np.int64),
         )
         prepared[period] = prepared_pack
+    if type_integration == "sampled" and prepared:
+        packs_in_order = list(prepared.values())
+        pooled_static = {
+            "x1": np.ascontiguousarray(
+                np.concatenate([pack["x1"] for pack in packs_in_order])
+            ),
+            "parinc": np.ascontiguousarray(
+                np.concatenate([pack["parinc"] for pack in packs_in_order]),
+                dtype=np.int64,
+            ),
+            "debt": np.ascontiguousarray(
+                np.concatenate([pack["debt"] for pack in packs_in_order]),
+                dtype=np.float64,
+            ),
+            "base_budget": np.ascontiguousarray(
+                np.concatenate([pack["base_budget_crn"] for pack in packs_in_order], axis=1),
+                dtype=np.float64,
+            ),
+            "budget_z": np.ascontiguousarray(
+                np.concatenate([pack["budget_z"] for pack in packs_in_order], axis=1),
+                dtype=np.float64,
+            ),
+            "ccp": np.ascontiguousarray(
+                np.concatenate([pack["ccp_sampled"] for pack in packs_in_order]),
+                dtype=np.float64,
+            ),
+            "b_idx": np.ascontiguousarray(
+                np.concatenate([pack["b_idx"] for pack in packs_in_order]),
+                dtype=np.int64,
+            ),
+            "max_idx": np.ascontiguousarray(
+                np.concatenate([pack["max_idx"] for pack in packs_in_order]),
+                dtype=np.int64,
+            ),
+            "beta_term": np.ascontiguousarray(
+                np.concatenate([
+                    np.full(
+                        len(pack["x1"]), float(beta ** (T - pack["period"])),
+                        dtype=np.float64,
+                    )
+                    for pack in packs_in_order
+                ]),
+                dtype=np.float64,
+            ),
+        }
+        next(iter(prepared.values()))["pooled_sampled_static"] = pooled_static
     return prepared
 
 
@@ -1957,6 +2066,52 @@ def minimize_distance_education_cell(
     return loss
 
 
+def _pool_sampled_education_cell_evaluation(
+    sample_by_period, spec, education, program_year,
+):
+    """Pool period packs without discarding any period-specific model input."""
+    first_pack = next(iter(sample_by_period.values()))
+    if "pooled_sampled_static" not in first_pack:
+        raise ValueError("Sampled education-cell static arrays were not prepared.")
+    static = first_pack["pooled_sampled_static"]
+    terminals = []
+    curve_cache = {}
+    for period, pack in sample_by_period.items():
+        x1 = pack["x1"]
+        terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
+        parental_group = x1[:, 0].astype(np.int64) - 1
+        for group_index in range(4):
+            idx = np.flatnonzero(parental_group == group_index)
+            if idx.size:
+                terminal[idx] = get_relevant_terminal_subset_cached(
+                    pack["terminal_data"], spec["risk_aversion"][group_index],
+                    idx, curve_cache,
+                )
+        terminals.append(terminal)
+
+    pooled = dict(static)
+    pooled["terminal"] = np.ascontiguousarray(
+        np.concatenate(terminals), dtype=np.float64
+    )
+    x1 = pooled["x1"]
+    pooled["sigma_i"] = np.ascontiguousarray(
+        bs.risk_aversion(spec, x1), dtype=np.float64
+    )
+    pooled["debtpen_i"] = np.ascontiguousarray(
+        bs.debt_penalty(spec, x1), dtype=np.float64
+    )
+    pooled["shock"] = np.ascontiguousarray(
+        bs.realization(
+            spec, x1, None, pooled["budget_z"], loan_type=None,
+            education=education, program_year=program_year,
+        ),
+        dtype=np.float64,
+    )
+    if pooled["base_budget"].shape != pooled["shock"].shape:
+        raise ValueError("Pooled budget and shock arrays are misaligned.")
+    return pooled
+
+
 def minimize_distance_education_cell_parental_income(
     params, data_moments, data_new_share, data_weights, labels, sample_by_period,
     cell_code, education, program_year, type_integration="sampled",
@@ -1976,53 +2131,64 @@ def minimize_distance_education_cell_parental_income(
     simulated_by_draw = []
     diagnostic_by_draw = []
 
-    # Terminal values and individual parameter vectors change with candidate
-    # parameters, but never with the resource/budget-shock draw. Construct them
-    # once per period and reuse them for all draws and latent-type calculations.
-    evaluation_by_period = {}
-    for period, pack in sample_by_period.items():
-        x1 = pack["x1"]
-        terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
-        cache = {}
-        parental_group = x1[:, 0].astype(int) - 1
-        for group_index in range(4):
-            idx = np.flatnonzero(parental_group == group_index)
-            if idx.size:
-                terminal[idx] = get_relevant_terminal_subset_cached(
-                    pack["terminal_data"], spec["risk_aversion"][group_index], idx, cache
-                )
-        evaluation_by_period[period] = {
-            "terminal": terminal,
-            "sigma_i": bs.risk_aversion(spec, x1).astype(np.float64),
-            "debtpen_i": bs.debt_penalty(spec, x1).astype(np.float64),
-        }
-
-    for draw_index in range(draws):
-        pooled_flow, pooled_stock, pooled_parinc, pooled_q = [], [], [], []
+    if type_integration == "sampled":
+        pooled = _pool_sampled_education_cell_evaluation(
+            sample_by_period, spec, education, program_year
+        )
+        debt_index_by_draw = solve_all_draws_debt_idx_pooled(
+            budget_by_draw=pooled["base_budget"],
+            shock_by_draw=pooled["shock"],
+            debt_grid=debt_range,
+            sigma_i=pooled["sigma_i"],
+            debtpen_i=pooled["debtpen_i"],
+            ccp_path_row=pooled["ccp"],
+            terminal_row=pooled["terminal"],
+            b_idx=pooled["b_idx"],
+            max_idx=pooled["max_idx"],
+            beta_term_i=pooled["beta_term"],
+            c_floor=2000.0,
+            fallback_idx=debt_range.size - 1,
+        )
+        stock_by_draw = debt_range[debt_index_by_draw]
+        flow_by_draw = stock_by_draw - (1.0 + r) * pooled["debt"][None, :]
+        for draw_index in range(draws):
+            moments, new_share, _, _ = parental_income_distribution_moments(
+                pooled["parinc"], flow_by_draw[draw_index],
+                stock_by_draw[draw_index], moment_spec=moment_spec,
+            )
+            simulated_by_draw.append(moments)
+            diagnostic_by_draw.append(new_share)
+    else:
+        # The exact validation mode retains its explicit type loop. Terminal
+        # values are still constructed only once per period and evaluation.
+        evaluation_by_period = {}
         for period, pack in sample_by_period.items():
             x1 = pack["x1"]
-            evaluation = evaluation_by_period[period]
-            shock = bs.realization(
-                spec, x1, None, pack["budget_z"][draw_index],
-                loan_type=None, education=education, program_year=program_year,
-            ).astype(np.float64)
+            terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
+            cache = {}
+            parental_group = x1[:, 0].astype(int) - 1
+            for group_index in range(4):
+                idx = np.flatnonzero(parental_group == group_index)
+                if idx.size:
+                    terminal[idx] = get_relevant_terminal_subset_cached(
+                        pack["terminal_data"], spec["risk_aversion"][group_index],
+                        idx, cache,
+                    )
+            evaluation_by_period[period] = {
+                "terminal": terminal,
+                "sigma_i": bs.risk_aversion(spec, x1).astype(np.float64),
+                "debtpen_i": bs.debt_penalty(spec, x1).astype(np.float64),
+            }
 
-            if type_integration == "sampled":
-                debt_index = solve_one_draw_debt_idx_terminal_only(
-                    budget=pack["base_budget_crn"][draw_index],
-                    e=shock, debt_grid=debt_range, sigma_i=evaluation["sigma_i"],
-                    debtpen_i=evaluation["debtpen_i"],
-                    ccp_path_row=pack["ccp_sampled"],
-                    terminal_row=evaluation["terminal"],
-                    b_idx=pack["b_idx"], max_idx=pack["max_idx"],
-                    beta_term=float(beta ** (T - period)), c_floor=2000.0,
-                    fallback_idx=debt_range.size - 1,
-                )
-                stock = debt_range[debt_index]
-                flow = stock - (1.0 + r) * pack["debt"]
-                pooled_flow.append(flow)
-                pooled_stock.append(stock)
-            else:
+        for draw_index in range(draws):
+            pooled_flow, pooled_stock, pooled_parinc, pooled_q = [], [], [], []
+            for period, pack in sample_by_period.items():
+                x1 = pack["x1"]
+                evaluation = evaluation_by_period[period]
+                shock = bs.realization(
+                    spec, x1, None, pack["budget_z"][draw_index],
+                    loan_type=None, education=education, program_year=program_year,
+                ).astype(np.float64)
                 stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
                 for type_index in range(N_TYPES):
                     debt_index = solve_one_draw_debt_idx_terminal_only(
@@ -2040,21 +2206,14 @@ def minimize_distance_education_cell_parental_income(
                 pooled_stock.append(stock_by_type)
                 pooled_flow.append(stock_by_type - (1.0 + r) * pack["debt"][None, :])
                 pooled_q.append(pack["q"])
-            pooled_parinc.append(pack["parinc"])
-
-        if type_integration == "sampled":
-            moments, new_share, _, _ = parental_income_distribution_moments(
-                np.concatenate(pooled_parinc), np.concatenate(pooled_flow),
-                np.concatenate(pooled_stock), moment_spec=moment_spec,
-            )
-        else:
+                pooled_parinc.append(pack["parinc"])
             moments, new_share, _, _ = parental_income_distribution_moments(
                 np.concatenate(pooled_parinc), np.concatenate(pooled_flow, axis=1),
                 np.concatenate(pooled_stock, axis=1), moment_spec=moment_spec,
                 q=np.concatenate(pooled_q, axis=0),
             )
-        simulated_by_draw.append(moments)
-        diagnostic_by_draw.append(new_share)
+            simulated_by_draw.append(moments)
+            diagnostic_by_draw.append(new_share)
 
     simulated = np.nanmean(np.asarray(simulated_by_draw), axis=0)
     sim_new_share = np.nanmean(np.asarray(diagnostic_by_draw), axis=0)
@@ -2084,7 +2243,8 @@ def minimize_distance_education_cell_differential(
 
 def fit_education_cell(
     packs, education=2, program_year=1, shock_heterogeneity="homogeneous",
-    draws=20, n_sample=None, maxiter=500, seed=12345, initial=None,
+    draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
+    seed=12345, initial=None,
     fixed_common=None, specification="parental_income_basic",
     type_integration="sampled", moment_spec="fast_stock",
 ):
@@ -2114,6 +2274,12 @@ def fit_education_cell(
     sample_by_period = prepare_education_cell_crns(
         sampled, draws=draws, seed=seed, type_integration=type_integration
     )
+    if type_integration == "sampled":
+        pooled_n = sum(len(pack["x1"]) for pack in sample_by_period.values())
+        print(
+            f"[parallel debt solver] {get_num_threads()} Numba threads; "
+            f"{draws * pooled_n:,} draw-individual problems per objective call"
+        )
 
     cell_code = bs.education_cell_code(education, program_year)
     if specification == "parental_income_basic":
@@ -2128,7 +2294,7 @@ def fit_education_cell(
                 [5000.0] * 4 + [100.0] + [2.0] * 4 + [-2.0] * 4,
                 dtype=np.float64,
             )
-        initial = np.asarray(initial, dtype=np.float64)
+        initial = np.asarray(initial, dtype=np.float64).reshape(-1)
         bs.unpack_parental_income_estimation_vector(
             initial, [cell_code], index_kind="education_cell"
         )
@@ -2238,7 +2404,7 @@ def estimate_budget_shock_education_cell(
     moment_spec="fast_stock",
     draws=20,
     n_sample=None,
-    maxiter=500,
+    maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
     seed=12345,
     save=False,
     initial=None,
