@@ -80,6 +80,7 @@ _EM_POSTERIORS = None
 DEFAULT_CCP_WORKERS = max(1, min(16, os.cpu_count() or 1))
 CCP_CACHE_MODES = ("off", "reuse", "rebuild")
 CCP_CELL_CACHE_SCHEMA = 1
+EDUCATION_CELL_SPECIFICATIONS = ("parental_income_basic", "joint_type")
 
 
 def load_full_em_posteriors():
@@ -111,6 +112,7 @@ def save_budgetshock_estimates(
     filename_prefix: str = "budgetshock",
     loan_heterogeneity: str = "homogeneous",
     index_kind: str = "model_period",
+    estimation_parameterization: str = "joint_type",
 ):
     """
     Saves:
@@ -124,12 +126,21 @@ def save_budgetshock_estimates(
     _ensure_est_dir()
 
     best_x = np.asarray(best_x, dtype=np.float64)
-    budget_params = bs.unpack_estimation_vector(
-        best_x,
-        periods,
-        loan_heterogeneity=loan_heterogeneity,
-        index_kind=index_kind,
-    )
+    if estimation_parameterization == "parental_income_basic":
+        budget_params = bs.unpack_parental_income_estimation_vector(
+            best_x, periods, index_kind=index_kind
+        )
+    elif estimation_parameterization == "joint_type":
+        budget_params = bs.unpack_estimation_vector(
+            best_x,
+            periods,
+            loan_heterogeneity=loan_heterogeneity,
+            index_kind=index_kind,
+        )
+    else:
+        raise ValueError(
+            "estimation_parameterization must be 'parental_income_basic' or 'joint_type'."
+        )
     bs.save(budget_params, raw_vector=best_x, filename_prefix=filename_prefix)
 
     if filename_prefix == "budgetshock":
@@ -591,6 +602,49 @@ def posterior_loan_moments(parinc, flow_by_type, stock_by_type, q):
             new_share.append(flow_share)
             effective_weight.append(total)
             labels.append((loan_type, parinc_level))
+    return (
+        np.asarray(target), np.asarray(new_share),
+        np.asarray(effective_weight), tuple(labels),
+    )
+
+
+def parental_income_loan_moments(parinc, flow_by_type, stock_by_type, q):
+    """Existing flow/stock moments collapsed to the four parinc brackets.
+
+    Target ordering within each parinc cell is
+    ``[mean positive annual flow, share with positive end stock]``. All 16
+    joint types remain integrated with their fixed posterior probabilities,
+    but no loan-type-specific moment is targeted.
+    """
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    flow_by_type = np.asarray(flow_by_type, dtype=np.float64)
+    stock_by_type = np.asarray(stock_by_type, dtype=np.float64)
+    q = validate_q(q, n_individuals=len(parinc))
+    expected_shape = (N_TYPES, len(parinc))
+    if flow_by_type.shape != expected_shape or stock_by_type.shape != expected_shape:
+        raise ValueError(f"Flow and stock arrays must both have shape {expected_shape}.")
+
+    target, new_share, effective_weight, labels = [], [], [], []
+    for parinc_level in range(1, 5):
+        selected = parinc == parinc_level
+        weights = q[selected].T.reshape(-1)
+        flow = flow_by_type[:, selected].reshape(-1)
+        stock = stock_by_type[:, selected].reshape(-1)
+        total = weights.sum()
+        positive_flow = flow > 0.0
+        positive_weight = weights[positive_flow].sum()
+        mean_flow = (
+            np.sum(weights[positive_flow] * flow[positive_flow]) / positive_weight
+            if positive_weight > 0.0 else np.nan
+        )
+        stock_share = (
+            np.sum(weights * (stock > 0.0)) / total if total > 0.0 else np.nan
+        )
+        flow_share = positive_weight / total if total > 0.0 else np.nan
+        target.extend((mean_flow, stock_share))
+        new_share.append(flow_share)
+        effective_weight.append(total)
+        labels.append(parinc_level)
     return (
         np.asarray(target), np.asarray(new_share),
         np.asarray(effective_weight), tuple(labels),
@@ -1572,16 +1626,21 @@ def prepare_education_cell_crns(packs, draws=20, seed=12345):
     return prepared
 
 
-def _pooled_observed_cell_moments(packs):
+def _pooled_observed_cell_moments(packs, specification="joint_type"):
     parinc = np.concatenate([pack["parinc"] for pack in packs])
     q = np.concatenate([pack["q"] for pack in packs], axis=0)
     flow = np.concatenate([pack["loan_flow"] for pack in packs])
     stock = np.concatenate([pack["debtchoice"] for pack in packs])
-    return posterior_loan_moments(
-        parinc,
-        np.broadcast_to(flow, (N_TYPES, len(flow))),
-        np.broadcast_to(stock, (N_TYPES, len(stock))),
-        q,
+    moment_function = (
+        parental_income_loan_moments
+        if specification == "parental_income_basic"
+        else posterior_loan_moments
+    )
+    if specification not in EDUCATION_CELL_SPECIFICATIONS:
+        raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
+    return moment_function(
+        parinc, np.broadcast_to(flow, (N_TYPES, len(flow))),
+        np.broadcast_to(stock, (N_TYPES, len(stock))), q,
     )
 
 
@@ -1600,6 +1659,26 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
             f"(posterior weight={weights[row]:.1f})"
         )
     print("=" * 112 + "\n")
+
+
+def _print_parental_income_fit(
+    data, simulated, data_new_share, sim_new_share, weights, labels, loss,
+):
+    print("\n" + "=" * 104)
+    print(f"[education-cell eval {EVAL_COUNTER}] standardized loss={loss:.6f}")
+    print(" parinc | mean positive annual flow: data       sim       diff | "
+          "share end-stock>0: data     sim     diff | new-flow share (diagnostic)")
+    for row, parinc in enumerate(labels):
+        m = 2 * row
+        print(
+            f"   {parinc:>2}   | "
+            f"{data[m]:>10.2f} {simulated[m]:>10.2f} {simulated[m]-data[m]:>10.2f} | "
+            f"{data[m+1]:>7.4f} {simulated[m+1]:>7.4f} "
+            f"{simulated[m+1]-data[m+1]:>+8.4f} | "
+            f"{data_new_share[row]:>7.4f} -> {sim_new_share[row]:>7.4f}  "
+            f"(posterior weight={weights[row]:.1f})"
+        )
+    print("=" * 104 + "\n")
 
 
 def minimize_distance_education_cell(
@@ -1677,6 +1756,83 @@ def minimize_distance_education_cell(
     return loss
 
 
+def minimize_distance_education_cell_parental_income(
+    params, data_moments, data_new_share, data_weights, labels, sample_by_period,
+    cell_code, education, program_year,
+):
+    """Basic 13-parameter SMM objective with parinc-only target moments."""
+    global EVAL_COUNTER
+    EVAL_COUNTER += 1
+    spec = bs.unpack_parental_income_estimation_vector(
+        params, [cell_code], index_kind="education_cell"
+    )
+    draws = next(iter(sample_by_period.values()))["budget_z"].shape[0]
+    simulated_by_draw = []
+    diagnostic_by_draw = []
+
+    for draw_index in range(draws):
+        pooled_flow, pooled_stock, pooled_parinc, pooled_q = [], [], [], []
+        for period, pack in sample_by_period.items():
+            x1 = pack["x1"]
+            terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
+            cache = {}
+            parental_group = x1[:, 0].astype(int) - 1
+            for group_index in range(4):
+                idx = np.flatnonzero(parental_group == group_index)
+                if idx.size:
+                    terminal[idx] = get_relevant_terminal_subset_cached(
+                        pack["terminal_data"], spec["risk_aversion"][group_index], idx, cache
+                    )
+            sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
+            debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+            stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
+            # The residual shock is common across all latent types in this
+            # baseline. Type-specific CCPs and simulated grant/transfer
+            # resources still enter below and are integrated through q.
+            shock = bs.realization(
+                spec, x1, None, pack["budget_z"][draw_index],
+                loan_type=None, education=education, program_year=program_year,
+            ).astype(np.float64)
+            for type_index in range(N_TYPES):
+                debt_index = solve_one_draw_debt_idx_terminal_only(
+                    budget=pack["base_budget_crn"][draw_index, type_index],
+                    e=shock, debt_grid=debt_range, sigma_i=sigma_i,
+                    debtpen_i=debtpen_i,
+                    ccp_path_row=pack["ccp_by_type"][type_index],
+                    terminal_row=terminal, b_idx=pack["b_idx"], max_idx=pack["max_idx"],
+                    beta_term=float(beta ** (T - period)), c_floor=2000.0,
+                    fallback_idx=debt_range.size - 1,
+                )
+                stock_by_type[type_index] = debt_range[debt_index]
+            flow_by_type = stock_by_type - (1.0 + r) * pack["debt"][None, :]
+            pooled_flow.append(flow_by_type)
+            pooled_stock.append(stock_by_type)
+            pooled_parinc.append(pack["parinc"])
+            pooled_q.append(pack["q"])
+        moments, new_share, _, _ = parental_income_loan_moments(
+            np.concatenate(pooled_parinc), np.concatenate(pooled_flow, axis=1),
+            np.concatenate(pooled_stock, axis=1), np.concatenate(pooled_q, axis=0),
+        )
+        simulated_by_draw.append(moments)
+        diagnostic_by_draw.append(new_share)
+
+    simulated = np.nanmean(np.asarray(simulated_by_draw), axis=0)
+    sim_new_share = np.nanmean(np.asarray(diagnostic_by_draw), axis=0)
+    valid = np.isfinite(data_moments) & np.isfinite(simulated)
+    scale = np.maximum(np.abs(data_moments), 1.0e-6)
+    loss = float(np.sum(((simulated[valid] - data_moments[valid]) / scale[valid]) ** 2))
+    if EVAL_COUNTER % 10 == 0:
+        _print_parental_income_fit(
+            data_moments, simulated, data_new_share, sim_new_share,
+            data_weights, labels, loss,
+        )
+        print("shock means by parinc:", np.round(np.asarray(params)[0:4], 3),
+              "common sigma:", round(float(np.asarray(params)[4]), 3))
+        print("risk aversion:", np.round(spec["risk_aversion"], 4),
+              "debt penalties:", np.round(np.asarray(params)[9:13], 4))
+    return loss
+
+
 def minimize_distance_education_cell_differential(
     differential, fixed_common, *objective_args,
 ):
@@ -1688,12 +1844,16 @@ def minimize_distance_education_cell_differential(
 def fit_education_cell(
     packs, education=2, program_year=1, shock_heterogeneity="homogeneous",
     draws=20, n_sample=None, maxiter=500, seed=12345, initial=None,
-    fixed_common=None,
+    fixed_common=None, specification="parental_income_basic",
 ):
     """Estimate a single program-year cell without changing the dynamic solver."""
     if not packs:
         raise ValueError("No observations were found for the requested education cell.")
-    data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(packs)
+    if specification not in EDUCATION_CELL_SPECIFICATIONS:
+        raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
+    data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(
+        packs, specification=specification
+    )
     rng = np.random.default_rng(seed)
     sampled = []
     for pack in packs:
@@ -1704,6 +1864,40 @@ def fit_education_cell(
     sample_by_period = prepare_education_cell_crns(sampled, draws=draws, seed=seed)
 
     cell_code = bs.education_cell_code(education, program_year)
+    if specification == "parental_income_basic":
+        if shock_heterogeneity != "homogeneous":
+            raise ValueError(
+                "parental_income_basic imposes a common shock across latent loan types."
+            )
+        if fixed_common is not None:
+            raise ValueError("fixed_common is only available for the joint_type specification.")
+        if initial is None:
+            initial = np.array(
+                [5000.0] * 4 + [100.0] + [2.0] * 4 + [-2.0] * 4,
+                dtype=np.float64,
+            )
+        initial = np.asarray(initial, dtype=np.float64)
+        bs.unpack_parental_income_estimation_vector(
+            initial, [cell_code], index_kind="education_cell"
+        )
+        bounds = (
+            [(-50000.0, 50000.0)] * 4 + [(1.0, 50000.0)]
+            + [(0.1001, 2.9999)] * 4 + [(-1.0e6, 0.0)] * 4
+        )
+        args = (
+            data_moments, data_new_share, data_weights, labels, sample_by_period,
+            cell_code, education, program_year,
+        )
+        result = minimize(
+            minimize_distance_education_cell_parental_income,
+            initial,
+            args=args,
+            method="Nelder-Mead",
+            bounds=bounds,
+            options={"maxiter": int(maxiter), "disp": True},
+        )
+        return result, (data_moments, data_new_share, data_weights, labels)
+
     if initial is None:
         parts = [
             np.tile(np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 1),
@@ -1787,6 +1981,7 @@ def estimate_budget_shock_education_cell(
     education=2,
     program_year=1,
     shock_heterogeneity="homogeneous",
+    specification="parental_income_basic",
     draws=20,
     n_sample=None,
     maxiter=500,
@@ -1818,18 +2013,20 @@ def estimate_budget_shock_education_cell(
         packs, education=education, program_year=program_year,
         shock_heterogeneity=shock_heterogeneity, draws=draws,
         n_sample=n_sample, maxiter=maxiter, seed=seed, initial=initial,
-        fixed_common=fixed_common,
+        fixed_common=fixed_common, specification=specification,
     )
     if save:
         cell_code = bs.education_cell_code(education, program_year)
         prefix = (
-            f"budgetshock_educ{education}_year{program_year}_"
-            f"{shock_heterogeneity}"
+            f"budgetshock_educ{education}_year{program_year}_parental_income_basic"
+            if specification == "parental_income_basic"
+            else f"budgetshock_educ{education}_year{program_year}_{shock_heterogeneity}"
         )
         save_budgetshock_estimates(
             result.x, [cell_code], filename_prefix=prefix,
             loan_heterogeneity=shock_heterogeneity,
             index_kind="education_cell",
+            estimation_parameterization=specification,
         )
     return result, data_summary
 

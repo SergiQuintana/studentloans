@@ -45,11 +45,13 @@ class Tee:
             stream.flush()
 
 
-def result_prefix(education, program_year, heterogeneity):
+def result_prefix(education, program_year, heterogeneity, specification):
+    if specification == "parental_income_basic":
+        return f"budgetshock_educ{education}_year{program_year}_parental_income_basic"
     return f"budgetshock_educ{education}_year{program_year}_{heterogeneity}"
 
 
-def load_saved_bundle(prefix, heterogeneity, education, program_year):
+def load_saved_bundle(prefix, heterogeneity, education, program_year, specification):
     paths = {
         "bestx": Path(EST(f"{prefix}_bestx.npy")),
         "params": Path(EST(f"{prefix}_params.npy")),
@@ -63,12 +65,15 @@ def load_saved_bundle(prefix, heterogeneity, education, program_year):
     saved_spec = bs.validate(np.load(paths["params"], allow_pickle=True).item())
     separate_risk = np.asarray(np.load(paths["risk_aversion"]), dtype=np.float64)
     cell_code = bs.education_cell_code(education, program_year)
-    vector_spec = bs.unpack_estimation_vector(
-        bestx,
-        [cell_code],
-        loan_heterogeneity=heterogeneity,
-        index_kind="education_cell",
-    )
+    if specification == "parental_income_basic":
+        vector_spec = bs.unpack_parental_income_estimation_vector(
+            bestx, [cell_code], index_kind="education_cell"
+        )
+    else:
+        vector_spec = bs.unpack_estimation_vector(
+            bestx, [cell_code], loan_heterogeneity=heterogeneity,
+            index_kind="education_cell",
+        )
 
     fields = (
         "periods", "mu_blocks", "sigma_e", "risk_aversion",
@@ -93,6 +98,7 @@ def print_parameter_report(paths, bestx, spec):
     print(f"index kind:           {spec['index_kind']}")
     print(f"education-cell code:  {int(spec['periods'][0])}")
     print(f"loan heterogeneity:   {spec['loan_heterogeneity']}")
+    print(f"estimation spec:      {spec.get('estimation_parameterization', 'joint_type')}")
     print(f"raw vector length:    {bestx.size}")
 
     print("\nBudget-shock conditional-mean coefficients")
@@ -127,15 +133,21 @@ def print_parameter_report(paths, bestx, spec):
         print(f"    parinc={level}                            {value:>14.6f}")
 
     print("\nRaw bestx order")
-    raw_labels = list(MEAN_LABELS)
-    raw_labels += ["sigma: low-loan type"]
-    raw_labels += [f"risk aversion: parinc={level}" for level in range(1, 5)]
-    raw_labels += ["debt penalty: baseline"]
-    raw_labels += [f"debt penalty deviation: parinc={level}" for level in range(2, 5)]
-    if spec["loan_heterogeneity"] in ("mean", "both"):
-        raw_labels += ["high-loan type mean shift"]
-    if spec["loan_heterogeneity"] in ("variance", "both"):
-        raw_labels += ["log(high/low sigma ratio)"]
+    if spec.get("estimation_parameterization") == "parental_income_basic":
+        raw_labels = [f"shock mean level: parinc={level}" for level in range(1, 5)]
+        raw_labels += ["common shock sigma"]
+        raw_labels += [f"risk aversion: parinc={level}" for level in range(1, 5)]
+        raw_labels += [f"debt penalty level: parinc={level}" for level in range(1, 5)]
+    else:
+        raw_labels = list(MEAN_LABELS)
+        raw_labels += ["sigma: low-loan type"]
+        raw_labels += [f"risk aversion: parinc={level}" for level in range(1, 5)]
+        raw_labels += ["debt penalty: baseline"]
+        raw_labels += [f"debt penalty deviation: parinc={level}" for level in range(2, 5)]
+        if spec["loan_heterogeneity"] in ("mean", "both"):
+            raw_labels += ["high-loan type mean shift"]
+        if spec["loan_heterogeneity"] in ("variance", "both"):
+            raw_labels += ["log(high/low sigma ratio)"]
     for index, (label, value) in enumerate(zip(raw_labels, bestx)):
         print(f"  [{index:>2}] {label:<43} {value:>14.6f}")
 
@@ -177,7 +189,7 @@ def reevaluate_model_fit(bestx, args):
         raise ValueError("No observations were found for the requested education cell.")
 
     data_moments, data_new_share, data_weights, labels = (
-        fit._pooled_observed_cell_moments(packs)
+        fit._pooled_observed_cell_moments(packs, specification=args.specification)
     )
     rng = np.random.default_rng(args.seed)
     sampled = []
@@ -195,18 +207,18 @@ def reevaluate_model_fit(bestx, args):
     # The objective prints its detailed table every tenth call. This is a
     # reporting-only process, so make the single evaluation the tenth call.
     fit.EVAL_COUNTER = 9
-    loss = fit.minimize_distance_education_cell(
-        bestx,
-        data_moments,
-        data_new_share,
-        data_weights,
-        labels,
-        sample_by_period,
-        cell_code,
-        args.education,
-        args.program_year,
-        args.heterogeneity,
+    objective = (
+        fit.minimize_distance_education_cell_parental_income
+        if args.specification == "parental_income_basic"
+        else fit.minimize_distance_education_cell
     )
+    objective_args = (
+        data_moments, data_new_share, data_weights, labels, sample_by_period,
+        cell_code, args.education, args.program_year,
+    )
+    if args.specification == "joint_type":
+        objective_args += (args.heterogeneity,)
+    loss = objective(bestx, *objective_args)
     print(f"Reevaluated SMM loss: {loss:.10f}")
 
 
@@ -214,6 +226,11 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--education", type=int, default=2)
     parser.add_argument("--program-year", type=int, default=1)
+    parser.add_argument(
+        "--specification",
+        choices=("parental_income_basic", "joint_type"),
+        default="parental_income_basic",
+    )
     parser.add_argument(
         "--heterogeneity",
         choices=bs.LOAN_HETEROGENEITY_MODES,
@@ -243,7 +260,13 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    prefix = result_prefix(args.education, args.program_year, args.heterogeneity)
+    if args.specification == "parental_income_basic" and args.heterogeneity != "homogeneous":
+        raise ValueError(
+            "--specification parental_income_basic requires --heterogeneity homogeneous."
+        )
+    prefix = result_prefix(
+        args.education, args.program_year, args.heterogeneity, args.specification
+    )
     report_path = Path(
         args.report_path
         or OUT("fitloans_reports", f"{prefix}_report.txt")
@@ -255,7 +278,8 @@ def main():
         sys.stdout = Tee(terminal, report)
         try:
             paths, bestx, spec = load_saved_bundle(
-                prefix, args.heterogeneity, args.education, args.program_year
+                prefix, args.heterogeneity, args.education, args.program_year,
+                args.specification,
             )
             print_parameter_report(paths, bestx, spec)
             if not args.parameters_only:

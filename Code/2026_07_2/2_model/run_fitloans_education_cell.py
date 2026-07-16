@@ -9,6 +9,7 @@ from config import EST
 from model_fitloans_dynamic import (
     CCP_CACHE_MODES,
     DEFAULT_CCP_WORKERS,
+    EDUCATION_CELL_SPECIFICATIONS,
     estimate_budget_shock_education_cell,
 )
 from prepare_fitloans_ccp_sequences import prepare_fitloans_ccp_sequences
@@ -18,6 +19,15 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--education", type=int, default=2)
     parser.add_argument("--program-year", type=int, default=1)
+    parser.add_argument(
+        "--specification",
+        choices=EDUCATION_CELL_SPECIFICATIONS,
+        default="parental_income_basic",
+        help=(
+            "parental_income_basic estimates 13 parinc-only parameters and "
+            "imposes a common budget shock across latent types."
+        ),
+    )
     parser.add_argument(
         "--heterogeneity",
         choices=("homogeneous", "mean", "variance", "both"),
@@ -59,6 +69,12 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if args.specification == "parental_income_basic" and args.heterogeneity != "homogeneous":
+        raise ValueError(
+            "--specification parental_income_basic requires --heterogeneity homogeneous."
+        )
+    if args.specification == "parental_income_basic" and args.fixed_common:
+        raise ValueError("--fixed-common is only available with --specification joint_type.")
     if not args.skip_preparation:
         print("Checking/building CCP continuation sequences")
         prepare_fitloans_ccp_sequences(processes=args.ccp_processes)
@@ -73,6 +89,7 @@ def main():
     result, _ = estimate_budget_shock_education_cell(
         education=args.education,
         program_year=args.program_year,
+        specification=args.specification,
         shock_heterogeneity=args.heterogeneity,
         draws=args.draws,
         n_sample=args.n_sample,

@@ -27,6 +27,7 @@ DEBT_PENALTY_PARAMETERIZATION = "baseline_plus_deviations"
 LOAN_HETEROGENEITY_MODES = ("homogeneous", "mean", "variance", "both")
 INDEX_KINDS = ("model_period", "education_cell")
 EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
+PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
 
 
 def education_cell_code(education: int, program_year: int) -> int:
@@ -111,6 +112,66 @@ def unpack_estimation_vector(
         "loan_heterogeneity": mode,
         "loan_mean_shift": loan_mean_shift,
         "loan_log_sigma_ratio": loan_log_sigma_ratio,
+    }
+
+
+def unpack_parental_income_estimation_vector(
+    vector: np.ndarray,
+    periods,
+    index_kind: str = "education_cell",
+) -> dict[str, Any]:
+    """Map the 13-parameter fast-style vector into the canonical model schema.
+
+    Raw order is four parinc-specific shock means, one common shock sigma,
+    four parinc-specific risk-aversion levels, and four parinc-specific debt
+    penalty levels. The returned named specification is consumed unchanged by
+    the solution and simulation code.
+    """
+    vector = np.asarray(vector, dtype=np.float64).reshape(-1)
+    periods = np.asarray(periods, dtype=np.int64).reshape(-1)
+    if periods.size != 1:
+        raise ValueError("The parental-income baseline currently supports one education cell.")
+    if vector.size != PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
+        raise ValueError(
+            f"Parental-income vector has {vector.size} entries; "
+            f"expected {PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE}."
+        )
+    index_kind = str(index_kind)
+    if index_kind not in INDEX_KINDS:
+        raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
+
+    mean_levels = vector[0:4]
+    debt_levels = vector[9:13]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "index_kind": index_kind,
+        "periods": periods,
+        "mu_blocks": np.asarray(
+            [[
+                mean_levels[0],
+                mean_levels[1] - mean_levels[0],
+                mean_levels[2] - mean_levels[0],
+                mean_levels[3] - mean_levels[0],
+                0.0, 0.0, 0.0,
+            ]],
+            dtype=np.float64,
+        ),
+        "sigma_e": np.asarray([vector[4]], dtype=np.float64),
+        "risk_aversion": np.asarray(vector[5:9], dtype=np.float64),
+        "debt_pen_parinc": np.asarray(
+            [
+                debt_levels[0],
+                debt_levels[1] - debt_levels[0],
+                debt_levels[2] - debt_levels[0],
+                debt_levels[3] - debt_levels[0],
+            ],
+            dtype=np.float64,
+        ),
+        "debt_pen_parameterization": DEBT_PENALTY_PARAMETERIZATION,
+        "loan_heterogeneity": "homogeneous",
+        "loan_mean_shift": np.zeros(1, dtype=np.float64),
+        "loan_log_sigma_ratio": np.zeros(1, dtype=np.float64),
+        "estimation_parameterization": "parental_income_basic",
     }
 
 
