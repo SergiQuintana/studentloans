@@ -45,9 +45,15 @@ class Tee:
             stream.flush()
 
 
-def result_prefix(education, program_year, heterogeneity, specification):
+def result_prefix(
+    education, program_year, heterogeneity, specification,
+    type_integration="sampled", moment_spec="fast_stock",
+):
     if specification == "parental_income_basic":
-        return f"budgetshock_educ{education}_year{program_year}_parental_income_basic"
+        return (
+            f"budgetshock_educ{education}_year{program_year}_parental_income_basic_"
+            f"{type_integration}_{moment_spec}"
+        )
     return f"budgetshock_educ{education}_year{program_year}_{heterogeneity}"
 
 
@@ -99,6 +105,12 @@ def print_parameter_report(paths, bestx, spec):
     print(f"education-cell code:  {int(spec['periods'][0])}")
     print(f"loan heterogeneity:   {spec['loan_heterogeneity']}")
     print(f"estimation spec:      {spec.get('estimation_parameterization', 'joint_type')}")
+    if "smm_type_integration" in spec:
+        print(f"type integration:     {spec['smm_type_integration']}")
+        print(f"moment specification: {spec['smm_moment_spec']}")
+        print(f"estimation draws:     {spec['smm_draws']}")
+        print(f"estimation seed:      {spec['smm_seed']}")
+        print(f"estimation n_sample:  {spec['smm_n_sample']}")
     print(f"raw vector length:    {bestx.size}")
 
     print("\nBudget-shock conditional-mean coefficients")
@@ -189,8 +201,12 @@ def reevaluate_model_fit(bestx, args):
         raise ValueError("No observations were found for the requested education cell.")
 
     data_moments, data_new_share, data_weights, labels = (
-        fit._pooled_observed_cell_moments(packs, specification=args.specification)
+        fit._pooled_observed_cell_moments(
+            packs, specification=args.specification, moment_spec=args.moment_spec
+        )
     )
+    if args.specification == "parental_income_basic" and args.type_integration == "sampled":
+        packs = fit.assign_persistent_joint_types(packs, seed=args.seed)
     rng = np.random.default_rng(args.seed)
     sampled = []
     for pack in packs:
@@ -200,7 +216,8 @@ def reevaluate_model_fit(bestx, args):
             indices = rng.choice(len(pack["x1"]), args.n_sample, replace=True)
             sampled.append(fit._subset_cell_pack(pack, indices))
     sample_by_period = fit.prepare_education_cell_crns(
-        sampled, draws=args.draws, seed=args.seed
+        sampled, draws=args.draws, seed=args.seed,
+        type_integration=args.type_integration,
     )
     cell_code = bs.education_cell_code(args.education, args.program_year)
 
@@ -218,6 +235,8 @@ def reevaluate_model_fit(bestx, args):
     )
     if args.specification == "joint_type":
         objective_args += (args.heterogeneity,)
+    else:
+        objective_args += (args.type_integration, args.moment_spec)
     loss = objective(bestx, *objective_args)
     print(f"Reevaluated SMM loss: {loss:.10f}")
 
@@ -235,6 +254,12 @@ def build_parser():
         "--heterogeneity",
         choices=bs.LOAN_HETEROGENEITY_MODES,
         default="homogeneous",
+    )
+    parser.add_argument(
+        "--type-integration", choices=("sampled", "exact"), default="sampled"
+    )
+    parser.add_argument(
+        "--moment-spec", choices=("fast_stock", "flow_stock"), default="fast_stock"
     )
     parser.add_argument("--draws", type=int, default=20)
     parser.add_argument("--n-sample", type=int, default=None)
@@ -264,8 +289,11 @@ def main():
         raise ValueError(
             "--specification parental_income_basic requires --heterogeneity homogeneous."
         )
+    if args.specification == "joint_type" and args.type_integration != "exact":
+        raise ValueError("--specification joint_type requires --type-integration exact.")
     prefix = result_prefix(
-        args.education, args.program_year, args.heterogeneity, args.specification
+        args.education, args.program_year, args.heterogeneity, args.specification,
+        args.type_integration, args.moment_spec,
     )
     report_path = Path(
         args.report_path

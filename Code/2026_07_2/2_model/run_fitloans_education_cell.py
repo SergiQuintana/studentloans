@@ -10,6 +10,8 @@ from model_fitloans_dynamic import (
     CCP_CACHE_MODES,
     DEFAULT_CCP_WORKERS,
     EDUCATION_CELL_SPECIFICATIONS,
+    PARENTAL_INCOME_MOMENT_SPECS,
+    TYPE_INTEGRATION_MODES,
     estimate_budget_shock_education_cell,
 )
 from prepare_fitloans_ccp_sequences import prepare_fitloans_ccp_sequences
@@ -32,6 +34,18 @@ def build_parser():
         "--heterogeneity",
         choices=("homogeneous", "mean", "variance", "both"),
         default="homogeneous",
+    )
+    parser.add_argument(
+        "--type-integration",
+        choices=TYPE_INTEGRATION_MODES,
+        default="sampled",
+        help="Draw one persistent posterior joint type, or retain exact integration for validation.",
+    )
+    parser.add_argument(
+        "--moment-spec",
+        choices=PARENTAL_INCOME_MOMENT_SPECS,
+        default="fast_stock",
+        help="fast_stock exactly matches the four model_fitloans_fast moment definitions.",
     )
     parser.add_argument("--draws", type=int, default=20)
     parser.add_argument("--n-sample", type=int, default=None)
@@ -75,6 +89,8 @@ def main():
         )
     if args.specification == "parental_income_basic" and args.fixed_common:
         raise ValueError("--fixed-common is only available with --specification joint_type.")
+    if args.specification == "joint_type" and args.type_integration != "exact":
+        raise ValueError("--specification joint_type requires --type-integration exact.")
     if not args.skip_preparation:
         print("Checking/building CCP continuation sequences")
         prepare_fitloans_ccp_sequences(processes=args.ccp_processes)
@@ -90,6 +106,8 @@ def main():
         education=args.education,
         program_year=args.program_year,
         specification=args.specification,
+        type_integration=args.type_integration,
+        moment_spec=args.moment_spec,
         shock_heterogeneity=args.heterogeneity,
         draws=args.draws,
         n_sample=args.n_sample,

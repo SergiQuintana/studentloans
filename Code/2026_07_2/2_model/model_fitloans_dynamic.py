@@ -59,6 +59,7 @@ from financial_process import (
 from latent_types import (
     N_TYPES,
     TYPE_IDS,
+    TYPE_NAMES,
     TYPE_GRANT,
     TYPE_TRANSFER,
     TYPE_LOAN,
@@ -81,6 +82,8 @@ DEFAULT_CCP_WORKERS = max(1, min(16, os.cpu_count() or 1))
 CCP_CACHE_MODES = ("off", "reuse", "rebuild")
 CCP_CELL_CACHE_SCHEMA = 1
 EDUCATION_CELL_SPECIFICATIONS = ("parental_income_basic", "joint_type")
+TYPE_INTEGRATION_MODES = ("sampled", "exact")
+PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock")
 
 
 def load_full_em_posteriors():
@@ -113,6 +116,7 @@ def save_budgetshock_estimates(
     loan_heterogeneity: str = "homogeneous",
     index_kind: str = "model_period",
     estimation_parameterization: str = "joint_type",
+    estimation_metadata=None,
 ):
     """
     Saves:
@@ -141,6 +145,8 @@ def save_budgetshock_estimates(
         raise ValueError(
             "estimation_parameterization must be 'parental_income_basic' or 'joint_type'."
         )
+    if estimation_metadata:
+        budget_params.update(dict(estimation_metadata))
     bs.save(budget_params, raw_vector=best_x, filename_prefix=filename_prefix)
 
     if filename_prefix == "budgetshock":
@@ -534,6 +540,7 @@ def load_education_cell(
         (choices[:, 1].astype(np.int64) == int(education))
         & (observed_code == cell_code)
     )
+    individual_index = np.flatnonzero(cell).astype(np.int64)
     x1 = np.ascontiguousarray(x1[cell])
     state = np.ascontiguousarray(state[cell])
     choices = np.ascontiguousarray(choices[cell])
@@ -554,6 +561,7 @@ def load_education_cell(
         "x1": x1,
         "state": state,
         "q": q,
+        "individual_index": individual_index,
         "debt": np.ascontiguousarray(debt, dtype=np.float64),
         "debtchoice": np.ascontiguousarray(debtchoice, dtype=np.float64),
         "loan_flow": loan_flow,
@@ -647,6 +655,87 @@ def parental_income_loan_moments(parinc, flow_by_type, stock_by_type, q):
         labels.append(parinc_level)
     return (
         np.asarray(target), np.asarray(new_share),
+        np.asarray(effective_weight), tuple(labels),
+    )
+
+
+def parental_income_distribution_moments(
+    parinc, flow, stock, moment_spec="fast_stock", q=None, eps=0.01,
+):
+    """Four fast-style distribution moments for each model parinc group.
+
+    ``fast_stock`` reproduces the moment definitions in model_fitloans_fast:
+    mean positive stock, share positive stock, standard deviation of positive
+    stock, and its 80th percentile. ``flow_stock`` keeps the stock share but
+    uses positive annual loan flow for the other three distribution moments.
+
+    One-dimensional outcomes are ordinary simulated/data observations. Two-
+    dimensional ``(16, N)`` outcomes require ``q`` and provide the retained
+    exact-posterior validation mode.
+    """
+    if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
+        raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    flow = np.asarray(flow, dtype=np.float64)
+    stock = np.asarray(stock, dtype=np.float64)
+    if flow.shape != stock.shape:
+        raise ValueError("flow and stock must have the same shape.")
+
+    if flow.ndim == 1:
+        if flow.size != parinc.size:
+            raise ValueError("One-dimensional outcomes must align with parinc.")
+        flow_values, stock_values = flow, stock
+        weights = np.ones(parinc.size, dtype=np.float64)
+        groups = parinc
+        unweighted = True
+    elif flow.shape == (N_TYPES, parinc.size):
+        q = validate_q(q, n_individuals=parinc.size)
+        flow_values = flow.reshape(-1)
+        stock_values = stock.reshape(-1)
+        weights = q.T.reshape(-1)
+        groups = np.tile(parinc, N_TYPES)
+        unweighted = False
+    else:
+        raise ValueError(
+            f"Outcomes must have shape {(parinc.size,)} or {(N_TYPES, parinc.size)}."
+        )
+
+    distribution_values = stock_values if moment_spec == "fast_stock" else flow_values
+    output, flow_share, effective_weight, labels = [], [], [], []
+    for level in range(1, 5):
+        selected = groups == level
+        w = weights[selected]
+        values = distribution_values[selected]
+        stocks = stock_values[selected]
+        flows = flow_values[selected]
+        total = w.sum()
+        positive = values > 0.0
+        positive_weight = w[positive].sum()
+        share = np.sum(w * (stocks > 0.0)) / total if total > 0.0 else eps
+        if total <= 0.0 or positive_weight <= 0.0:
+            mean, std, p80 = eps, eps, eps
+            if moment_spec == "fast_stock":
+                share = eps
+        else:
+            positive_values = values[positive]
+            positive_weights = w[positive]
+            mean = np.sum(positive_weights * positive_values) / positive_weight
+            variance = (
+                np.sum(positive_weights * (positive_values - mean) ** 2)
+                / positive_weight
+            )
+            std = np.sqrt(max(float(variance), 0.0))
+            p80 = (
+                float(np.percentile(positive_values, 80))
+                if unweighted
+                else _weighted_quantile(positive_values, positive_weights, 0.80)
+            )
+        output.extend((mean, share, std, p80))
+        flow_share.append(np.sum(w * (flows > 0.0)) / total if total > 0.0 else np.nan)
+        effective_weight.append(total)
+        labels.append(level)
+    return (
+        np.asarray(output), np.asarray(flow_share),
         np.asarray(effective_weight), tuple(labels),
     )
 
@@ -1544,14 +1633,68 @@ def fit_budget_shock_multi(
 # ==============================================================================
 # Education-cell pre-test (posterior integrated, simulated financial resources)
 
+def assign_persistent_joint_types(packs, seed=12345):
+    """Draw one joint EM type per balanced individual and reuse it everywhere."""
+    if not packs:
+        return []
+    max_index = max(int(np.max(pack["individual_index"])) for pack in packs if len(pack["x1"]))
+    rng = np.random.default_rng(int(seed) + 1_000_003)
+    uniforms = rng.random(max_index + 1)
+    assigned = []
+    observed_q = {}
+    sampled_by_individual = {}
+    for pack in packs:
+        indices = np.asarray(pack["individual_index"], dtype=np.int64)
+        q = validate_q(pack["q"], n_individuals=len(indices))
+        for individual, posterior in zip(indices, q):
+            previous = observed_q.get(int(individual))
+            if previous is not None and not np.allclose(previous, posterior, atol=1.0e-12):
+                raise ValueError(
+                    f"Posterior q differs across periods for individual index {individual}."
+                )
+            observed_q[int(individual)] = posterior
+        cumulative = np.cumsum(q, axis=1)
+        cumulative[:, -1] = 1.0
+        type_index = np.sum(uniforms[indices, None] > cumulative, axis=1).astype(np.int64)
+        for individual, latent_type in zip(indices, type_index):
+            previous_type = sampled_by_individual.get(int(individual))
+            if previous_type is not None and previous_type != int(latent_type):
+                raise ValueError(
+                    f"Sampled type changed across periods for individual index {individual}."
+                )
+            sampled_by_individual[int(individual)] = int(latent_type)
+        out = dict(pack)
+        out["sampled_type_index"] = np.ascontiguousarray(type_index)
+        assigned.append(out)
+    unique_individuals = np.asarray(sorted(sampled_by_individual), dtype=np.int64)
+    sampled_unique = np.asarray(
+        [sampled_by_individual[int(i)] for i in unique_individuals], dtype=np.int64
+    )
+    expected = np.sum([observed_q[int(i)] for i in unique_individuals], axis=0)
+    observed = np.bincount(sampled_unique, minlength=N_TYPES).astype(np.float64)
+    print(f"[sampled joint types] {len(unique_individuals)} unique individuals; seed={seed}")
+    print("  type          observed share   posterior-expected share")
+    for type_index, name in enumerate(TYPE_NAMES):
+        print(
+            f"  {type_index + 1:>2} {str(name):<10} "
+            f"{observed[type_index] / len(unique_individuals):>12.4f} "
+            f"{expected[type_index] / len(unique_individuals):>24.4f}"
+        )
+    return assigned
+
+
 def _subset_cell_pack(pack, indices):
     indices = np.asarray(indices, dtype=np.int64)
     out = dict(pack)
     for name in (
         "x1", "state", "q", "debt", "debtchoice", "loan_flow",
-        "parinc", "choice", "observed_budget",
+        "parinc", "choice", "observed_budget", "individual_index",
     ):
         out[name] = np.ascontiguousarray(pack[name][indices])
+    if "sampled_type_index" in pack:
+        out["sampled_type_index"] = np.ascontiguousarray(
+            pack["sampled_type_index"][indices], dtype=np.int64
+        )
     out["ccp_by_type"] = np.ascontiguousarray(pack["ccp_by_type"][:, indices, :])
     term_g, term_ng, p_grad = pack["terminal_data"]
     out["terminal_data"] = [
@@ -1562,8 +1705,12 @@ def _subset_cell_pack(pack, indices):
     return out
 
 
-def prepare_education_cell_crns(packs, draws=20, seed=12345):
+def prepare_education_cell_crns(
+    packs, draws=20, seed=12345, type_integration="sampled",
+):
     """Pre-draw every resource shock once and reuse it in all SMM evaluations."""
+    if type_integration not in TYPE_INTEGRATION_MODES:
+        raise ValueError(f"type_integration must be one of {TYPE_INTEGRATION_MODES}.")
     wage_parameters = load_fixed_wage_parameters()
     financial = load_auxiliary_financial_process(EST("auxiliary_em_results.npz"))
     prepared = {}
@@ -1590,33 +1737,72 @@ def prepare_education_cell_crns(packs, draws=20, seed=12345):
         education = choice[:, 1].astype(np.int64)
         work = choice[:, 2].astype(np.int64)
         tuition = np.asarray(tuition_agents(0, choice), dtype=np.float64).reshape(-1)
-        base_budget = np.empty((draws, N_TYPES, n), dtype=np.float64)
+        if type_integration == "sampled":
+            if "sampled_type_index" not in pack:
+                raise ValueError("Sampled integration requires persistent joint-type draws.")
+            sampled_type = np.asarray(pack["sampled_type_index"], dtype=np.int64)
+            if sampled_type.shape != (n,) or not np.all((0 <= sampled_type) & (sampled_type < N_TYPES)):
+                raise ValueError("sampled_type_index is invalid or misaligned.")
+            base_budget = np.empty((draws, n), dtype=np.float64)
+        else:
+            base_budget = np.empty((draws, N_TYPES, n), dtype=np.float64)
 
         for draw_index in range(draws):
             wage = (
                 np.exp(np.clip(wage_mu + wage_sigma * crn["wage_z"][draw_index], -20.0, 20.0))
                 * work * 0.5 * (40 * 52)
             )
-            for type_index in range(N_TYPES):
-                grant = draw_grants_vectorized(
-                    x1_design, education, work, financial["grant"],
-                    grant_type=int(TYPE_GRANT[type_index]),
-                    receipt_uniform=crn["grant_u"][draw_index],
-                    amount_standard_normal=crn["grant_z"][draw_index],
-                )
-                transfer = draw_transfers_vectorized(
-                    x1_design, education, work, financial["transfer"],
-                    transfer_type=int(TYPE_TRANSFER[type_index]),
-                    receipt_uniform=crn["transfer_u"][draw_index],
-                    amount_standard_normal=crn["transfer_z"][draw_index],
-                )
-                base_budget[draw_index, type_index] = (
+            if type_integration == "sampled":
+                grant = np.zeros(n, dtype=np.float64)
+                transfer = np.zeros(n, dtype=np.float64)
+                sampled_grant = TYPE_GRANT[sampled_type]
+                sampled_transfer = TYPE_TRANSFER[sampled_type]
+                for financial_type in (0, 1):
+                    idx = np.flatnonzero(sampled_grant == financial_type)
+                    if idx.size:
+                        grant[idx] = draw_grants_vectorized(
+                            x1_design[idx], education[idx], work[idx], financial["grant"],
+                            grant_type=financial_type,
+                            receipt_uniform=crn["grant_u"][draw_index, idx],
+                            amount_standard_normal=crn["grant_z"][draw_index, idx],
+                        )
+                    idx = np.flatnonzero(sampled_transfer == financial_type)
+                    if idx.size:
+                        transfer[idx] = draw_transfers_vectorized(
+                            x1_design[idx], education[idx], work[idx], financial["transfer"],
+                            transfer_type=financial_type,
+                            receipt_uniform=crn["transfer_u"][draw_index, idx],
+                            amount_standard_normal=crn["transfer_z"][draw_index, idx],
+                        )
+                base_budget[draw_index] = (
                     wage + grant + transfer - tuition - (1.0 + r) * pack["debt"]
                 )
+            else:
+                for type_index in range(N_TYPES):
+                    grant = draw_grants_vectorized(
+                        x1_design, education, work, financial["grant"],
+                        grant_type=int(TYPE_GRANT[type_index]),
+                        receipt_uniform=crn["grant_u"][draw_index],
+                        amount_standard_normal=crn["grant_z"][draw_index],
+                    )
+                    transfer = draw_transfers_vectorized(
+                        x1_design, education, work, financial["transfer"],
+                        transfer_type=int(TYPE_TRANSFER[type_index]),
+                        receipt_uniform=crn["transfer_u"][draw_index],
+                        amount_standard_normal=crn["transfer_z"][draw_index],
+                    )
+                    base_budget[draw_index, type_index] = (
+                        wage + grant + transfer - tuition - (1.0 + r) * pack["debt"]
+                    )
 
         prepared_pack = dict(pack)
         prepared_pack["base_budget_crn"] = np.ascontiguousarray(base_budget)
         prepared_pack["budget_z"] = np.ascontiguousarray(crn["budget_z"])
+        prepared_pack["type_integration"] = type_integration
+        if type_integration == "sampled":
+            prepared_pack["ccp_sampled"] = np.ascontiguousarray(
+                pack["ccp_by_type"][sampled_type, np.arange(n)], dtype=np.float64
+            )
         prepared_pack["b_idx"], prepared_pack["max_idx"] = precompute_bounds_indices(
             pack["debt"].astype(np.float64),
             pack["state"].astype(np.int64),
@@ -1626,19 +1812,20 @@ def prepare_education_cell_crns(packs, draws=20, seed=12345):
     return prepared
 
 
-def _pooled_observed_cell_moments(packs, specification="joint_type"):
+def _pooled_observed_cell_moments(
+    packs, specification="joint_type", moment_spec="fast_stock",
+):
     parinc = np.concatenate([pack["parinc"] for pack in packs])
     q = np.concatenate([pack["q"] for pack in packs], axis=0)
     flow = np.concatenate([pack["loan_flow"] for pack in packs])
     stock = np.concatenate([pack["debtchoice"] for pack in packs])
-    moment_function = (
-        parental_income_loan_moments
-        if specification == "parental_income_basic"
-        else posterior_loan_moments
-    )
     if specification not in EDUCATION_CELL_SPECIFICATIONS:
         raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
-    return moment_function(
+    if specification == "parental_income_basic":
+        return parental_income_distribution_moments(
+            parinc, flow, stock, moment_spec=moment_spec
+        )
+    return posterior_loan_moments(
         parinc, np.broadcast_to(flow, (N_TYPES, len(flow))),
         np.broadcast_to(stock, (N_TYPES, len(stock))), q,
     )
@@ -1663,22 +1850,36 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
 
 def _print_parental_income_fit(
     data, simulated, data_new_share, sim_new_share, weights, labels, loss,
+    moment_spec,
 ):
-    print("\n" + "=" * 104)
+    print("\n" + "=" * 132)
     print(f"[education-cell eval {EVAL_COUNTER}] standardized loss={loss:.6f}")
-    print(" parinc | mean positive annual flow: data       sim       diff | "
-          "share end-stock>0: data     sim     diff | new-flow share (diagnostic)")
+    source = "stock" if moment_spec == "fast_stock" else "annual flow"
+    print(
+        f" parinc | mean positive {source}: data/sim/diff | share end-stock>0: "
+        f"data/sim/diff | std positive {source}: data/sim/diff | "
+        f"p80 positive {source}: data/sim/diff"
+    )
     for row, parinc in enumerate(labels):
-        m = 2 * row
+        m = 4 * row
         print(
             f"   {parinc:>2}   | "
-            f"{data[m]:>10.2f} {simulated[m]:>10.2f} {simulated[m]-data[m]:>10.2f} | "
-            f"{data[m+1]:>7.4f} {simulated[m+1]:>7.4f} "
-            f"{simulated[m+1]-data[m+1]:>+8.4f} | "
-            f"{data_new_share[row]:>7.4f} -> {sim_new_share[row]:>7.4f}  "
-            f"(posterior weight={weights[row]:.1f})"
+            f"{data[m]:>8.2f}/{simulated[m]:>8.2f}/{simulated[m]-data[m]:>+8.2f} | "
+            f"{data[m+1]:>6.4f}/{simulated[m+1]:>6.4f}/"
+            f"{simulated[m+1]-data[m+1]:>+7.4f} | "
+            f"{data[m+2]:>8.2f}/{simulated[m+2]:>8.2f}/"
+            f"{simulated[m+2]-data[m+2]:>+8.2f} | "
+            f"{data[m+3]:>8.2f}/{simulated[m+3]:>8.2f}/"
+            f"{simulated[m+3]-data[m+3]:>+8.2f}"
         )
-    print("=" * 104 + "\n")
+    print(" positive-flow share diagnostic (data -> simulation): " + ", ".join(
+        f"parinc {level}: {data_new_share[row]:.4f}->{sim_new_share[row]:.4f}"
+        for row, level in enumerate(labels)
+    ))
+    print(" cell observation weights: " + ", ".join(
+        f"parinc {level}: {weights[row]:.1f}" for row, level in enumerate(labels)
+    ))
+    print("=" * 132 + "\n")
 
 
 def minimize_distance_education_cell(
@@ -1758,11 +1959,16 @@ def minimize_distance_education_cell(
 
 def minimize_distance_education_cell_parental_income(
     params, data_moments, data_new_share, data_weights, labels, sample_by_period,
-    cell_code, education, program_year,
+    cell_code, education, program_year, type_integration="sampled",
+    moment_spec="fast_stock",
 ):
-    """Basic 13-parameter SMM objective with parinc-only target moments."""
+    """Basic 13-parameter SMM with sampled types or an exact validation mode."""
     global EVAL_COUNTER
     EVAL_COUNTER += 1
+    if type_integration not in TYPE_INTEGRATION_MODES:
+        raise ValueError(f"type_integration must be one of {TYPE_INTEGRATION_MODES}.")
+    if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
+        raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
     spec = bs.unpack_parental_income_estimation_vector(
         params, [cell_code], index_kind="education_cell"
     )
@@ -1770,49 +1976,83 @@ def minimize_distance_education_cell_parental_income(
     simulated_by_draw = []
     diagnostic_by_draw = []
 
+    # Terminal values and individual parameter vectors change with candidate
+    # parameters, but never with the resource/budget-shock draw. Construct them
+    # once per period and reuse them for all draws and latent-type calculations.
+    evaluation_by_period = {}
+    for period, pack in sample_by_period.items():
+        x1 = pack["x1"]
+        terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
+        cache = {}
+        parental_group = x1[:, 0].astype(int) - 1
+        for group_index in range(4):
+            idx = np.flatnonzero(parental_group == group_index)
+            if idx.size:
+                terminal[idx] = get_relevant_terminal_subset_cached(
+                    pack["terminal_data"], spec["risk_aversion"][group_index], idx, cache
+                )
+        evaluation_by_period[period] = {
+            "terminal": terminal,
+            "sigma_i": bs.risk_aversion(spec, x1).astype(np.float64),
+            "debtpen_i": bs.debt_penalty(spec, x1).astype(np.float64),
+        }
+
     for draw_index in range(draws):
         pooled_flow, pooled_stock, pooled_parinc, pooled_q = [], [], [], []
         for period, pack in sample_by_period.items():
             x1 = pack["x1"]
-            terminal = np.zeros((len(x1), debt_range.size), dtype=np.float64)
-            cache = {}
-            parental_group = x1[:, 0].astype(int) - 1
-            for group_index in range(4):
-                idx = np.flatnonzero(parental_group == group_index)
-                if idx.size:
-                    terminal[idx] = get_relevant_terminal_subset_cached(
-                        pack["terminal_data"], spec["risk_aversion"][group_index], idx, cache
-                    )
-            sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
-            debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
-            stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
-            # The residual shock is common across all latent types in this
-            # baseline. Type-specific CCPs and simulated grant/transfer
-            # resources still enter below and are integrated through q.
+            evaluation = evaluation_by_period[period]
             shock = bs.realization(
                 spec, x1, None, pack["budget_z"][draw_index],
                 loan_type=None, education=education, program_year=program_year,
             ).astype(np.float64)
-            for type_index in range(N_TYPES):
+
+            if type_integration == "sampled":
                 debt_index = solve_one_draw_debt_idx_terminal_only(
-                    budget=pack["base_budget_crn"][draw_index, type_index],
-                    e=shock, debt_grid=debt_range, sigma_i=sigma_i,
-                    debtpen_i=debtpen_i,
-                    ccp_path_row=pack["ccp_by_type"][type_index],
-                    terminal_row=terminal, b_idx=pack["b_idx"], max_idx=pack["max_idx"],
+                    budget=pack["base_budget_crn"][draw_index],
+                    e=shock, debt_grid=debt_range, sigma_i=evaluation["sigma_i"],
+                    debtpen_i=evaluation["debtpen_i"],
+                    ccp_path_row=pack["ccp_sampled"],
+                    terminal_row=evaluation["terminal"],
+                    b_idx=pack["b_idx"], max_idx=pack["max_idx"],
                     beta_term=float(beta ** (T - period)), c_floor=2000.0,
                     fallback_idx=debt_range.size - 1,
                 )
-                stock_by_type[type_index] = debt_range[debt_index]
-            flow_by_type = stock_by_type - (1.0 + r) * pack["debt"][None, :]
-            pooled_flow.append(flow_by_type)
-            pooled_stock.append(stock_by_type)
+                stock = debt_range[debt_index]
+                flow = stock - (1.0 + r) * pack["debt"]
+                pooled_flow.append(flow)
+                pooled_stock.append(stock)
+            else:
+                stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
+                for type_index in range(N_TYPES):
+                    debt_index = solve_one_draw_debt_idx_terminal_only(
+                        budget=pack["base_budget_crn"][draw_index, type_index],
+                        e=shock, debt_grid=debt_range,
+                        sigma_i=evaluation["sigma_i"],
+                        debtpen_i=evaluation["debtpen_i"],
+                        ccp_path_row=pack["ccp_by_type"][type_index],
+                        terminal_row=evaluation["terminal"],
+                        b_idx=pack["b_idx"], max_idx=pack["max_idx"],
+                        beta_term=float(beta ** (T - period)), c_floor=2000.0,
+                        fallback_idx=debt_range.size - 1,
+                    )
+                    stock_by_type[type_index] = debt_range[debt_index]
+                pooled_stock.append(stock_by_type)
+                pooled_flow.append(stock_by_type - (1.0 + r) * pack["debt"][None, :])
+                pooled_q.append(pack["q"])
             pooled_parinc.append(pack["parinc"])
-            pooled_q.append(pack["q"])
-        moments, new_share, _, _ = parental_income_loan_moments(
-            np.concatenate(pooled_parinc), np.concatenate(pooled_flow, axis=1),
-            np.concatenate(pooled_stock, axis=1), np.concatenate(pooled_q, axis=0),
-        )
+
+        if type_integration == "sampled":
+            moments, new_share, _, _ = parental_income_distribution_moments(
+                np.concatenate(pooled_parinc), np.concatenate(pooled_flow),
+                np.concatenate(pooled_stock), moment_spec=moment_spec,
+            )
+        else:
+            moments, new_share, _, _ = parental_income_distribution_moments(
+                np.concatenate(pooled_parinc), np.concatenate(pooled_flow, axis=1),
+                np.concatenate(pooled_stock, axis=1), moment_spec=moment_spec,
+                q=np.concatenate(pooled_q, axis=0),
+            )
         simulated_by_draw.append(moments)
         diagnostic_by_draw.append(new_share)
 
@@ -1824,8 +2064,9 @@ def minimize_distance_education_cell_parental_income(
     if EVAL_COUNTER % 10 == 0:
         _print_parental_income_fit(
             data_moments, simulated, data_new_share, sim_new_share,
-            data_weights, labels, loss,
+            data_weights, labels, loss, moment_spec,
         )
+        print("type integration:", type_integration, "moment specification:", moment_spec)
         print("shock means by parinc:", np.round(np.asarray(params)[0:4], 3),
               "common sigma:", round(float(np.asarray(params)[4]), 3))
         print("risk aversion:", np.round(spec["risk_aversion"], 4),
@@ -1845,15 +2086,24 @@ def fit_education_cell(
     packs, education=2, program_year=1, shock_heterogeneity="homogeneous",
     draws=20, n_sample=None, maxiter=500, seed=12345, initial=None,
     fixed_common=None, specification="parental_income_basic",
+    type_integration="sampled", moment_spec="fast_stock",
 ):
     """Estimate a single program-year cell without changing the dynamic solver."""
     if not packs:
         raise ValueError("No observations were found for the requested education cell.")
     if specification not in EDUCATION_CELL_SPECIFICATIONS:
         raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
+    if type_integration not in TYPE_INTEGRATION_MODES:
+        raise ValueError(f"type_integration must be one of {TYPE_INTEGRATION_MODES}.")
+    if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
+        raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    if specification == "joint_type" and type_integration != "exact":
+        raise ValueError("The retained joint_type specification requires exact integration.")
     data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(
-        packs, specification=specification
+        packs, specification=specification, moment_spec=moment_spec
     )
+    if specification == "parental_income_basic" and type_integration == "sampled":
+        packs = assign_persistent_joint_types(packs, seed=seed)
     rng = np.random.default_rng(seed)
     sampled = []
     for pack in packs:
@@ -1861,7 +2111,9 @@ def fit_education_cell(
             sampled.append(pack)
         else:
             sampled.append(_subset_cell_pack(pack, rng.choice(len(pack["x1"]), n_sample, replace=True)))
-    sample_by_period = prepare_education_cell_crns(sampled, draws=draws, seed=seed)
+    sample_by_period = prepare_education_cell_crns(
+        sampled, draws=draws, seed=seed, type_integration=type_integration
+    )
 
     cell_code = bs.education_cell_code(education, program_year)
     if specification == "parental_income_basic":
@@ -1886,7 +2138,7 @@ def fit_education_cell(
         )
         args = (
             data_moments, data_new_share, data_weights, labels, sample_by_period,
-            cell_code, education, program_year,
+            cell_code, education, program_year, type_integration, moment_spec,
         )
         result = minimize(
             minimize_distance_education_cell_parental_income,
@@ -1982,6 +2234,8 @@ def estimate_budget_shock_education_cell(
     program_year=1,
     shock_heterogeneity="homogeneous",
     specification="parental_income_basic",
+    type_integration="sampled",
+    moment_spec="fast_stock",
     draws=20,
     n_sample=None,
     maxiter=500,
@@ -2014,11 +2268,13 @@ def estimate_budget_shock_education_cell(
         shock_heterogeneity=shock_heterogeneity, draws=draws,
         n_sample=n_sample, maxiter=maxiter, seed=seed, initial=initial,
         fixed_common=fixed_common, specification=specification,
+        type_integration=type_integration, moment_spec=moment_spec,
     )
     if save:
         cell_code = bs.education_cell_code(education, program_year)
         prefix = (
-            f"budgetshock_educ{education}_year{program_year}_parental_income_basic"
+            f"budgetshock_educ{education}_year{program_year}_parental_income_basic_"
+            f"{type_integration}_{moment_spec}"
             if specification == "parental_income_basic"
             else f"budgetshock_educ{education}_year{program_year}_{shock_heterogeneity}"
         )
@@ -2027,6 +2283,13 @@ def estimate_budget_shock_education_cell(
             loan_heterogeneity=shock_heterogeneity,
             index_kind="education_cell",
             estimation_parameterization=specification,
+            estimation_metadata={
+                "smm_type_integration": type_integration,
+                "smm_moment_spec": moment_spec,
+                "smm_draws": int(draws),
+                "smm_seed": int(seed),
+                "smm_n_sample": None if n_sample is None else int(n_sample),
+            },
         )
     return result, data_summary
 
