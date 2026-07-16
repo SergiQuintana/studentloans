@@ -65,7 +65,7 @@ import solve_many_continuations as mcf
 import model_predict_ccps as mccp
 import model_getccp_sequence as mgs
 from model_interpolate_terminal import build_interp_cache 
-from model_fitloans_dynamic import estimate_budget_shock 
+from model_fitloans_dynamic import estimate_budget_shock_all_education
 from latent_types import TYPE_IDS, load_em_posteriors, validate_q
 #-----------------------------------------------------------------------------------------------#
 
@@ -108,7 +108,15 @@ solve_model = False
 solve_continuation = False 
 solve_qs = False
 solve_initial_ccps = False
-get_budget = False
+get_budget = True
+
+# Production loan-SMM controls. The auxiliary EM results are loaded above and
+# remain fixed. A deliberately small annealing budget keeps each NPL iteration
+# manageable; subsequent iterations restart from the saved production vector.
+BUDGET_SMM_DRAWS = 100
+BUDGET_SMM_ANNEALING_MAXFUN = 2000
+BUDGET_SMM_MAXITER = 1000
+BUDGET_SMM_CCP_WORKERS = 60
 
 if __name__ == '__main__':
     
@@ -275,7 +283,19 @@ if __name__ == '__main__':
             #---------------------------------------#
             print("Estimation of the Budget Shock")
             
-            estimate_budget_shock()
+            estimate_budget_shock_all_education(
+                draws=BUDGET_SMM_DRAWS,
+                maxiter=BUDGET_SMM_MAXITER,
+                optimizer="dual-annealing",
+                annealing_maxfun=BUDGET_SMM_ANNEALING_MAXFUN,
+                resource_mode="simulated",
+                restart=True,
+                ccp_workers=BUDGET_SMM_CCP_WORKERS,
+                # CCPs change at every NPL iteration. Production estimation
+                # must therefore read the newly constructed sequences rather
+                # than reuse the education-cell testing cache.
+                ccp_cache_mode="off",
+            )
             ms.reload_budgetshock_params()
             
         #--------------------------------------#

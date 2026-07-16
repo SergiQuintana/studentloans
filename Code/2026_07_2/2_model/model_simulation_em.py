@@ -741,18 +741,52 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     # Break the set of individuals into those who make educational choices and those who don't. 
     x_educ = x[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
     x_noteduc = x[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
+    choices_educ = choices[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
+    choices_noteduc = choices[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
 
     # Draw distinct shocks in their correct units. The wage shock is in log
     # wages; the fitted budget shock is additive in dollar consumption.
     if budget_params is None:
         reload_budget_shock_params(raise_if_missing=True)
     wage_psi_educ = np.random.normal(loc=0.0, scale=sigmas[0], size=np.shape(x_educ)[0])
-    budget_psi_educ = bs.draw(budget_params, x_educ[:, 1:5], period)
+    x1_educ = x_educ[:, 1:5]
+    x2_educ = x_educ[:, 5:15]
+    x1_new_educ = get_x1_new(x1_educ)
+    expected_help = fin_help_agents(
+        x1_new_educ, x2_educ, choices_educ, period
+    )
+    wage_index = wage0(x1_new_educ, x2_educ)
+    realized_wage = (
+        np.exp(wage_index + wage_psi_educ)
+        * choices_educ[:, 2] * 0.5 * (40 * 52)
+    )
+    pre_choice_resources = (
+        expected_help + realized_wage
+        - tuition_agents(conterfactual, choices_educ)
+        - (1.0 + r) * debt_range[x_educ[:, 15].astype(np.int64)]
+    )
+    budget_psi_educ = np.empty(len(x_educ), dtype=np.float64)
+    for education in (1, 2, 3):
+        education_rows = np.flatnonzero(
+            choices_educ[:, 1].astype(np.int64) == education
+        )
+        if not education_rows.size:
+            continue
+        cell_codes = bs.education_cell_from_state(
+            x2_educ[education_rows], education
+        )
+        for cell_code in np.unique(cell_codes):
+            rows = education_rows[cell_codes == cell_code]
+            program_year = int(cell_code - 100 * education)
+            budget_psi_educ[rows] = bs.draw(
+                budget_params,
+                x1_educ[rows],
+                period,
+                education=education,
+                program_year=program_year,
+                pre_choice_resources=pre_choice_resources[rows],
+            )
     sigma_educ = bs.risk_aversion(budget_params, x_educ[:, 1:5])
-    
-        
-    choices_educ = choices[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
-    choices_noteduc = choices[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
     
     # Move debt for not education choices.
     # The individuals that are not making educational choices will have tomorrow debt based on the repayment rule.

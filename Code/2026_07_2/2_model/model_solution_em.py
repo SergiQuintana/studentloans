@@ -469,9 +469,13 @@ def get_utility(
     h0 = fin_help(x1_new, j, financial_parameters)  # type-specific scalar
     h_vis = np.repeat(h0, nb*Q)         # length Q*nb
 
-    # Add budget shock if provided as vector
+    # Add the budget shock. It may be one value per quadrature point or one
+    # value per (quadrature point, current-debt state) when its conditional
+    # mean depends on pre-choice resources.
     if np.ndim(z) == 0:
         z_vis = 0.0
+    elif np.asarray(z).size == Q * nb:
+        z_vis = np.asarray(z, dtype=np.float64).reshape(-1)
     else:
         z_vis = np.repeat(z, nb)        # length Q*nb
     h_vis = h_vis + z_vis
@@ -1594,12 +1598,18 @@ def get_sigma(j,sigmas):
 
 
 def get_quadrature_budget(deg, x1, x2, j, period):
-    return bs.quadrature(budget_params, x1, period, degree=deg)
+    return bs.quadrature(
+        budget_params, x1, period, degree=deg,
+        education=int(j[1]), state=x2,
+    )
 
 
 def budget_mu_sigma_from_params(x1, x2, j, period):
-    mean = float(np.asarray(bs.conditional_mean(budget_params, x1, period)).reshape(-1)[0])
-    return mean, bs.conditional_sigma(budget_params, period)
+    keywords = {"education": int(j[1]), "state": x2}
+    mean = float(np.asarray(
+        bs.conditional_mean(budget_params, x1, period, **keywords)
+    ).reshape(-1)[0])
+    return mean, bs.conditional_sigma(budget_params, period, **keywords)
 
 
 def get_quadrature(deg,mu,sigma):
@@ -1652,11 +1662,36 @@ def get_expected_conditional(
         v = v.reshape((len(e_nodes), nb)).T
         return np.sum(v, axis=1)
 
-    z_nodes, wz = get_quadrature_budget(deg_budget, x1, x2, j, period)
+    standard_nodes, wz = np.polynomial.hermite.hermgauss(deg_budget)
+    standard_nodes = np.sqrt(2.0) * standard_nodes
+    wz = wz / np.sqrt(np.pi)
 
-    e_joint = np.tile(e_nodes, len(z_nodes))
-    z_joint = np.repeat(z_nodes, len(e_nodes))
+    e_joint = np.tile(e_nodes, len(standard_nodes))
+    z_standard_joint = np.repeat(standard_nodes, len(e_nodes))
     w_joint = np.kron(wz, we)
+
+    # The fitted residual-shock mean may depend on resources available before
+    # choosing next-period debt. Construct those resources for every wage
+    # quadrature point and current-debt state, exactly where the Bellman budget
+    # is formed.
+    h0 = float(fin_help(x1_new, j, financial_parameters))
+    wage_index = float(np.asarray(wage0(x1_new, x2)).reshape(-1)[0])
+    real_wage = (
+        np.exp(wage_index + e_joint) * (j[2] / 2.0) * 52.0 * 40.0
+    )
+    pre_choice_resources = (
+        h0 + real_wage[:, None] - tuition(j)
+        - (1.0 + r) * b[None, :]
+    )
+    z_joint = bs.realization(
+        budget_params,
+        x1,
+        period,
+        z_standard_joint[:, None],
+        education=int(j[1]),
+        state=x2,
+        pre_choice_resources=pre_choice_resources,
+    ).reshape(-1)
 
     w_vis = np.repeat(w_joint, nb)
 

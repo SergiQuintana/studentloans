@@ -107,7 +107,7 @@ def build_parser():
     parser.add_argument(
         "--annealing-maxfun",
         type=int,
-        default=50000,
+        default=2000,
         help="Maximum objective evaluations for --optimizer dual-annealing.",
     )
     parser.add_argument("--seed", type=int, default=12345)
