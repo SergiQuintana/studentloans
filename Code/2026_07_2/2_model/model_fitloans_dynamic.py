@@ -84,6 +84,7 @@ CCP_CELL_CACHE_SCHEMA = 1
 EDUCATION_CELL_SPECIFICATIONS = ("parental_income_basic", "joint_type")
 TYPE_INTEGRATION_MODES = ("sampled", "exact")
 PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock")
+DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
 UNCAPPED_EDUCATION_CELL_MAXITER = np.iinfo(np.int32).max
 
@@ -1959,10 +1960,15 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
 
 def _print_parental_income_fit(
     data, simulated, data_new_share, sim_new_share, weights, labels, loss,
-    moment_spec,
+    moment_spec, primary_moment_weight,
 ):
     print("\n" + "=" * 132)
-    print(f"[education-cell eval {EVAL_COUNTER}] standardized loss={loss:.6f}")
+    print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    print(
+        " loss weights per parinc group: "
+        f"mean positive={primary_moment_weight:g}, "
+        f"share indebted={primary_moment_weight:g}, std=1, p80=1"
+    )
     source = "stock" if moment_spec == "fast_stock" else "annual flow"
     print(
         f" parinc | mean positive {source}: data/sim/diff | share end-stock>0: "
@@ -2115,7 +2121,7 @@ def _pool_sampled_education_cell_evaluation(
 def minimize_distance_education_cell_parental_income(
     params, data_moments, data_new_share, data_weights, labels, sample_by_period,
     cell_code, education, program_year, type_integration="sampled",
-    moment_spec="fast_stock",
+    moment_spec="fast_stock", primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
 ):
     """Basic 13-parameter SMM with sampled types or an exact validation mode."""
     global EVAL_COUNTER
@@ -2124,6 +2130,8 @@ def minimize_distance_education_cell_parental_income(
         raise ValueError(f"type_integration must be one of {TYPE_INTEGRATION_MODES}.")
     if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
         raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
+        raise ValueError("primary_moment_weight must be positive and finite.")
     spec = bs.unpack_parental_income_estimation_vector(
         params, [cell_code], index_kind="education_cell"
     )
@@ -2219,11 +2227,20 @@ def minimize_distance_education_cell_parental_income(
     sim_new_share = np.nanmean(np.asarray(diagnostic_by_draw), axis=0)
     valid = np.isfinite(data_moments) & np.isfinite(simulated)
     scale = np.maximum(np.abs(data_moments), 1.0e-6)
-    loss = float(np.sum(((simulated[valid] - data_moments[valid]) / scale[valid]) ** 2))
+    # Each parinc group contributes the same four standardized residuals,
+    # regardless of its sample size. Emphasize the two central debt targets
+    # (mean positive stock/flow and share with positive end stock) without
+    # changing any moment definition or simulated choice.
+    moment_weights = np.tile(
+        np.array([primary_moment_weight, primary_moment_weight, 1.0, 1.0]),
+        len(labels),
+    )
+    standardized_error = (simulated - data_moments) / scale
+    loss = float(np.sum(moment_weights[valid] * standardized_error[valid] ** 2))
     if EVAL_COUNTER % 10 == 0:
         _print_parental_income_fit(
             data_moments, simulated, data_new_share, sim_new_share,
-            data_weights, labels, loss, moment_spec,
+            data_weights, labels, loss, moment_spec, primary_moment_weight,
         )
         print("type integration:", type_integration, "moment specification:", moment_spec)
         print("shock means by parinc:", np.round(np.asarray(params)[0:4], 3),
@@ -2247,6 +2264,7 @@ def fit_education_cell(
     seed=12345, initial=None,
     fixed_common=None, specification="parental_income_basic",
     type_integration="sampled", moment_spec="fast_stock",
+    primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
 ):
     """Estimate a single program-year cell without changing the dynamic solver."""
     if not packs:
@@ -2257,6 +2275,8 @@ def fit_education_cell(
         raise ValueError(f"type_integration must be one of {TYPE_INTEGRATION_MODES}.")
     if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
         raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
+        raise ValueError("primary_moment_weight must be positive and finite.")
     if specification == "joint_type" and type_integration != "exact":
         raise ValueError("The retained joint_type specification requires exact integration.")
     data_moments, data_new_share, data_weights, labels = _pooled_observed_cell_moments(
@@ -2305,6 +2325,7 @@ def fit_education_cell(
         args = (
             data_moments, data_new_share, data_weights, labels, sample_by_period,
             cell_code, education, program_year, type_integration, moment_spec,
+            primary_moment_weight,
         )
         result = minimize(
             minimize_distance_education_cell_parental_income,
@@ -2402,6 +2423,7 @@ def estimate_budget_shock_education_cell(
     specification="parental_income_basic",
     type_integration="sampled",
     moment_spec="fast_stock",
+    primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     draws=20,
     n_sample=None,
     maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
@@ -2435,6 +2457,7 @@ def estimate_budget_shock_education_cell(
         n_sample=n_sample, maxiter=maxiter, seed=seed, initial=initial,
         fixed_common=fixed_common, specification=specification,
         type_integration=type_integration, moment_spec=moment_spec,
+        primary_moment_weight=primary_moment_weight,
     )
     if save:
         cell_code = bs.education_cell_code(education, program_year)
@@ -2452,6 +2475,7 @@ def estimate_budget_shock_education_cell(
             estimation_metadata={
                 "smm_type_integration": type_integration,
                 "smm_moment_spec": moment_spec,
+                "smm_primary_moment_weight": float(primary_moment_weight),
                 "smm_draws": int(draws),
                 "smm_seed": int(seed),
                 "smm_n_sample": None if n_sample is None else int(n_sample),

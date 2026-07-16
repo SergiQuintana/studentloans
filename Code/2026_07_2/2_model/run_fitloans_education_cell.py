@@ -11,6 +11,7 @@ from model_fitloans_dynamic import (
     CCP_CACHE_MODES,
     DEFAULT_CCP_WORKERS,
     DEFAULT_EDUCATION_CELL_MAXITER,
+    DEFAULT_PRIMARY_MOMENT_WEIGHT,
     EDUCATION_CELL_SPECIFICATIONS,
     PARENTAL_INCOME_MOMENT_SPECS,
     TYPE_INTEGRATION_MODES,
@@ -49,6 +50,15 @@ def build_parser():
         choices=PARENTAL_INCOME_MOMENT_SPECS,
         default="fast_stock",
         help="fast_stock exactly matches the four model_fitloans_fast moment definitions.",
+    )
+    parser.add_argument(
+        "--primary-moment-weight",
+        type=float,
+        default=DEFAULT_PRIMARY_MOMENT_WEIGHT,
+        help=(
+            "Loss weight on mean positive loans and share indebted in every "
+            "parinc group; std and p80 each retain weight 1 (default: 4)."
+        ),
     )
     parser.add_argument("--draws", type=int, default=20)
     parser.add_argument(
@@ -106,6 +116,8 @@ def main():
     args = build_parser().parse_args()
     if args.maxiter <= 0:
         raise ValueError("--maxiter must be positive; use --no-maxiter for no practical cap.")
+    if not np.isfinite(args.primary_moment_weight) or args.primary_moment_weight <= 0.0:
+        raise ValueError("--primary-moment-weight must be positive and finite.")
     if args.numba_threads is not None:
         if args.numba_threads <= 0:
             raise ValueError("--numba-threads must be positive.")
@@ -148,6 +160,7 @@ def main():
         specification=args.specification,
         type_integration=args.type_integration,
         moment_spec=args.moment_spec,
+        primary_moment_weight=args.primary_moment_weight,
         shock_heterogeneity=args.heterogeneity,
         draws=args.draws,
         n_sample=args.n_sample,

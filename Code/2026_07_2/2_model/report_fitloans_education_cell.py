@@ -108,6 +108,10 @@ def print_parameter_report(paths, bestx, spec):
     if "smm_type_integration" in spec:
         print(f"type integration:     {spec['smm_type_integration']}")
         print(f"moment specification: {spec['smm_moment_spec']}")
+        print(
+            "primary moment weight: "
+            f"{spec.get('smm_primary_moment_weight', 1.0)}"
+        )
         print(f"estimation draws:     {spec['smm_draws']}")
         print(f"estimation seed:      {spec['smm_seed']}")
         print(f"estimation n_sample:  {spec['smm_n_sample']}")
@@ -177,6 +181,7 @@ def reevaluate_model_fit(bestx, args):
     print(f"n_sample:    {args.n_sample if args.n_sample is not None else 'all'}")
     print(f"ccp workers: {args.ccp_workers}")
     print(f"ccp cache:   {args.ccp_cache_mode}")
+    print(f"primary moment weight: {args.primary_moment_weight:g}")
     print(
         "This reproduces the original reported fit exactly only when these "
         "settings equal those used in estimation."
@@ -236,7 +241,9 @@ def reevaluate_model_fit(bestx, args):
     if args.specification == "joint_type":
         objective_args += (args.heterogeneity,)
     else:
-        objective_args += (args.type_integration, args.moment_spec)
+        objective_args += (
+            args.type_integration, args.moment_spec, args.primary_moment_weight,
+        )
     loss = objective(bestx, *objective_args)
     print(f"Reevaluated SMM loss: {loss:.10f}")
 
@@ -260,6 +267,12 @@ def build_parser():
     )
     parser.add_argument(
         "--moment-spec", choices=("fast_stock", "flow_stock"), default="fast_stock"
+    )
+    parser.add_argument(
+        "--primary-moment-weight",
+        type=float,
+        default=None,
+        help="Override the saved primary-moment loss weight when reevaluating.",
     )
     parser.add_argument("--draws", type=int, default=20)
     parser.add_argument("--n-sample", type=int, default=None)
@@ -309,6 +322,12 @@ def main():
                 prefix, args.heterogeneity, args.education, args.program_year,
                 args.specification,
             )
+            if args.primary_moment_weight is None:
+                args.primary_moment_weight = float(
+                    spec.get("smm_primary_moment_weight", 1.0)
+                )
+            if not np.isfinite(args.primary_moment_weight) or args.primary_moment_weight <= 0:
+                raise ValueError("--primary-moment-weight must be positive and finite.")
             print_parameter_report(paths, bestx, spec)
             if not args.parameters_only:
                 reevaluate_model_fit(bestx, args)
