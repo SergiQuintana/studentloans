@@ -30,7 +30,7 @@ EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
 LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
 PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 14
 PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE = 18
-PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL = 10
+PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL = 6
 BUDGET_RESOURCE_SCALE = 10000.0
 
 
@@ -197,16 +197,16 @@ def unpack_parental_income_multicell_estimation_vector(
 ) -> dict[str, Any]:
     """Map cell-specific parameters plus common risk aversion to one bundle.
 
-    Each education cell contributes ten free parameters in this order: four
-    parental-income shock means, one shock sigma, four parental-income debt
-    penalty levels, and one pre-choice-resource slope.  The final four entries
-    are parental-income risk-aversion levels, estimated once and shared by all
-    education cells.
+    Each education cell contributes six free parameters in this order: four
+    parental-income shock means, one shock sigma, and one pre-choice-resource
+    slope.  The final eight entries are four parental-income risk-aversion
+    levels followed by four parental-income debt-penalty levels.  Both sets are
+    estimated once and shared by all education cells.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     periods = np.asarray(periods, dtype=np.int64).reshape(-1)
     block_size = PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL * periods.size
-    expected = block_size + N_RISK_PARAMETERS
+    expected = block_size + N_RISK_PARAMETERS + N_DEBT_PENALTY_PARAMETERS
     if periods.size < 2:
         raise ValueError("The multicell parameterization requires at least two cells.")
     if np.unique(periods).size != periods.size:
@@ -216,7 +216,8 @@ def unpack_parental_income_multicell_estimation_vector(
             f"Multicell parental-income vector has {vector.size} entries; "
             f"expected {expected}."
         )
-    shared_risk_aversion = vector[block_size:]
+    shared_risk_aversion = vector[block_size:block_size + N_RISK_PARAMETERS]
+    debt_levels = vector[block_size + N_RISK_PARAMETERS:]
     index_kind = str(index_kind)
     if index_kind not in INDEX_KINDS:
         raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
@@ -225,15 +226,18 @@ def unpack_parental_income_multicell_estimation_vector(
         periods.size, PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
     )
     mean_levels = blocks[:, 0:4]
-    debt_levels = blocks[:, 5:9]
     mu_blocks = np.zeros((periods.size, N_MEAN_PARAMETERS), dtype=np.float64)
     mu_blocks[:, 0] = mean_levels[:, 0]
     mu_blocks[:, 1:4] = mean_levels[:, 1:4] - mean_levels[:, [0]]
-    debt_coefficients = np.empty(
-        (periods.size, N_DEBT_PENALTY_PARAMETERS), dtype=np.float64
+    debt_coefficients = np.asarray(
+        [
+            debt_levels[0],
+            debt_levels[1] - debt_levels[0],
+            debt_levels[2] - debt_levels[0],
+            debt_levels[3] - debt_levels[0],
+        ],
+        dtype=np.float64,
     )
-    debt_coefficients[:, 0] = debt_levels[:, 0]
-    debt_coefficients[:, 1:4] = debt_levels[:, 1:4] - debt_levels[:, [0]]
     return {
         "schema_version": SCHEMA_VERSION,
         "index_kind": index_kind,
@@ -246,8 +250,8 @@ def unpack_parental_income_multicell_estimation_vector(
         "loan_heterogeneity": "homogeneous",
         "loan_mean_shift": np.zeros(periods.size, dtype=np.float64),
         "loan_log_sigma_ratio": np.zeros(periods.size, dtype=np.float64),
-        "budget_resource_slope": blocks[:, 9].copy(),
-        "estimation_parameterization": "parental_income_basic_multicell_shared_risk",
+        "budget_resource_slope": blocks[:, 5].copy(),
+        "estimation_parameterization": "parental_income_basic_multicell_shared_risk_debt",
     }
 
 

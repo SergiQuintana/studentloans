@@ -27,7 +27,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from numba import get_num_threads, njit, prange
-from scipy.optimize import minimize
+from scipy.optimize import dual_annealing, minimize
 
 from model_em_algorithm import (
     load_data_superfeasible,
@@ -144,7 +144,7 @@ def save_budgetshock_estimates(
         budget_params = bs.unpack_parental_income_loan_type_estimation_vector(
             best_x, periods, index_kind=index_kind
         )
-    elif estimation_parameterization == "parental_income_basic_multicell_shared_risk":
+    elif estimation_parameterization == "parental_income_basic_multicell_shared_risk_debt":
         budget_params = bs.unpack_parental_income_multicell_estimation_vector(
             best_x, periods, index_kind=index_kind
         )
@@ -2366,15 +2366,14 @@ def minimize_distance_education_cells_parental_income(
     n_cells = len(program_years)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
     shared_risk = params[n_cells * block_size:n_cells * block_size + 4]
+    shared_debt = params[n_cells * block_size + 4:n_cells * block_size + 8]
     total_loss = 0.0
     evaluations = []
     for cell_index, (program_year, context) in enumerate(
         zip(program_years, contexts)
     ):
         block = params[cell_index * block_size:(cell_index + 1) * block_size]
-        full_params = np.concatenate(
-            (block[0:5], shared_risk, block[5:10])
-        )
+        full_params = np.concatenate((block[0:5], shared_risk, shared_debt, block[5:6]))
         loss, simulated, sim_new_share, spec = (
             _evaluate_sampled_parental_income_cell(
                 full_params,
@@ -2397,6 +2396,7 @@ def minimize_distance_education_cells_parental_income(
             f"loss={total_loss:.6f}; shared risk aversion="
             f"{np.round(shared_risk, 4)}"
         )
+        print(f"shared debt penalties={np.round(shared_debt, 4)}")
         print("#" * 132)
         for program_year, evaluation in zip(program_years, evaluations):
             loss, simulated, sim_new_share, spec, block, context = evaluation
@@ -2409,10 +2409,9 @@ def minimize_distance_education_cells_parental_income(
             )
             print("shock means by parinc:", np.round(block[0:4], 3),
                   "cell sigma:", round(float(block[4]), 3))
-            print("debt penalties:", np.round(block[5:9], 4))
             print(
                 "pre-choice-resource slope ($ shock per $10,000 resources):",
-                round(float(block[9]), 4),
+                round(float(block[5]), 4),
             )
             if float(spec["sigma_e"][0]) <= 1.000001:
                 print("WARNING: cell budget-shock sigma is at its lower bound (1.0).")
@@ -2867,13 +2866,14 @@ def fit_education_cells(
     draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
     seed=12345, initial=None, moment_spec="fast_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
-    resource_mode="simulated",
+    resource_mode="simulated", optimizer="nelder-mead",
+    annealing_maxfun=50000,
 ):
     """Jointly estimate several education cells with common risk aversion.
 
     All 16 parental-income moments from every cell enter the loss.  Each cell
-    has its own four means, sigma, four debt penalties, and resource slope;
-    four parental-income risk-aversion levels are estimated once and shared.
+    has its own four means, sigma, and resource slope. Four parental-income
+    risk-aversion levels and four debt penalties are estimated once and shared.
     """
     program_years = tuple(int(year) for year in program_years)
     if len(program_years) < 2 or len(set(program_years)) != len(program_years):
@@ -2886,6 +2886,11 @@ def fit_education_cells(
         raise ValueError(f"resource_mode must be one of {EDUCATION_CELL_RESOURCE_MODES}.")
     if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
         raise ValueError("primary_moment_weight must be positive and finite.")
+    optimizer = str(optimizer).lower()
+    if optimizer not in ("nelder-mead", "dual-annealing"):
+        raise ValueError("optimizer must be nelder-mead or dual-annealing.")
+    if int(annealing_maxfun) <= 0:
+        raise ValueError("annealing_maxfun must be positive.")
     for year in program_years:
         if not packs_by_program_year.get(year):
             raise ValueError(f"No observations were found for program year {year}.")
@@ -2940,22 +2945,38 @@ def fit_education_cells(
 
     n_cells = len(program_years)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
-    expected = n_cells * block_size + 4
+    expected = n_cells * block_size + 8
     if initial is None:
         cell_block = np.array(
-            [5000.0] * 4 + [100.0] + [-2.0] * 4 + [0.0], dtype=np.float64
+            [5000.0] * 4 + [100.0] + [0.0], dtype=np.float64
         )
-        initial = np.concatenate((np.tile(cell_block, n_cells), [2.0] * 4))
+        initial = np.concatenate(
+            (np.tile(cell_block, n_cells), [2.0] * 4, [-2.0] * 4)
+        )
     else:
         initial = np.asarray(initial, dtype=np.float64).reshape(-1)
         if initial.size == bs.PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
-            cell_block = np.concatenate((initial[0:5], initial[9:14]))
-            initial = np.concatenate((np.tile(cell_block, n_cells), initial[5:9]))
+            cell_block = np.concatenate((initial[0:5], initial[13:14]))
+            initial = np.concatenate(
+                (np.tile(cell_block, n_cells), initial[5:9], initial[9:13])
+            )
             print("[initial] Replicated one-cell parameters across selected program years.")
+        elif initial.size == n_cells * 10 + 4:
+            old_blocks = initial[:n_cells * 10].reshape(n_cells, 10)
+            cell_blocks = np.column_stack((old_blocks[:, 0:5], old_blocks[:, 9]))
+            shared_debt = np.mean(old_blocks[:, 5:9], axis=0)
+            initial = np.concatenate(
+                (cell_blocks.reshape(-1), initial[-4:], shared_debt)
+            )
+            print(
+                "[initial] Converted the previous multi-cell vector and "
+                "initialized shared debt penalties at their across-year means."
+            )
     if initial.size != expected:
         raise ValueError(
             f"Multi-cell initial vector has {initial.size} entries; expected {expected} "
-            f"({block_size} per cell plus four shared risk-aversion levels)."
+            f"({block_size} per cell plus four shared risk-aversion and four "
+            "shared debt-penalty levels)."
         )
     cell_codes = [bs.education_cell_code(education, year) for year in program_years]
     bs.unpack_parental_income_multicell_estimation_vector(
@@ -2965,9 +2986,10 @@ def fit_education_cells(
     for _ in program_years:
         bounds.extend(
             [(-50000.0, 50000.0)] * 4 + [(1.0, 50000.0)]
-            + [(-1.0e6, 0.0)] * 4 + [(-50000.0, 50000.0)]
+            + [(-50000.0, 50000.0)]
         )
     bounds.extend([(0.1001, 2.9999)] * 4)
+    bounds.extend([(-1.0e6, 0.0)] * 4)
 
     initial_simplex = np.tile(initial, (initial.size + 1, 1))
     for parameter_index, value in enumerate(initial):
@@ -2975,23 +2997,36 @@ def fit_education_cells(
             1.05 * value if value != 0.0 else 0.00025
         )
     for cell_index in range(n_cells):
-        slope_index = cell_index * block_size + 9
+        slope_index = cell_index * block_size + 5
         if initial[slope_index] == 0.0:
             initial_simplex[slope_index + 1, slope_index] = 100.0
-    result = minimize(
-        minimize_distance_education_cells_parental_income,
-        initial,
-        args=(
-            contexts, education, program_years, moment_spec,
-            primary_moment_weight,
-        ),
-        method="Nelder-Mead",
-        bounds=bounds,
-        options={
-            "maxiter": int(maxiter), "disp": True,
-            "initial_simplex": initial_simplex,
-        },
+    objective_args = (
+        contexts, education, program_years, moment_spec, primary_moment_weight,
     )
+    print(f"[multi-cell optimizer] {optimizer}")
+    if optimizer == "dual-annealing":
+        result = dual_annealing(
+            minimize_distance_education_cells_parental_income,
+            bounds=bounds,
+            args=objective_args,
+            x0=initial,
+            maxiter=int(maxiter),
+            maxfun=int(annealing_maxfun),
+            seed=int(seed),
+            no_local_search=True,
+        )
+    else:
+        result = minimize(
+            minimize_distance_education_cells_parental_income,
+            initial,
+            args=objective_args,
+            method="Nelder-Mead",
+            bounds=bounds,
+            options={
+                "maxiter": int(maxiter), "disp": True,
+                "initial_simplex": initial_simplex,
+            },
+        )
     return result, data_summaries
 
 # ==============================================================================
@@ -3106,6 +3141,8 @@ def estimate_budget_shock_education_cells(
     seed=12345,
     save=False,
     initial=None,
+    optimizer="nelder-mead",
+    annealing_maxfun=50000,
     ccp_workers=DEFAULT_CCP_WORKERS,
     ccp_cache_mode="reuse",
 ):
@@ -3136,6 +3173,8 @@ def estimate_budget_shock_education_cells(
         moment_spec=moment_spec,
         primary_moment_weight=primary_moment_weight,
         resource_mode=resource_mode,
+        optimizer=optimizer,
+        annealing_maxfun=annealing_maxfun,
     )
     if save:
         cell_codes = [
@@ -3144,7 +3183,7 @@ def estimate_budget_shock_education_cells(
         years_label = "-".join(str(year) for year in program_years)
         prefix = (
             f"budgetshock_educ{education}_years{years_label}_"
-            f"parental_income_basic_multicell_shared_risk_sampled_{moment_spec}"
+            f"parental_income_basic_multicell_shared_risk_debt_sampled_{moment_spec}"
             f"{'_observed_resources' if resource_mode == 'observed' else ''}"
         )
         save_budgetshock_estimates(
@@ -3154,7 +3193,7 @@ def estimate_budget_shock_education_cells(
             loan_heterogeneity="homogeneous",
             index_kind="education_cell",
             estimation_parameterization=(
-                "parental_income_basic_multicell_shared_risk"
+                "parental_income_basic_multicell_shared_risk_debt"
             ),
             estimation_metadata={
                 "smm_type_integration": "sampled",
@@ -3166,6 +3205,9 @@ def estimate_budget_shock_education_cells(
                 "smm_n_sample": None if n_sample is None else int(n_sample),
                 "smm_program_years": np.asarray(program_years, dtype=np.int64),
                 "smm_risk_aversion_shared_across_cells": True,
+                "smm_debt_penalties_shared_across_cells": True,
+                "smm_optimizer": optimizer,
+                "smm_annealing_maxfun": int(annealing_maxfun),
             },
         )
     return result, data_summary

@@ -98,6 +98,18 @@ def build_parser():
         "--no-maxiter", action="store_true",
         help="Use an effectively unlimited iteration cap; convergence still stops the optimizer.",
     )
+    parser.add_argument(
+        "--optimizer",
+        choices=("nelder-mead", "dual-annealing"),
+        default="nelder-mead",
+        help="Multi-cell optimizer; single-cell estimation retains Nelder-Mead.",
+    )
+    parser.add_argument(
+        "--annealing-maxfun",
+        type=int,
+        default=50000,
+        help="Maximum objective evaluations for --optimizer dual-annealing.",
+    )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--ccp-processes", type=int, default=10)
@@ -141,6 +153,8 @@ def main():
         args.program_year = args.program_years[0]
     if args.maxiter <= 0:
         raise ValueError("--maxiter must be positive; use --no-maxiter for no practical cap.")
+    if args.annealing_maxfun <= 0:
+        raise ValueError("--annealing-maxfun must be positive.")
     if not np.isfinite(args.primary_moment_weight) or args.primary_moment_weight <= 0.0:
         raise ValueError("--primary-moment-weight must be positive and finite.")
     if args.numba_threads is not None:
@@ -208,6 +222,8 @@ def main():
             seed=args.seed,
             save=args.save,
             initial=initial,
+            optimizer=args.optimizer,
+            annealing_maxfun=args.annealing_maxfun,
             ccp_workers=args.ccp_workers,
             ccp_cache_mode=args.ccp_cache_mode,
         )
