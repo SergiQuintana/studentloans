@@ -144,6 +144,10 @@ def save_budgetshock_estimates(
         budget_params = bs.unpack_parental_income_loan_type_estimation_vector(
             best_x, periods, index_kind=index_kind
         )
+    elif estimation_parameterization == "parental_income_basic_multicell_shared_risk":
+        budget_params = bs.unpack_parental_income_multicell_estimation_vector(
+            best_x, periods, index_kind=index_kind
+        )
     elif estimation_parameterization == "joint_type":
         budget_params = bs.unpack_estimation_vector(
             best_x,
@@ -2303,6 +2307,118 @@ def _pool_sampled_education_cell_evaluation(
     return pooled
 
 
+def _evaluate_sampled_parental_income_cell(
+    full_params, data_moments, sample_by_period, cell_code, education,
+    program_year, moment_spec, primary_moment_weight,
+):
+    """Evaluate one cell's 16 moments without changing the global counter."""
+    spec = bs.unpack_parental_income_estimation_vector(
+        full_params, [cell_code], index_kind="education_cell"
+    )
+    pooled = _pool_sampled_education_cell_evaluation(
+        sample_by_period, spec, education, program_year
+    )
+    debt_index_by_draw = solve_all_draws_debt_idx_pooled(
+        budget_by_draw=pooled["base_budget"],
+        shock_by_draw=pooled["shock"],
+        debt_grid=debt_range,
+        sigma_i=pooled["sigma_i"],
+        debtpen_i=pooled["debtpen_i"],
+        ccp_path_row=pooled["ccp"],
+        terminal_row=pooled["terminal"],
+        b_idx=pooled["b_idx"],
+        max_idx=pooled["max_idx"],
+        beta_term_i=pooled["beta_term"],
+        c_floor=2000.0,
+        fallback_idx=debt_range.size - 1,
+    )
+    stock_by_draw = debt_range[debt_index_by_draw]
+    flow_by_draw = stock_by_draw - (1.0 + r) * pooled["debt"][None, :]
+    simulated_by_draw = []
+    diagnostic_by_draw = []
+    for draw_index in range(stock_by_draw.shape[0]):
+        moments, new_share, _, _ = parental_income_distribution_moments(
+            pooled["parinc"], flow_by_draw[draw_index], stock_by_draw[draw_index],
+            moment_spec=moment_spec,
+        )
+        simulated_by_draw.append(moments)
+        diagnostic_by_draw.append(new_share)
+    simulated = np.nanmean(np.asarray(simulated_by_draw), axis=0)
+    sim_new_share = np.nanmean(np.asarray(diagnostic_by_draw), axis=0)
+    valid = np.isfinite(data_moments) & np.isfinite(simulated)
+    scale = np.maximum(np.abs(data_moments), 1.0e-6)
+    moment_weights = np.tile(
+        np.array([primary_moment_weight, primary_moment_weight, 1.0, 1.0]), 4
+    )
+    standardized_error = (simulated - data_moments) / scale
+    loss = float(np.sum(moment_weights[valid] * standardized_error[valid] ** 2))
+    return loss, simulated, sim_new_share, spec
+
+
+def minimize_distance_education_cells_parental_income(
+    params, contexts, education, program_years, moment_spec,
+    primary_moment_weight,
+):
+    """Joint multi-cell loss with risk aversion shared across cells."""
+    global EVAL_COUNTER
+    EVAL_COUNTER += 1
+    params = np.asarray(params, dtype=np.float64)
+    n_cells = len(program_years)
+    block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+    shared_risk = params[n_cells * block_size:n_cells * block_size + 4]
+    total_loss = 0.0
+    evaluations = []
+    for cell_index, (program_year, context) in enumerate(
+        zip(program_years, contexts)
+    ):
+        block = params[cell_index * block_size:(cell_index + 1) * block_size]
+        full_params = np.concatenate(
+            (block[0:5], shared_risk, block[5:10])
+        )
+        loss, simulated, sim_new_share, spec = (
+            _evaluate_sampled_parental_income_cell(
+                full_params,
+                context["data_moments"],
+                context["sample_by_period"],
+                context["cell_code"],
+                education,
+                program_year,
+                moment_spec,
+                primary_moment_weight,
+            )
+        )
+        total_loss += loss
+        evaluations.append((loss, simulated, sim_new_share, spec, block, context))
+
+    if EVAL_COUNTER % 10 == 0:
+        print("\n" + "#" * 132)
+        print(
+            f"[multi-cell eval {EVAL_COUNTER}] total weighted standardized "
+            f"loss={total_loss:.6f}; shared risk aversion="
+            f"{np.round(shared_risk, 4)}"
+        )
+        print("#" * 132)
+        for program_year, evaluation in zip(program_years, evaluations):
+            loss, simulated, sim_new_share, spec, block, context = evaluation
+            print(f"EDUCATION {education}, PROGRAM YEAR {program_year}; cell loss={loss:.6f}")
+            _print_parental_income_fit(
+                context["data_moments"], simulated,
+                context["data_new_share"], sim_new_share,
+                context["data_weights"], context["labels"], loss,
+                moment_spec, primary_moment_weight,
+            )
+            print("shock means by parinc:", np.round(block[0:4], 3),
+                  "cell sigma:", round(float(block[4]), 3))
+            print("debt penalties:", np.round(block[5:9], 4))
+            print(
+                "pre-choice-resource slope ($ shock per $10,000 resources):",
+                round(float(block[9]), 4),
+            )
+            if float(spec["sigma_e"][0]) <= 1.000001:
+                print("WARNING: cell budget-shock sigma is at its lower bound (1.0).")
+    return total_loss
+
+
 def minimize_distance_education_cell_parental_income(
     params, data_moments, data_new_share, data_weights, labels, sample_by_period,
     cell_code, education, program_year, type_integration="sampled",
@@ -2745,6 +2861,139 @@ def fit_education_cell(
         result.x = np.concatenate((fixed_common, result.x))
     return result, (data_moments, data_new_share, data_weights, labels)
 
+
+def fit_education_cells(
+    packs_by_program_year, education=2, program_years=(1, 2, 3, 4),
+    draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
+    seed=12345, initial=None, moment_spec="fast_stock",
+    primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
+    resource_mode="simulated",
+):
+    """Jointly estimate several education cells with common risk aversion.
+
+    All 16 parental-income moments from every cell enter the loss.  Each cell
+    has its own four means, sigma, four debt penalties, and resource slope;
+    four parental-income risk-aversion levels are estimated once and shared.
+    """
+    program_years = tuple(int(year) for year in program_years)
+    if len(program_years) < 2 or len(set(program_years)) != len(program_years):
+        raise ValueError("Multi-cell estimation requires at least two unique program years.")
+    if any(year < 1 for year in program_years):
+        raise ValueError("Program years must be positive.")
+    if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
+        raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    if resource_mode not in EDUCATION_CELL_RESOURCE_MODES:
+        raise ValueError(f"resource_mode must be one of {EDUCATION_CELL_RESOURCE_MODES}.")
+    if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
+        raise ValueError("primary_moment_weight must be positive and finite.")
+    for year in program_years:
+        if not packs_by_program_year.get(year):
+            raise ValueError(f"No observations were found for program year {year}.")
+
+    # Draw one posterior joint type per unique individual across the complete
+    # multi-cell sample, so a person never changes latent type across years.
+    combined = [
+        pack for year in program_years for pack in packs_by_program_year[year]
+    ]
+    combined = assign_persistent_joint_types(combined, seed=seed)
+    assigned_by_year = {year: [] for year in program_years}
+    for pack in combined:
+        year = int(pack["cell_code"] - 100 * int(education))
+        assigned_by_year[year].append(pack)
+
+    rng = np.random.default_rng(seed)
+    contexts = []
+    data_summaries = {}
+    for year in program_years:
+        packs = assigned_by_year[year]
+        summary = _pooled_observed_cell_moments(
+            packs, specification="parental_income_basic", moment_spec=moment_spec
+        )
+        data_summaries[year] = summary
+        sampled = []
+        for pack in packs:
+            if n_sample is None or len(pack["x1"]) <= n_sample:
+                sampled.append(pack)
+            else:
+                idx = rng.choice(len(pack["x1"]), n_sample, replace=True)
+                sampled.append(_subset_cell_pack(pack, idx))
+        sample_by_period = prepare_education_cell_crns(
+            sampled, draws=draws, seed=seed + 100000 * year,
+            type_integration="sampled", resource_mode=resource_mode,
+        )
+        data_moments, data_new_share, data_weights, labels = summary
+        contexts.append({
+            "cell_code": bs.education_cell_code(education, year),
+            "data_moments": data_moments,
+            "data_new_share": data_new_share,
+            "data_weights": data_weights,
+            "labels": labels,
+            "sample_by_period": sample_by_period,
+        })
+        pooled_n = sum(len(pack["x1"]) for pack in sample_by_period.values())
+        print(
+            f"[program year {year}] {pooled_n:,} pooled observations; "
+            f"{draws * pooled_n:,} draw-individual problems per objective call"
+        )
+    print(f"[current resources] {resource_mode}")
+    print(f"[parallel debt solver] {get_num_threads()} Numba threads")
+
+    n_cells = len(program_years)
+    block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+    expected = n_cells * block_size + 4
+    if initial is None:
+        cell_block = np.array(
+            [5000.0] * 4 + [100.0] + [-2.0] * 4 + [0.0], dtype=np.float64
+        )
+        initial = np.concatenate((np.tile(cell_block, n_cells), [2.0] * 4))
+    else:
+        initial = np.asarray(initial, dtype=np.float64).reshape(-1)
+        if initial.size == bs.PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE:
+            cell_block = np.concatenate((initial[0:5], initial[9:14]))
+            initial = np.concatenate((np.tile(cell_block, n_cells), initial[5:9]))
+            print("[initial] Replicated one-cell parameters across selected program years.")
+    if initial.size != expected:
+        raise ValueError(
+            f"Multi-cell initial vector has {initial.size} entries; expected {expected} "
+            f"({block_size} per cell plus four shared risk-aversion levels)."
+        )
+    cell_codes = [bs.education_cell_code(education, year) for year in program_years]
+    bs.unpack_parental_income_multicell_estimation_vector(
+        initial, cell_codes, index_kind="education_cell"
+    )
+    bounds = []
+    for _ in program_years:
+        bounds.extend(
+            [(-50000.0, 50000.0)] * 4 + [(1.0, 50000.0)]
+            + [(-1.0e6, 0.0)] * 4 + [(-50000.0, 50000.0)]
+        )
+    bounds.extend([(0.1001, 2.9999)] * 4)
+
+    initial_simplex = np.tile(initial, (initial.size + 1, 1))
+    for parameter_index, value in enumerate(initial):
+        initial_simplex[parameter_index + 1, parameter_index] = (
+            1.05 * value if value != 0.0 else 0.00025
+        )
+    for cell_index in range(n_cells):
+        slope_index = cell_index * block_size + 9
+        if initial[slope_index] == 0.0:
+            initial_simplex[slope_index + 1, slope_index] = 100.0
+    result = minimize(
+        minimize_distance_education_cells_parental_income,
+        initial,
+        args=(
+            contexts, education, program_years, moment_spec,
+            primary_moment_weight,
+        ),
+        method="Nelder-Mead",
+        bounds=bounds,
+        options={
+            "maxiter": int(maxiter), "disp": True,
+            "initial_simplex": initial_simplex,
+        },
+    )
+    return result, data_summaries
+
 # ==============================================================================
 # Main entry point
 
@@ -2840,6 +3089,83 @@ def estimate_budget_shock_education_cell(
                 "smm_draws": int(draws),
                 "smm_seed": int(seed),
                 "smm_n_sample": None if n_sample is None else int(n_sample),
+            },
+        )
+    return result, data_summary
+
+
+def estimate_budget_shock_education_cells(
+    education=2,
+    program_years=(1, 2, 3, 4),
+    moment_spec="fast_stock",
+    primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
+    resource_mode="simulated",
+    draws=20,
+    n_sample=None,
+    maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
+    seed=12345,
+    save=False,
+    initial=None,
+    ccp_workers=DEFAULT_CCP_WORKERS,
+    ccp_cache_mode="reuse",
+):
+    """Estimate multiple program-year cells with shared risk aversion."""
+    program_years = tuple(int(year) for year in program_years)
+    interp_dict = get_interp_dict_cached(force_rebuild=False)
+    packs_by_program_year = {year: [] for year in program_years}
+    for year in program_years:
+        print(f"\n[load education cell] education={education}, program year={year}")
+        for period in range(1, T):
+            print(f"  model period={period}")
+            pack = load_education_cell(
+                period, interp_dict, education=education, program_year=year,
+                ccp_workers=ccp_workers, ccp_cache_mode=ccp_cache_mode,
+            )
+            if len(pack["x1"]):
+                print(f"    retained {len(pack['x1'])} enrolled observations")
+                packs_by_program_year[year].append(pack)
+    result, data_summary = fit_education_cells(
+        packs_by_program_year,
+        education=education,
+        program_years=program_years,
+        draws=draws,
+        n_sample=n_sample,
+        maxiter=maxiter,
+        seed=seed,
+        initial=initial,
+        moment_spec=moment_spec,
+        primary_moment_weight=primary_moment_weight,
+        resource_mode=resource_mode,
+    )
+    if save:
+        cell_codes = [
+            bs.education_cell_code(education, year) for year in program_years
+        ]
+        years_label = "-".join(str(year) for year in program_years)
+        prefix = (
+            f"budgetshock_educ{education}_years{years_label}_"
+            f"parental_income_basic_multicell_shared_risk_sampled_{moment_spec}"
+            f"{'_observed_resources' if resource_mode == 'observed' else ''}"
+        )
+        save_budgetshock_estimates(
+            result.x,
+            cell_codes,
+            filename_prefix=prefix,
+            loan_heterogeneity="homogeneous",
+            index_kind="education_cell",
+            estimation_parameterization=(
+                "parental_income_basic_multicell_shared_risk"
+            ),
+            estimation_metadata={
+                "smm_type_integration": "sampled",
+                "smm_moment_spec": moment_spec,
+                "smm_primary_moment_weight": float(primary_moment_weight),
+                "smm_resource_mode": resource_mode,
+                "smm_draws": int(draws),
+                "smm_seed": int(seed),
+                "smm_n_sample": None if n_sample is None else int(n_sample),
+                "smm_program_years": np.asarray(program_years, dtype=np.int64),
+                "smm_risk_aversion_shared_across_cells": True,
             },
         )
     return result, data_summary

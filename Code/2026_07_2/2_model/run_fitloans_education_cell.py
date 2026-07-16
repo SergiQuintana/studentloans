@@ -18,6 +18,7 @@ from model_fitloans_dynamic import (
     TYPE_INTEGRATION_MODES,
     UNCAPPED_EDUCATION_CELL_MAXITER,
     estimate_budget_shock_education_cell,
+    estimate_budget_shock_education_cells,
 )
 from prepare_fitloans_ccp_sequences import prepare_fitloans_ccp_sequences
 
@@ -26,6 +27,14 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--education", type=int, default=2)
     parser.add_argument("--program-year", type=int, default=1)
+    parser.add_argument(
+        "--program-years", type=int, nargs="+", default=None,
+        help=(
+            "Joint multi-cell mode, for example --program-years 1 2 3 4. "
+            "Risk aversion is estimated but shared across years; all other "
+            "parameters are year-specific. Omit to retain single-cell mode."
+        ),
+    )
     parser.add_argument(
         "--specification",
         choices=EDUCATION_CELL_SPECIFICATIONS,
@@ -127,6 +136,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    multi_cell = args.program_years is not None and len(args.program_years) > 1
+    if args.program_years is not None and len(args.program_years) == 1:
+        args.program_year = args.program_years[0]
     if args.maxiter <= 0:
         raise ValueError("--maxiter must be positive; use --no-maxiter for no practical cap.")
     if not np.isfinite(args.primary_moment_weight) or args.primary_moment_weight <= 0.0:
@@ -149,6 +161,17 @@ def main():
         raise ValueError("--fixed-common is only available with --specification joint_type.")
     if args.specification == "joint_type" and args.type_integration != "exact":
         raise ValueError("--specification joint_type requires --type-integration exact.")
+    if multi_cell:
+        if args.specification != "parental_income_basic":
+            raise ValueError(
+                "Multi-cell mode currently requires --specification parental_income_basic."
+            )
+        if args.type_integration != "sampled":
+            raise ValueError("Multi-cell mode currently requires --type-integration sampled.")
+        if args.heterogeneity != "homogeneous":
+            raise ValueError("Multi-cell mode does not use loan-type parameter heterogeneity.")
+        if args.fixed_common:
+            raise ValueError("--fixed-common is not used in multi-cell mode.")
     if not args.skip_preparation:
         print("Checking/building CCP continuation sequences")
         prepare_fitloans_ccp_sequences(processes=args.ccp_processes)
@@ -172,25 +195,42 @@ def main():
         UNCAPPED_EDUCATION_CELL_MAXITER if args.no_maxiter else args.maxiter
     )
 
-    result, _ = estimate_budget_shock_education_cell(
-        education=args.education,
-        program_year=args.program_year,
-        specification=args.specification,
-        type_integration=args.type_integration,
-        moment_spec=args.moment_spec,
-        primary_moment_weight=args.primary_moment_weight,
-        resource_mode=args.resource_mode,
-        shock_heterogeneity=args.heterogeneity,
-        draws=args.draws,
-        n_sample=args.n_sample,
-        maxiter=maxiter,
-        seed=args.seed,
-        save=args.save,
-        initial=initial,
-        fixed_common=fixed_common,
-        ccp_workers=args.ccp_workers,
-        ccp_cache_mode=args.ccp_cache_mode,
-    )
+    if multi_cell:
+        result, _ = estimate_budget_shock_education_cells(
+            education=args.education,
+            program_years=args.program_years,
+            moment_spec=args.moment_spec,
+            primary_moment_weight=args.primary_moment_weight,
+            resource_mode=args.resource_mode,
+            draws=args.draws,
+            n_sample=args.n_sample,
+            maxiter=maxiter,
+            seed=args.seed,
+            save=args.save,
+            initial=initial,
+            ccp_workers=args.ccp_workers,
+            ccp_cache_mode=args.ccp_cache_mode,
+        )
+    else:
+        result, _ = estimate_budget_shock_education_cell(
+            education=args.education,
+            program_year=args.program_year,
+            specification=args.specification,
+            type_integration=args.type_integration,
+            moment_spec=args.moment_spec,
+            primary_moment_weight=args.primary_moment_weight,
+            resource_mode=args.resource_mode,
+            shock_heterogeneity=args.heterogeneity,
+            draws=args.draws,
+            n_sample=args.n_sample,
+            maxiter=maxiter,
+            seed=args.seed,
+            save=args.save,
+            initial=initial,
+            fixed_common=fixed_common,
+            ccp_workers=args.ccp_workers,
+            ccp_cache_mode=args.ccp_cache_mode,
+        )
     print("\nOptimization finished")
     print("success:", result.success)
     print("message:", result.message)

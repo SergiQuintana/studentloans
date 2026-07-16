@@ -30,6 +30,7 @@ EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
 LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
 PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 14
 PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE = 18
+PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL = 10
 BUDGET_RESOURCE_SCALE = 10000.0
 
 
@@ -189,6 +190,67 @@ def unpack_parental_income_estimation_vector(
     }
 
 
+def unpack_parental_income_multicell_estimation_vector(
+    vector: np.ndarray,
+    periods,
+    index_kind: str = "education_cell",
+) -> dict[str, Any]:
+    """Map cell-specific parameters plus common risk aversion to one bundle.
+
+    Each education cell contributes ten free parameters in this order: four
+    parental-income shock means, one shock sigma, four parental-income debt
+    penalty levels, and one pre-choice-resource slope.  The final four entries
+    are parental-income risk-aversion levels, estimated once and shared by all
+    education cells.
+    """
+    vector = np.asarray(vector, dtype=np.float64).reshape(-1)
+    periods = np.asarray(periods, dtype=np.int64).reshape(-1)
+    block_size = PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL * periods.size
+    expected = block_size + N_RISK_PARAMETERS
+    if periods.size < 2:
+        raise ValueError("The multicell parameterization requires at least two cells.")
+    if np.unique(periods).size != periods.size:
+        raise ValueError("Multicell education-cell codes must be unique.")
+    if vector.size != expected:
+        raise ValueError(
+            f"Multicell parental-income vector has {vector.size} entries; "
+            f"expected {expected}."
+        )
+    shared_risk_aversion = vector[block_size:]
+    index_kind = str(index_kind)
+    if index_kind not in INDEX_KINDS:
+        raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
+
+    blocks = vector[:block_size].reshape(
+        periods.size, PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+    )
+    mean_levels = blocks[:, 0:4]
+    debt_levels = blocks[:, 5:9]
+    mu_blocks = np.zeros((periods.size, N_MEAN_PARAMETERS), dtype=np.float64)
+    mu_blocks[:, 0] = mean_levels[:, 0]
+    mu_blocks[:, 1:4] = mean_levels[:, 1:4] - mean_levels[:, [0]]
+    debt_coefficients = np.empty(
+        (periods.size, N_DEBT_PENALTY_PARAMETERS), dtype=np.float64
+    )
+    debt_coefficients[:, 0] = debt_levels[:, 0]
+    debt_coefficients[:, 1:4] = debt_levels[:, 1:4] - debt_levels[:, [0]]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "index_kind": index_kind,
+        "periods": periods,
+        "mu_blocks": mu_blocks,
+        "sigma_e": blocks[:, 4].copy(),
+        "risk_aversion": shared_risk_aversion.copy(),
+        "debt_pen_parinc": debt_coefficients,
+        "debt_pen_parameterization": DEBT_PENALTY_PARAMETERIZATION,
+        "loan_heterogeneity": "homogeneous",
+        "loan_mean_shift": np.zeros(periods.size, dtype=np.float64),
+        "loan_log_sigma_ratio": np.zeros(periods.size, dtype=np.float64),
+        "budget_resource_slope": blocks[:, 9].copy(),
+        "estimation_parameterization": "parental_income_basic_multicell_shared_risk",
+    }
+
+
 def unpack_parental_income_loan_type_estimation_vector(
     vector: np.ndarray,
     periods,
@@ -259,8 +321,13 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("mu_blocks must have shape (number of periods, 7)")
     if out["sigma_e"].shape != (p,) or np.any(out["sigma_e"] <= 0):
         raise ValueError("sigma_e must contain one positive value per period")
-    if out["debt_pen_parinc"].shape not in ((3,), (N_DEBT_PENALTY_PARAMETERS,)):
-        raise ValueError("debt_pen_parinc must have three legacy or four current entries")
+    if out["debt_pen_parinc"].shape not in (
+        (3,), (N_DEBT_PENALTY_PARAMETERS,), (p, N_DEBT_PENALTY_PARAMETERS),
+    ):
+        raise ValueError(
+            "debt_pen_parinc must have three legacy entries, four current "
+            "entries, or one four-entry row per support point"
+        )
     if "risk_aversion" in out and out["risk_aversion"].shape != (N_RISK_PARAMETERS,):
         raise ValueError("risk_aversion must have four entries")
     if (
