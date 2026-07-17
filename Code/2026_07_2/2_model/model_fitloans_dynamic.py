@@ -23,10 +23,11 @@ import joblib
 import os
 import hashlib
 import json
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from numba import get_num_threads, njit, prange
+from numba import get_num_threads, njit, prange, set_num_threads
 from scipy.optimize import dual_annealing, minimize
 
 from model_em_algorithm import (
@@ -78,6 +79,9 @@ beta = 0.98
 
 debt_range = get_debt_range()
 _EM_POSTERIORS = None
+_CELL_WORKER_CONTEXTS = None
+_CELL_WORKER_MOMENT_SPEC = None
+_CELL_WORKER_PRIMARY_WEIGHT = None
 DEFAULT_CCP_WORKERS = max(1, min(16, os.cpu_count() or 1))
 CCP_CACHE_MODES = ("off", "reuse", "rebuild")
 CCP_CELL_CACHE_SCHEMA = 1
@@ -2355,8 +2359,41 @@ def _evaluate_sampled_parental_income_cell(
     return loss, simulated, sim_new_share, spec
 
 
+def _initialize_cell_smm_worker(
+    contexts, moment_spec, primary_moment_weight, numba_threads,
+):
+    """Keep prepared cell data resident in each persistent SMM worker."""
+    global _CELL_WORKER_CONTEXTS
+    global _CELL_WORKER_MOMENT_SPEC
+    global _CELL_WORKER_PRIMARY_WEIGHT
+    _CELL_WORKER_CONTEXTS = contexts
+    _CELL_WORKER_MOMENT_SPEC = moment_spec
+    _CELL_WORKER_PRIMARY_WEIGHT = float(primary_moment_weight)
+    set_num_threads(int(numba_threads))
+
+
+def _evaluate_cell_smm_worker(task):
+    """Evaluate one education cell for one common parameter proposal."""
+    cell_index, block, shared_risk, shared_debt = task
+    context = _CELL_WORKER_CONTEXTS[cell_index]
+    full_params = np.concatenate(
+        (block[0:5], shared_risk, shared_debt, block[5:6])
+    )
+    loss, simulated, sim_new_share, _ = _evaluate_sampled_parental_income_cell(
+        full_params,
+        context["data_moments"],
+        context["sample_by_period"],
+        context["cell_code"],
+        int(context["education"]),
+        int(context["program_year"]),
+        _CELL_WORKER_MOMENT_SPEC,
+        _CELL_WORKER_PRIMARY_WEIGHT,
+    )
+    return cell_index, loss, simulated, sim_new_share
+
+
 def minimize_distance_education_cells_parental_income(
-    params, contexts, moment_spec, primary_moment_weight,
+    params, contexts, moment_spec, primary_moment_weight, cell_pool=None,
 ):
     """Joint multi-cell loss with risk aversion shared across cells."""
     global EVAL_COUNTER
@@ -2366,27 +2403,36 @@ def minimize_distance_education_cells_parental_income(
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
     shared_risk = params[n_cells * block_size:n_cells * block_size + 4]
     shared_debt = params[n_cells * block_size + 4:n_cells * block_size + 8]
-    total_loss = 0.0
-    evaluations = []
-    for cell_index, context in enumerate(contexts):
-        education = int(context["education"])
-        program_year = int(context["program_year"])
+    tasks = []
+    for cell_index in range(n_cells):
         block = params[cell_index * block_size:(cell_index + 1) * block_size]
-        full_params = np.concatenate((block[0:5], shared_risk, shared_debt, block[5:6]))
-        loss, simulated, sim_new_share, spec = (
-            _evaluate_sampled_parental_income_cell(
-                full_params,
-                context["data_moments"],
-                context["sample_by_period"],
-                context["cell_code"],
-                education,
-                program_year,
-                moment_spec,
-                primary_moment_weight,
+        tasks.append((cell_index, block, shared_risk, shared_debt))
+
+    if cell_pool is None:
+        results = []
+        for cell_index, block, risk, debt_penalty in tasks:
+            context = contexts[cell_index]
+            full_params = np.concatenate(
+                (block[0:5], risk, debt_penalty, block[5:6])
             )
-        )
-        total_loss += loss
-        evaluations.append((loss, simulated, sim_new_share, spec, block, context))
+            loss, simulated, sim_new_share, _ = (
+                _evaluate_sampled_parental_income_cell(
+                    full_params,
+                    context["data_moments"],
+                    context["sample_by_period"],
+                    context["cell_code"],
+                    int(context["education"]),
+                    int(context["program_year"]),
+                    moment_spec,
+                    primary_moment_weight,
+                )
+            )
+            results.append((cell_index, loss, simulated, sim_new_share))
+    else:
+        results = cell_pool.map(_evaluate_cell_smm_worker, tasks, chunksize=1)
+
+    results.sort(key=lambda item: item[0])
+    total_loss = float(sum(item[1] for item in results))
 
     if EVAL_COUNTER % 10 == 0:
         print("\n" + "#" * 132)
@@ -2397,10 +2443,13 @@ def minimize_distance_education_cells_parental_income(
         )
         print(f"shared debt penalties={np.round(shared_debt, 4)}")
         print("#" * 132)
-        for context, evaluation in zip(contexts, evaluations):
+        for context, evaluation in zip(contexts, results):
             education = int(context["education"])
             program_year = int(context["program_year"])
-            loss, simulated, sim_new_share, spec, block, context = evaluation
+            cell_index, loss, simulated, sim_new_share = evaluation
+            block = params[
+                cell_index * block_size:(cell_index + 1) * block_size
+            ]
             print(f"EDUCATION {education}, PROGRAM YEAR {program_year}; cell loss={loss:.6f}")
             _print_parental_income_fit(
                 context["data_moments"], simulated,
@@ -2414,7 +2463,7 @@ def minimize_distance_education_cells_parental_income(
                 "pre-choice-resource slope ($ shock per $10,000 resources):",
                 round(float(block[5]), 4),
             )
-            if float(spec["sigma_e"][0]) <= 1.000001:
+            if float(block[4]) <= 1.000001:
                 print("WARNING: cell budget-shock sigma is at its lower bound (1.0).")
     return total_loss
 
@@ -2868,7 +2917,8 @@ def fit_education_cells(
     seed=12345, initial=None, moment_spec="fast_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated", optimizer="nelder-mead",
-    annealing_maxfun=2000, education_cells=None,
+    annealing_maxfun=500, education_cells=None, cell_workers=None,
+    cell_numba_threads=1,
 ):
     """Jointly estimate several education cells with common risk aversion.
 
@@ -2897,10 +2947,14 @@ def fit_education_cells(
     if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
         raise ValueError("primary_moment_weight must be positive and finite.")
     optimizer = str(optimizer).lower()
-    if optimizer not in ("nelder-mead", "dual-annealing"):
-        raise ValueError("optimizer must be nelder-mead or dual-annealing.")
+    if optimizer not in ("nelder-mead", "dual-annealing", "hybrid"):
+        raise ValueError(
+            "optimizer must be nelder-mead, dual-annealing, or hybrid."
+        )
     if int(annealing_maxfun) <= 0:
         raise ValueError("annealing_maxfun must be positive.")
+    if int(cell_numba_threads) <= 0:
+        raise ValueError("cell_numba_threads must be positive.")
     for cell in cells:
         if not packs_by_cell.get(cell):
             raise ValueError(f"No observations were found for education cell {cell}.")
@@ -3004,42 +3058,95 @@ def fit_education_cells(
     bounds.extend([(0.1001, 2.9999)] * 4)
     bounds.extend([(-1.0e6, 0.0)] * 4)
 
-    initial_simplex = np.tile(initial, (initial.size + 1, 1))
-    for parameter_index, value in enumerate(initial):
-        initial_simplex[parameter_index + 1, parameter_index] = (
-            1.05 * value if value != 0.0 else 0.00025
+    def make_initial_simplex(center):
+        center = np.asarray(center, dtype=np.float64)
+        simplex = np.tile(center, (center.size + 1, 1))
+        for parameter_index, value in enumerate(center):
+            simplex[parameter_index + 1, parameter_index] = (
+                1.05 * value if value != 0.0 else 0.00025
+            )
+        for cell_index in range(n_cells):
+            slope_index = cell_index * block_size + 5
+            if center[slope_index] == 0.0:
+                simplex[slope_index + 1, slope_index] = 100.0
+        return simplex
+
+    if cell_workers is None:
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except AttributeError:
+            available_cpus = os.cpu_count() or 1
+        cell_workers = min(n_cells, available_cpus)
+    cell_workers = max(1, min(int(cell_workers), n_cells))
+    cell_pool = None
+    if cell_workers > 1 and "fork" in mp.get_all_start_methods():
+        fork_context = mp.get_context("fork")
+        cell_pool = fork_context.Pool(
+            processes=cell_workers,
+            initializer=_initialize_cell_smm_worker,
+            initargs=(
+                contexts, moment_spec, primary_moment_weight,
+                int(cell_numba_threads),
+            ),
         )
-    for cell_index in range(n_cells):
-        slope_index = cell_index * block_size + 5
-        if initial[slope_index] == 0.0:
-            initial_simplex[slope_index + 1, slope_index] = 100.0
-    objective_args = (
-        contexts, moment_spec, primary_moment_weight,
-    )
-    print(f"[multi-cell optimizer] {optimizer}")
-    if optimizer == "dual-annealing":
-        result = dual_annealing(
-            minimize_distance_education_cells_parental_income,
-            bounds=bounds,
-            args=objective_args,
-            x0=initial,
-            maxiter=int(maxiter),
-            maxfun=int(annealing_maxfun),
-            seed=int(seed),
-            no_local_search=True,
+        print(
+            f"[parallel SMM cells] {cell_workers} persistent processes; "
+            f"{int(cell_numba_threads)} Numba thread(s) per process"
         )
     else:
-        result = minimize(
-            minimize_distance_education_cells_parental_income,
-            initial,
-            args=objective_args,
-            method="Nelder-Mead",
-            bounds=bounds,
-            options={
-                "maxiter": int(maxiter), "disp": True,
-                "initial_simplex": initial_simplex,
-            },
-        )
+        print("[parallel SMM cells] disabled; using serial cell evaluation")
+
+    objective_args = (
+        contexts, moment_spec, primary_moment_weight, cell_pool,
+    )
+    print(f"[multi-cell optimizer] {optimizer}")
+    try:
+        annealing_result = None
+        if optimizer in ("dual-annealing", "hybrid"):
+            annealing_result = dual_annealing(
+                minimize_distance_education_cells_parental_income,
+                bounds=bounds,
+                args=objective_args,
+                x0=initial,
+                maxiter=int(maxiter),
+                maxfun=int(annealing_maxfun),
+                seed=int(seed),
+                no_local_search=True,
+            )
+            print(
+                f"[annealing finished] loss={annealing_result.fun:.6f}; "
+                f"evaluations={annealing_result.nfev}"
+            )
+
+        if optimizer == "dual-annealing":
+            result = annealing_result
+        else:
+            local_start = (
+                annealing_result.x if optimizer == "hybrid" else initial
+            )
+            result = minimize(
+                minimize_distance_education_cells_parental_income,
+                local_start,
+                args=objective_args,
+                method="Nelder-Mead",
+                bounds=bounds,
+                options={
+                    "maxiter": int(maxiter), "disp": True,
+                    "initial_simplex": make_initial_simplex(local_start),
+                },
+            )
+            if annealing_result is not None:
+                result.annealing_x = annealing_result.x.copy()
+                result.annealing_fun = float(annealing_result.fun)
+                result.annealing_nfev = int(annealing_result.nfev)
+                result.total_nfev = int(annealing_result.nfev + result.nfev)
+    finally:
+        if cell_pool is not None:
+            cell_pool.close()
+            cell_pool.join()
+    result.smm_optimizer = optimizer
+    result.smm_cell_workers = int(cell_workers)
+    result.smm_cell_numba_threads = int(cell_numba_threads)
     return result, data_summaries
 
 # ==============================================================================
@@ -3155,7 +3262,9 @@ def estimate_budget_shock_education_cells(
     save=False,
     initial=None,
     optimizer="nelder-mead",
-    annealing_maxfun=2000,
+    annealing_maxfun=500,
+    cell_workers=None,
+    cell_numba_threads=1,
     ccp_workers=DEFAULT_CCP_WORKERS,
     ccp_cache_mode="reuse",
 ):
@@ -3188,6 +3297,8 @@ def estimate_budget_shock_education_cells(
         resource_mode=resource_mode,
         optimizer=optimizer,
         annealing_maxfun=annealing_maxfun,
+        cell_workers=cell_workers,
+        cell_numba_threads=cell_numba_threads,
     )
     if save:
         cell_codes = [
@@ -3221,6 +3332,8 @@ def estimate_budget_shock_education_cells(
                 "smm_debt_penalties_shared_across_cells": True,
                 "smm_optimizer": optimizer,
                 "smm_annealing_maxfun": int(annealing_maxfun),
+                "smm_cell_workers": int(result.smm_cell_workers),
+                "smm_cell_numba_threads": int(result.smm_cell_numba_threads),
             },
         )
     return result, data_summary
@@ -3252,8 +3365,8 @@ def estimate_budget_shock_all_education(
     n_sample=None,
     maxiter=1000,
     seed=12345,
-    optimizer="dual-annealing",
-    annealing_maxfun=2000,
+    optimizer="hybrid",
+    annealing_maxfun=500,
     moment_spec="fast_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
@@ -3261,6 +3374,8 @@ def estimate_budget_shock_all_education(
     restart=True,
     ccp_workers=DEFAULT_CCP_WORKERS,
     ccp_cache_mode="off",
+    cell_workers=None,
+    cell_numba_threads=1,
 ):
     """Production SMM over every observed 2y, 4y, and graduate cell."""
     cells = discover_observed_education_cells()
@@ -3315,6 +3430,8 @@ def estimate_budget_shock_all_education(
         resource_mode=resource_mode,
         optimizer=optimizer,
         annealing_maxfun=annealing_maxfun,
+        cell_workers=cell_workers,
+        cell_numba_threads=cell_numba_threads,
     )
     save_budgetshock_estimates(
         result.x,
@@ -3339,6 +3456,8 @@ def estimate_budget_shock_all_education(
             "smm_debt_penalties_shared_across_cells": True,
             "smm_optimizer": optimizer,
             "smm_annealing_maxfun": int(annealing_maxfun),
+            "smm_cell_workers": int(result.smm_cell_workers),
+            "smm_cell_numba_threads": int(result.smm_cell_numba_threads),
         },
     )
     return result, data_summary

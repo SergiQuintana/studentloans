@@ -114,9 +114,11 @@ get_budget = True
 # remain fixed. A deliberately small annealing budget keeps each NPL iteration
 # manageable; subsequent iterations restart from the saved production vector.
 BUDGET_SMM_DRAWS = 100
-BUDGET_SMM_ANNEALING_MAXFUN = 2000
+BUDGET_SMM_ANNEALING_MAXFUN = 500
 BUDGET_SMM_MAXITER = 1000
 BUDGET_SMM_CCP_WORKERS = 60
+BUDGET_SMM_CELL_WORKERS = None  # automatically one worker per cell, CPU permitting
+BUDGET_SMM_CELL_NUMBA_THREADS = 1
 
 if __name__ == '__main__':
     
@@ -161,7 +163,7 @@ if __name__ == '__main__':
         ms.simulate_all_states(T)
 
         conter = 0
-        maxdebt = False
+        maxdebt = True
         args = [
             (i, ms.invariant_states, debt_range, debt_range, ccp_real,
              utility_parameters[em_type], models, solution_mode, conter,
@@ -286,11 +288,13 @@ if __name__ == '__main__':
             estimate_budget_shock_all_education(
                 draws=BUDGET_SMM_DRAWS,
                 maxiter=BUDGET_SMM_MAXITER,
-                optimizer="dual-annealing",
+                optimizer="hybrid",
                 annealing_maxfun=BUDGET_SMM_ANNEALING_MAXFUN,
                 resource_mode="simulated",
                 restart=True,
                 ccp_workers=BUDGET_SMM_CCP_WORKERS,
+                cell_workers=BUDGET_SMM_CELL_WORKERS,
+                cell_numba_threads=BUDGET_SMM_CELL_NUMBA_THREADS,
                 # CCPs change at every NPL iteration. Production estimation
                 # must therefore read the newly constructed sequences rather
                 # than reuse the education-cell testing cache.
@@ -303,7 +307,7 @@ if __name__ == '__main__':
         print("Solve the model and the ccps")
         models = 0
         conter = 0
-        maxdebt = False
+        maxdebt = True
         pool_obj = multiprocessing.Pool(processes=60, initializer=ms.reload_budgetshock_params)
     
         args = [

@@ -100,15 +100,29 @@ def build_parser():
     )
     parser.add_argument(
         "--optimizer",
-        choices=("nelder-mead", "dual-annealing"),
+        choices=("nelder-mead", "dual-annealing", "hybrid"),
         default="nelder-mead",
-        help="Multi-cell optimizer; single-cell estimation retains Nelder-Mead.",
+        help=(
+            "Multi-cell optimizer; hybrid anneals first and then refines with "
+            "Nelder-Mead. Single-cell estimation retains Nelder-Mead."
+        ),
     )
     parser.add_argument(
         "--annealing-maxfun",
         type=int,
-        default=2000,
-        help="Maximum objective evaluations for --optimizer dual-annealing.",
+        default=500,
+        help=(
+            "Maximum annealing-stage objective evaluations for --optimizer "
+            "dual-annealing or hybrid."
+        ),
+    )
+    parser.add_argument(
+        "--cell-workers", type=int, default=None,
+        help="Persistent education-cell SMM workers; default uses one per cell.",
+    )
+    parser.add_argument(
+        "--cell-numba-threads", type=int, default=1,
+        help="Numba debt-solver threads inside each education-cell worker.",
     )
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--save", action="store_true")
@@ -155,6 +169,10 @@ def main():
         raise ValueError("--maxiter must be positive; use --no-maxiter for no practical cap.")
     if args.annealing_maxfun <= 0:
         raise ValueError("--annealing-maxfun must be positive.")
+    if args.cell_workers is not None and args.cell_workers <= 0:
+        raise ValueError("--cell-workers must be positive.")
+    if args.cell_numba_threads <= 0:
+        raise ValueError("--cell-numba-threads must be positive.")
     if not np.isfinite(args.primary_moment_weight) or args.primary_moment_weight <= 0.0:
         raise ValueError("--primary-moment-weight must be positive and finite.")
     if args.numba_threads is not None:
@@ -224,6 +242,8 @@ def main():
             initial=initial,
             optimizer=args.optimizer,
             annealing_maxfun=args.annealing_maxfun,
+            cell_workers=args.cell_workers,
+            cell_numba_threads=args.cell_numba_threads,
             ccp_workers=args.ccp_workers,
             ccp_cache_mode=args.ccp_cache_mode,
         )
