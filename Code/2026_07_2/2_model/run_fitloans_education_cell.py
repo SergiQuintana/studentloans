@@ -60,10 +60,10 @@ def build_parser():
     parser.add_argument(
         "--moment-spec",
         choices=PARENTAL_INCOME_MOMENT_SPECS,
-        default="fast_flow",
+        default="flow_plus_stock",
         help=(
-            "fast_flow targets mean, receipt share, standard deviation, and "
-            "p80 of positive annual new-loan flows."
+            "flow_plus_stock targets four annual-flow moments plus mean "
+            "positive stock and the stock indebtedness share."
         ),
     )
     parser.add_argument(

@@ -184,7 +184,7 @@ loan-type heterogeneity remains available but is not used by
 
 ## Active moments and loss
 
-Production currently uses `moment_spec="fast_flow"`. New annual borrowing is
+Production currently uses `moment_spec="flow_plus_stock"`. New annual borrowing is
 defined consistently in data and simulation as
 `b_next - (1 + interest_rate) * b_current`. For every education cell and
 parental-income group it targets:
@@ -192,14 +192,17 @@ parental-income group it targets:
 1. mean positive new-loan flow, conditional on receiving a new loan;
 2. share receiving a positive new-loan flow;
 3. standard deviation of positive new-loan flow;
-4. 80th percentile of positive new-loan flow.
+4. 80th percentile of positive new-loan flow;
+5. mean positive end-of-period debt stock;
+6. share with positive end-of-period debt stock.
 
 Each error is divided by the absolute data moment, with a small numerical
-floor. The first two moments receive weight 4 each; the dispersion moments
-receive weight 1 each. Parental-income groups themselves receive equal weight,
-regardless of their sample sizes. Stock-based `fast_stock` and the mixed
-`flow_stock` specification remain available for comparison, but are not the
-active production moments.
+floor. Flow mean and receipt share receive weight 4 each; flow standard
+deviation and p80 receive weight 1 each; stock mean and indebtedness share
+receive weight 2 each. Parental-income groups themselves receive equal weight,
+regardless of their sample sizes. The four-moment `fast_flow`, stock-based
+`fast_stock`, and mixed `flow_stock` specifications remain available for
+comparison, but are not the active production moments.
 
 Across education cells, the cell loss is weighted by enrolled observations:
 `N_cell / mean(N_cell)`. This gives more influence to education-year groups
@@ -208,8 +211,10 @@ inside a cell. Every printed fit block reports the cell's N, normalized weight,
 raw loss, and weighted contribution.
 
 The current objective therefore prioritizes the average positive new loan and
-the new-loan receipt share. Interest accumulation on existing debt is removed
-before determining whether an individual receives a new loan.
+the new-loan receipt share, while using stock mean and participation to
+discipline accumulated borrowing and persistence. Interest accumulation on
+existing debt is removed before determining whether an individual receives a
+new loan.
 
 Model fit is printed every ten objective evaluations for every education cell
 and parental-income group. Preserve these data/simulation comparisons when
@@ -309,8 +314,8 @@ must not change the working directory.
 
 ## Open questions; do not resolve without confirmation
 
-- Whether later specifications should reintroduce stock-based indebtedness or
-  debt persistence as additional moments alongside the active flow moments.
+- Whether later specifications should add more direct debt-persistence moments
+  beyond the active stock mean and indebtedness share.
 - Whether the present grouped education-year support should be revised after
   the joint estimates are evaluated.
 - Whether and how latent loan type should enter the structural budget process

@@ -97,7 +97,10 @@ EDUCATION_CELL_SPECIFICATIONS = (
     "parental_income_basic", "parental_income_loan_type", "joint_type",
 )
 TYPE_INTEGRATION_MODES = ("sampled", "exact")
-PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock", "fast_flow")
+PARENTAL_INCOME_MOMENT_SPECS = (
+    "fast_stock", "flow_stock", "fast_flow", "flow_plus_stock",
+)
+STOCK_MOMENT_WEIGHT = 2.0
 EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
 DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
@@ -696,7 +699,9 @@ def parental_income_distribution_moments(
     stock, and its 80th percentile. ``flow_stock`` keeps the stock share but
     uses positive annual loan flow for the other three distribution moments.
     ``fast_flow`` uses annual loan flow for all four moments, including the
-    share receiving a positive new loan.
+    share receiving a positive new loan. ``flow_plus_stock`` adds mean positive
+    end-of-period stock and the end-of-period indebtedness share to those four
+    flow moments.
 
     One-dimensional outcomes are ordinary simulated/data observations. Two-
     dimensional ``(16, N)`` outcomes require ``q`` and provide the retained
@@ -740,7 +745,10 @@ def parental_income_distribution_moments(
         total = w.sum()
         positive = values > 0.0
         positive_weight = w[positive].sum()
-        participation = flows if moment_spec == "fast_flow" else stocks
+        participation = (
+            flows if moment_spec in ("fast_flow", "flow_plus_stock")
+            else stocks
+        )
         share = (
             np.sum(w * (participation > 0.0)) / total
             if total > 0.0 else eps
@@ -764,6 +772,18 @@ def parental_income_distribution_moments(
                 else _weighted_quantile(positive_values, positive_weights, 0.80)
             )
         output.extend((mean, share, std, p80))
+        if moment_spec == "flow_plus_stock":
+            positive_stock = stocks > 0.0
+            positive_stock_weight = w[positive_stock].sum()
+            mean_positive_stock = (
+                np.sum(w[positive_stock] * stocks[positive_stock])
+                / positive_stock_weight
+                if positive_stock_weight > 0.0 else eps
+            )
+            stock_share = (
+                np.sum(w * positive_stock) / total if total > 0.0 else eps
+            )
+            output.extend((mean_positive_stock, stock_share))
         flow_share.append(np.sum(w * (flows > 0.0)) / total if total > 0.0 else np.nan)
         effective_weight.append(total)
         labels.append(level)
@@ -826,7 +846,9 @@ def parental_income_loan_type_distribution_moments(
             positive = distribution_values > 0.0
             positive_weight = weights[positive].sum()
             participation_values = (
-                flow_values if moment_spec == "fast_flow" else stock_values
+                flow_values
+                if moment_spec in ("fast_flow", "flow_plus_stock")
+                else stock_values
             )
             share = (
                 np.sum(weights * (participation_values > 0.0)) / total
@@ -846,6 +868,20 @@ def parental_income_loan_type_distribution_moments(
                 std = np.sqrt(max(float(variance), 0.0))
                 p80 = _weighted_quantile(positive_values, positive_weights, 0.80)
             output.extend((mean, share, std, p80))
+            if moment_spec == "flow_plus_stock":
+                positive_stock = stock_values > 0.0
+                positive_stock_weight = weights[positive_stock].sum()
+                mean_positive_stock = (
+                    np.sum(
+                        weights[positive_stock] * stock_values[positive_stock]
+                    ) / positive_stock_weight
+                    if positive_stock_weight > 0.0 else eps
+                )
+                stock_share = (
+                    np.sum(weights * positive_stock) / total
+                    if total > 0.0 else eps
+                )
+                output.extend((mean_positive_stock, stock_share))
             flow_share.append(
                 np.sum(weights * (flow_values > 0.0)) / total
                 if total > 0.0 else np.nan
@@ -2086,12 +2122,53 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
     print("=" * 112 + "\n")
 
 
+def parental_income_moment_weight_pattern(moment_spec, primary_moment_weight):
+    """Within-parinc SMM weights in the exact moment-output ordering."""
+    base = [primary_moment_weight, primary_moment_weight, 1.0, 1.0]
+    if moment_spec == "flow_plus_stock":
+        base.extend((STOCK_MOMENT_WEIGHT, STOCK_MOMENT_WEIGHT))
+    return np.asarray(base, dtype=np.float64)
+
+
 def _print_parental_income_fit(
     data, simulated, data_new_share, sim_new_share, weights, labels, loss,
     moment_spec, primary_moment_weight,
 ):
     print("\n" + "=" * 132)
     print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    if moment_spec == "flow_plus_stock":
+        print(
+            " loss weights per parinc group: "
+            f"flow mean={primary_moment_weight:g}, flow receipt "
+            f"share={primary_moment_weight:g}, flow std=1, flow p80=1, "
+            f"stock mean={STOCK_MOMENT_WEIGHT:g}, stock indebted "
+            f"share={STOCK_MOMENT_WEIGHT:g}"
+        )
+        print(
+            " parinc | mean positive flow: data/sim/diff | share new-flow>0: "
+            "data/sim/diff | std positive flow: data/sim/diff | "
+            "p80 positive flow: data/sim/diff | mean positive stock: "
+            "data/sim/diff | share end-stock>0: data/sim/diff"
+        )
+        for row, parinc in enumerate(labels):
+            m = 6 * row
+            pieces = []
+            for offset, numeric_format in (
+                (0, "8.2f"), (1, "6.4f"), (2, "8.2f"),
+                (3, "8.2f"), (4, "8.2f"), (5, "6.4f"),
+            ):
+                pieces.append(
+                    f"{data[m+offset]:{numeric_format}}/"
+                    f"{simulated[m+offset]:{numeric_format}}/"
+                    f"{simulated[m+offset]-data[m+offset]:+8.2f}"
+                )
+            print(f"   {parinc:>2}   | " + " | ".join(pieces))
+        print(" cell observation weights: " + ", ".join(
+            f"parinc {level}: {weights[row]:.1f}"
+            for row, level in enumerate(labels)
+        ))
+        print("=" * 132 + "\n")
+        return
     share_name = (
         "share new-flow>0" if moment_spec == "fast_flow"
         else "share end-stock>0"
@@ -2139,6 +2216,33 @@ def _print_parental_income_loan_type_fit(
 ):
     print("\n" + "=" * 144)
     print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    if moment_spec == "flow_plus_stock":
+        print(
+            " TARGETED LOAN-TYPE MOMENTS; weights: "
+            f"flow mean={primary_moment_weight:g}, flow receipt "
+            f"share={primary_moment_weight:g}, flow std=1, flow p80=1, "
+            f"stock mean={STOCK_MOMENT_WEIGHT:g}, stock indebted "
+            f"share={STOCK_MOMENT_WEIGHT:g}"
+        )
+        print(
+            " loan type | parinc | flow mean | flow receipt share | flow std | "
+            "flow p80 | stock mean | stock indebted share"
+        )
+        for row, (loan_type, parinc) in enumerate(labels):
+            m = 6 * row
+            type_name = "low" if loan_type == 0 else "high"
+            pieces = [
+                f"{data[m+k]:.4f}/{simulated[m+k]:.4f}/"
+                f"{simulated[m+k]-data[m+k]:+.4f}"
+                for k in range(6)
+            ]
+            print(
+                f" {type_name:>9} |   {parinc:>2}   | "
+                + " | ".join(pieces)
+                + f" (weight={weights[row]:.1f})"
+            )
+        print("=" * 144 + "\n")
+        return
     share_name = (
         "share new-flow>0" if moment_spec == "fast_flow"
         else "share end-stock>0"
@@ -2325,7 +2429,7 @@ def _evaluate_sampled_parental_income_cell(
     full_params, data_moments, sample_by_period, cell_code, education,
     program_year, moment_spec, primary_moment_weight,
 ):
-    """Evaluate one cell's 16 moments without changing the global counter."""
+    """Evaluate one cell's parental-income moments without a global count."""
     spec = bs.unpack_parental_income_estimation_vector(
         full_params, [cell_code], index_kind="education_cell"
     )
@@ -2362,7 +2466,10 @@ def _evaluate_sampled_parental_income_cell(
     valid = np.isfinite(data_moments) & np.isfinite(simulated)
     scale = np.maximum(np.abs(data_moments), 1.0e-6)
     moment_weights = np.tile(
-        np.array([primary_moment_weight, primary_moment_weight, 1.0, 1.0]), 4
+        parental_income_moment_weight_pattern(
+            moment_spec, primary_moment_weight
+        ),
+        4,
     )
     standardized_error = (simulated - data_moments) / scale
     loss = float(np.sum(moment_weights[valid] * standardized_error[valid] ** 2))
@@ -2691,11 +2798,12 @@ def minimize_distance_education_cell_parental_income(
     valid = np.isfinite(data_moments) & np.isfinite(simulated)
     scale = np.maximum(np.abs(data_moments), 1.0e-6)
     # Each parinc group contributes the same four standardized residuals,
-    # regardless of its sample size. Emphasize the two central debt targets
-    # (mean positive stock/flow and share with positive end stock) without
-    # changing any moment definition or simulated choice.
+    # regardless of its sample size. Moment weights are defined within each
+    # parental-income group and do not alter simulated choices.
     moment_weights = np.tile(
-        np.array([primary_moment_weight, primary_moment_weight, 1.0, 1.0]),
+        parental_income_moment_weight_pattern(
+            moment_spec, primary_moment_weight
+        ),
         len(labels),
     )
     standardized_error = (simulated - data_moments) / scale
@@ -2760,7 +2868,7 @@ def fit_education_cell(
     draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
     seed=12345, initial=None,
     fixed_common=None, specification="parental_income_basic",
-    type_integration="sampled", moment_spec="fast_flow",
+    type_integration="sampled", moment_spec="flow_plus_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
 ):
@@ -2939,7 +3047,7 @@ def fit_education_cell(
 def fit_education_cells(
     packs_by_program_year, education=2, program_years=(1, 2, 3, 4),
     draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
-    seed=12345, initial=None, moment_spec="fast_flow",
+    seed=12345, initial=None, moment_spec="flow_plus_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated", optimizer="nelder-mead",
     annealing_maxfun=500, education_cells=None, cell_workers=None,
@@ -2947,7 +3055,8 @@ def fit_education_cells(
 ):
     """Jointly estimate several education cells with common risk aversion.
 
-    All 16 parental-income moments from every cell enter the loss.  Each cell
+    Every selected parental-income moment from every cell enters the loss.
+    Under ``flow_plus_stock`` this is 24 moments per education cell. Each cell
     has its own four means, sigma, and resource slope. Four parental-income
     risk-aversion levels and four debt penalties are estimated once and shared.
     """
@@ -3245,7 +3354,7 @@ def estimate_budget_shock_education_cell(
     shock_heterogeneity="homogeneous",
     specification="parental_income_basic",
     type_integration="sampled",
-    moment_spec="fast_flow",
+    moment_spec="flow_plus_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
     draws=20,
@@ -3306,6 +3415,11 @@ def estimate_budget_shock_education_cell(
                 "smm_type_integration": type_integration,
                 "smm_moment_spec": moment_spec,
                 "smm_primary_moment_weight": float(primary_moment_weight),
+                "smm_within_parinc_moment_weights": (
+                    parental_income_moment_weight_pattern(
+                        moment_spec, primary_moment_weight
+                    )
+                ),
                 "smm_resource_mode": resource_mode,
                 "smm_draws": int(draws),
                 "smm_seed": int(seed),
@@ -3318,7 +3432,7 @@ def estimate_budget_shock_education_cell(
 def estimate_budget_shock_education_cells(
     education=2,
     program_years=(1, 2, 3, 4),
-    moment_spec="fast_flow",
+    moment_spec="flow_plus_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
     draws=20,
@@ -3393,6 +3507,11 @@ def estimate_budget_shock_education_cells(
                 "smm_type_integration": "sampled",
                 "smm_moment_spec": moment_spec,
                 "smm_primary_moment_weight": float(primary_moment_weight),
+                "smm_within_parinc_moment_weights": (
+                    parental_income_moment_weight_pattern(
+                        moment_spec, primary_moment_weight
+                    )
+                ),
                 "smm_resource_mode": resource_mode,
                 "smm_draws": int(draws),
                 "smm_seed": int(seed),
@@ -3450,7 +3569,7 @@ def estimate_budget_shock_all_education(
     seed=12345,
     optimizer="hybrid",
     annealing_maxfun=500,
-    moment_spec="fast_flow",
+    moment_spec="flow_plus_stock",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
     initial=None,
@@ -3538,6 +3657,11 @@ def estimate_budget_shock_all_education(
             "smm_type_integration": "sampled",
             "smm_moment_spec": moment_spec,
             "smm_primary_moment_weight": float(primary_moment_weight),
+            "smm_within_parinc_moment_weights": (
+                parental_income_moment_weight_pattern(
+                    moment_spec, primary_moment_weight
+                )
+            ),
             "smm_resource_mode": resource_mode,
             "smm_draws": int(draws),
             "smm_seed": int(seed),

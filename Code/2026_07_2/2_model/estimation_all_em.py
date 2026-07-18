@@ -290,7 +290,7 @@ if __name__ == '__main__':
                 maxiter=BUDGET_SMM_MAXITER,
                 optimizer="hybrid",
                 annealing_maxfun=BUDGET_SMM_ANNEALING_MAXFUN,
-                moment_spec="fast_flow",
+                moment_spec="flow_plus_stock",
                 resource_mode="simulated",
                 restart=True,
                 ccp_workers=BUDGET_SMM_CCP_WORKERS,
