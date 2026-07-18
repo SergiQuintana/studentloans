@@ -52,6 +52,14 @@ from model_interpolate_terminal import build_interpolator_dictionary
 
 from config import DIR, OUT, EST, RDATA, ENSURE_DIR
 import budget_shock as bs
+from debt_limits import (
+    CONSUMPTION_FLOOR,
+    INTEREST_RATE,
+    get_annual_cap_by_stage,
+    get_lifetime_cap_by_stage,
+    nearest_grid_index,
+    precompute_smm_bounds_indices,
+)
 from financial_process import (
     load_auxiliary_financial_process,
     draw_grants_vectorized,
@@ -74,7 +82,7 @@ PATH_EST        = DIR["MODEL_ESTIMATES"]
 PATH_CONT_FINAL = DIR["MODEL_CONTINUATION_FINAL"]
 
 T = 10
-r = 0.05
+r = INTEREST_RATE
 beta = 0.98
 
 debt_range = get_debt_range()
@@ -494,6 +502,7 @@ def load_education_cell_ccp(
         "period": int(period),
         "education": int(education),
         "program_year": int(program_year),
+        "education_year_grouping": bs.BUDGET_EDUCATION_YEAR_GROUPING,
         "type_ids": list(TYPE_IDS),
         "shape": [len(TYPE_IDS), int(len(x1)), int(debt_range.size)],
         "data_fingerprint": _hash_arrays(x1, state, choices),
@@ -552,8 +561,8 @@ def load_education_cell(
     if len(set(lengths.values())) != 1:
         raise ValueError(f"Education-cell inputs are misaligned in period {period}: {lengths}")
 
-    cell_code = bs.education_cell_code(education, program_year)
-    observed_code = bs.education_cell_from_state(state, education)
+    cell_code = bs.budget_education_cell_code(education, program_year)
+    observed_code = bs.budget_education_cell_from_state(state, education)
     cell = (
         (choices[:, 1].astype(np.int64) == int(education))
         & (observed_code == cell_code)
@@ -1136,11 +1145,8 @@ def get_range_number(b, maxdebt):
     value = np.zeros(b.shape[0])
     value2 = np.zeros(b.shape[0])
     for i in range(b.shape[0]):
-        diff = (debt_range - b[i]) ** 2
-        value[i] = np.argmin(diff)
-
-        diff2 = (debt_range - maxdebt[i]) ** 2
-        value2[i] = np.argmin(diff2)
+        value[i] = nearest_grid_index(debt_range, b[i])
+        value2[i] = nearest_grid_index(debt_range, maxdebt[i])
     return value, value2
 
 @njit()
@@ -1152,36 +1158,8 @@ def minimum_debt_maxdebt(u, b, maxdebt):
     return u
 
 @njit()
-def get_annual_cap_by_stage(educ_choice, twoy_exp, foury_exp):
-    cap = 0.0
-    if educ_choice == 1:
-        if twoy_exp <= 0:
-            cap = 8391
-        elif twoy_exp == 1:
-            cap = 9309
-        else:
-            cap = 12581
-    elif educ_choice == 2:
-        if foury_exp <= 0:
-            cap = 8391
-        elif foury_exp == 1:
-            cap = 9309
-        else:
-            cap = 12581
-    elif educ_choice == 3:
-        cap = 23222
-    return cap
-
-@njit()
-def get_lifetime_cap_by_stage(educ_choice):
-    if educ_choice == 3:
-        return 150000
-    else:
-        return 70786
-
-@njit()
 def get_debt_rules(c, vjt, previousdebt, state, choices):
-    vjt[c < 2000] = -100000000
+    vjt[c < CONSUMPTION_FLOOR] = -100000000
 
     n = previousdebt.shape[0]
     maxdebt = np.empty(n, dtype=np.float64)
@@ -1239,7 +1217,7 @@ def solve_one_draw_debt_idx_terminal_only(
     ccp_path_row, terminal_row,
     b_idx, max_idx,
     beta_term,
-    c_floor=2000.0,
+    c_floor=CONSUMPTION_FLOOR,
     fallback_idx=99,
 ):
     """
@@ -1294,31 +1272,28 @@ def solve_one_draw_debt_idx_terminal_only(
 # ==============================================================================
 # Precompute bounds indices (speed)
 
-@njit(parallel=True, fastmath=True)
 def precompute_bounds_indices(previousdebt, state, choices):
-    n = previousdebt.shape[0]
-    maxdebt = np.empty(n, dtype=np.float64)
-
-    for i in prange(n):
-        educ_choice = int(choices[i, 1])
-        twoy_exp = int(state[i, 1])
-        foury_exp = int(state[i, 2])
-
-        annual_cap = get_annual_cap_by_stage(educ_choice, twoy_exp, foury_exp)
-        lifetime_cap = get_lifetime_cap_by_stage(educ_choice)
-
-        m = previousdebt[i] * (1.0 + r) + annual_cap
-        if m > lifetime_cap:
-            m = lifetime_cap
-        maxdebt[i] = m
-
-    b_idx, max_idx = get_range_number(previousdebt, maxdebt)
-    return b_idx.astype(np.int64), max_idx.astype(np.int64)
+    return precompute_smm_bounds_indices(
+        previousdebt, state, choices, debt_range, r
+    )
 
 # ==============================================================================
 # Objective
 
 EVAL_COUNTER = 0
+
+
+def discounted_explicit_horizon_debt_penalty(spec, x1, model_period):
+    """Present value of the common parinc flow penalty through period T-1.
+
+    This is the SMM shortcut for the recursively repeated flow penalty in the
+    Bellman solver. It deliberately excludes the terminal continuation at T.
+    """
+    flow_penalty = bs.debt_penalty(spec, x1).astype(np.float64)
+    multiplier = bs.explicit_debt_penalty_multiplier(
+        model_period, beta=beta, terminal_period=T
+    )
+    return np.ascontiguousarray(flow_penalty * multiplier, dtype=np.float64)
 
 def minimize_distance_multi(params, moments_data, sample_by_period, periods):
     """
@@ -1353,7 +1328,7 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
         max_idx = pack["max_idx"]
 
         # period-specific mu params
-        debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+        debtpen_i = discounted_explicit_horizon_debt_penalty(spec, x1, p)
         sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
         gi = x1[:, 0].astype(int) - 1
 
@@ -1387,7 +1362,7 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
                 b_idx=b_idx,
                 max_idx=max_idx,
                 beta_term=beta_term,
-                c_floor=2000.0,
+                c_floor=CONSUMPTION_FLOOR,
                 fallback_idx=99,
             )
 
@@ -1476,7 +1451,7 @@ def minimize_distance_multi_posterior(
         b_idx = pack["b_idx"]
         max_idx = pack["max_idx"]
 
-        debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+        debtpen_i = discounted_explicit_horizon_debt_penalty(spec, x1, p)
         sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
         parental_group = x1[:, 0].astype(int) - 1
         terminal = np.zeros((x1.shape[0], debt_range.size), dtype=np.float64)
@@ -1511,7 +1486,7 @@ def minimize_distance_multi_posterior(
                     b_idx=b_idx,
                     max_idx=max_idx,
                     beta_term=beta_term,
-                    c_floor=2000.0,
+                    c_floor=CONSUMPTION_FLOOR,
                     fallback_idx=debt_range.size - 1,
                 )
                 debt_by_type[type_index] = debt_range[debt_index]
@@ -1810,7 +1785,7 @@ def solve_all_draws_debt_idx_pooled(
     budget_by_draw, shock_by_draw, debt_grid,
     sigma_i, debtpen_i, ccp_path_row, terminal_row,
     b_idx, max_idx, beta_term_i,
-    c_floor=2000.0, fallback_idx=99,
+    c_floor=CONSUMPTION_FLOOR, fallback_idx=99,
 ):
     """Solve every sampled individual and simulation draw in one parallel call.
 
@@ -2012,6 +1987,13 @@ def prepare_education_cell_crns(
                 np.concatenate([pack["debt"] for pack in packs_in_order]),
                 dtype=np.float64,
             ),
+            "model_period": np.ascontiguousarray(
+                np.concatenate([
+                    np.full(len(pack["x1"]), int(pack["period"]), dtype=np.int64)
+                    for pack in packs_in_order
+                ]),
+                dtype=np.int64,
+            ),
             "loan_type": np.ascontiguousarray(
                 np.concatenate([pack["sampled_loan_type"] for pack in packs_in_order]),
                 dtype=np.int64,
@@ -2198,7 +2180,9 @@ def minimize_distance_education_cell(
                         pack["terminal_data"], spec["risk_aversion"][group_index], idx, cache
                     )
             sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
-            debtpen_i = bs.debt_penalty(spec, x1).astype(np.float64)
+            debtpen_i = discounted_explicit_horizon_debt_penalty(
+                spec, x1, period
+            )
             stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
             for type_index in range(N_TYPES):
                 shock = bs.realization(
@@ -2212,7 +2196,8 @@ def minimize_distance_education_cell(
                     debtpen_i=debtpen_i,
                     ccp_path_row=pack["ccp_by_type"][type_index],
                     terminal_row=terminal, b_idx=pack["b_idx"], max_idx=pack["max_idx"],
-                    beta_term=float(beta ** (T - period)), c_floor=2000.0,
+                    beta_term=float(beta ** (T - period)),
+                    c_floor=CONSUMPTION_FLOOR,
                     fallback_idx=debt_range.size - 1,
                 )
                 stock_by_type[type_index] = debt_range[debt_index]
@@ -2291,8 +2276,8 @@ def _pool_sampled_education_cell_evaluation(
             ),
         ), dtype=np.float64
     )
-    pooled["debtpen_i"] = np.ascontiguousarray(
-        bs.debt_penalty(spec, x1), dtype=np.float64
+    pooled["debtpen_i"] = discounted_explicit_horizon_debt_penalty(
+        spec, x1, pooled["model_period"]
     )
     pooled["shock"] = np.ascontiguousarray(
         bs.realization(
@@ -2333,7 +2318,7 @@ def _evaluate_sampled_parental_income_cell(
         b_idx=pooled["b_idx"],
         max_idx=pooled["max_idx"],
         beta_term_i=pooled["beta_term"],
-        c_floor=2000.0,
+        c_floor=CONSUMPTION_FLOOR,
         fallback_idx=debt_range.size - 1,
     )
     stock_by_draw = debt_range[debt_index_by_draw]
@@ -2432,7 +2417,9 @@ def minimize_distance_education_cells_parental_income(
         results = cell_pool.map(_evaluate_cell_smm_worker, tasks, chunksize=1)
 
     results.sort(key=lambda item: item[0])
-    total_loss = float(sum(item[1] for item in results))
+    total_loss = float(sum(
+        contexts[item[0]]["cell_weight"] * item[1] for item in results
+    ))
 
     if EVAL_COUNTER % 10 == 0:
         print("\n" + "#" * 132)
@@ -2450,7 +2437,17 @@ def minimize_distance_education_cells_parental_income(
             block = params[
                 cell_index * block_size:(cell_index + 1) * block_size
             ]
-            print(f"EDUCATION {education}, PROGRAM YEAR {program_year}; cell loss={loss:.6f}")
+            cell_weight = float(context["cell_weight"])
+            weighted_loss = cell_weight * loss
+            year_label = bs.budget_program_year_label(
+                education, program_year
+            )
+            print(
+                f"EDUCATION {education}, PROGRAM YEAR {year_label}; "
+                f"N={int(context['cell_observations'])}; "
+                f"cell weight={cell_weight:.4f}; raw loss={loss:.6f}; "
+                f"weighted contribution={weighted_loss:.6f}"
+            )
             _print_parental_income_fit(
                 context["data_moments"], simulated,
                 context["data_new_share"], sim_new_share,
@@ -2516,7 +2513,7 @@ def minimize_distance_education_cell_parental_income(
             b_idx=pooled["b_idx"],
             max_idx=pooled["max_idx"],
             beta_term_i=pooled["beta_term"],
-            c_floor=2000.0,
+            c_floor=CONSUMPTION_FLOOR,
             fallback_idx=debt_range.size - 1,
         )
         stock_by_draw = debt_range[debt_index_by_draw]
@@ -2589,7 +2586,9 @@ def minimize_distance_education_cell_parental_income(
             evaluation_by_period[period] = {
                 "terminal": terminal,
                 "sigma_i": sigma_i,
-                "debtpen_i": bs.debt_penalty(spec, x1).astype(np.float64),
+                "debtpen_i": discounted_explicit_horizon_debt_penalty(
+                    spec, x1, period
+                ),
             }
 
         for draw_index in range(draws):
@@ -2626,7 +2625,8 @@ def minimize_distance_education_cell_parental_income(
                             if type_specific_risk else evaluation["terminal"]
                         ),
                         b_idx=pack["b_idx"], max_idx=pack["max_idx"],
-                        beta_term=float(beta ** (T - period)), c_floor=2000.0,
+                        beta_term=float(beta ** (T - period)),
+                        c_floor=CONSUMPTION_FLOOR,
                         fallback_idx=debt_range.size - 1,
                     )
                     stock_by_type[type_index] = debt_range[debt_index]
@@ -2785,7 +2785,7 @@ def fit_education_cell(
             f"{draws * pooled_n:,} draw-individual problems per objective call"
         )
 
-    cell_code = bs.education_cell_code(education, program_year)
+    cell_code = bs.budget_education_cell_code(education, program_year)
     if specification in ("parental_income_basic", "parental_income_loan_type"):
         if shock_heterogeneity != "homogeneous":
             raise ValueError(
@@ -2927,14 +2927,23 @@ def fit_education_cells(
     risk-aversion levels and four debt penalties are estimated once and shared.
     """
     if education_cells is None:
-        program_years = tuple(int(year) for year in program_years)
+        program_years = tuple(dict.fromkeys(
+            int(bs.budget_program_year(education, year))
+            for year in program_years
+        ))
         cells = tuple((int(education), year) for year in program_years)
         packs_by_cell = {
             (int(education), year): packs_by_program_year[year]
             for year in program_years
         }
     else:
-        cells = tuple((int(educ), int(year)) for educ, year in education_cells)
+        cells = tuple(dict.fromkeys(
+            (
+                int(educ),
+                int(bs.budget_program_year(educ, year)),
+            )
+            for educ, year in education_cells
+        ))
         packs_by_cell = packs_by_program_year
     if len(cells) < 2 or len(set(cells)) != len(cells):
         raise ValueError("Multi-cell estimation requires at least two unique education cells.")
@@ -2965,7 +2974,9 @@ def fit_education_cells(
         pack for cell in cells for pack in packs_by_cell[cell]
     ]
     combined = assign_persistent_joint_types(combined, seed=seed)
-    assigned_by_code = {bs.education_cell_code(*cell): [] for cell in cells}
+    assigned_by_code = {
+        bs.budget_education_cell_code(*cell): [] for cell in cells
+    }
     for pack in combined:
         assigned_by_code[int(pack["cell_code"])].append(pack)
 
@@ -2973,7 +2984,7 @@ def fit_education_cells(
     contexts = []
     data_summaries = {}
     for education_value, year in cells:
-        cell_code = bs.education_cell_code(education_value, year)
+        cell_code = bs.budget_education_cell_code(education_value, year)
         packs = assigned_by_code[cell_code]
         summary = _pooled_observed_cell_moments(
             packs, specification="parental_income_basic", moment_spec=moment_spec
@@ -2990,6 +3001,10 @@ def fit_education_cells(
             sampled, draws=draws, seed=seed + 100000 * cell_code,
             type_integration="sampled", resource_mode=resource_mode,
         )
+        observed_n = sum(len(pack["x1"]) for pack in packs)
+        simulated_n = sum(
+            len(pack["x1"]) for pack in sample_by_period.values()
+        )
         data_moments, data_new_share, data_weights, labels = summary
         contexts.append({
             "cell_code": cell_code,
@@ -3000,12 +3015,31 @@ def fit_education_cells(
             "data_weights": data_weights,
             "labels": labels,
             "sample_by_period": sample_by_period,
+            "cell_observations": int(observed_n),
         })
-        pooled_n = sum(len(pack["x1"]) for pack in sample_by_period.values())
+        year_label = bs.budget_program_year_label(education_value, year)
         print(
-            f"[education {education_value}, program year {year}] "
-            f"{pooled_n:,} pooled observations; "
-            f"{draws * pooled_n:,} draw-individual problems per objective call"
+            f"[education {education_value}, program year {year_label}] "
+            f"{observed_n:,} observed enrolled observations; "
+            f"{simulated_n:,} simulated observations; "
+            f"{draws * simulated_n:,} draw-individual problems per objective call"
+        )
+    mean_cell_observations = float(np.mean([
+        context["cell_observations"] for context in contexts
+    ]))
+    for context in contexts:
+        context["cell_weight"] = (
+            context["cell_observations"] / mean_cell_observations
+        )
+    print("[education-cell loss weights: N_cell / mean(N)]")
+    for context in contexts:
+        year_label = bs.budget_program_year_label(
+            context["education"], context["program_year"]
+        )
+        print(
+            f"  education={context['education']} year={year_label}: "
+            f"N={context['cell_observations']:,}, "
+            f"weight={context['cell_weight']:.4f}"
         )
     print(f"[current resources] {resource_mode}")
     print(f"[parallel debt solver] {get_num_threads()} Numba threads")
@@ -3045,7 +3079,7 @@ def fit_education_cells(
             f"({block_size} per cell plus four shared risk-aversion and four "
             "shared debt-penalty levels)."
         )
-    cell_codes = [bs.education_cell_code(*cell) for cell in cells]
+    cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
     bs.unpack_parental_income_multicell_estimation_vector(
         initial, cell_codes, index_kind="education_cell"
     )
@@ -3147,6 +3181,12 @@ def fit_education_cells(
     result.smm_optimizer = optimizer
     result.smm_cell_workers = int(cell_workers)
     result.smm_cell_numba_threads = int(cell_numba_threads)
+    result.smm_cell_observations = np.asarray(
+        [context["cell_observations"] for context in contexts], dtype=np.int64
+    )
+    result.smm_cell_weights = np.asarray(
+        [context["cell_weight"] for context in contexts], dtype=np.float64
+    )
     return result, data_summaries
 
 # ==============================================================================
@@ -3199,6 +3239,7 @@ def estimate_budget_shock_education_cell(
     model periods, but each retains its period-specific CCP and terminal value.
     Set ``save=True`` only after validating the homogeneous benchmark.
     """
+    program_year = int(bs.budget_program_year(education, program_year))
     interp_dict = get_interp_dict_cached(force_rebuild=False)
     packs = []
     for period in range(1, T):
@@ -3220,7 +3261,7 @@ def estimate_budget_shock_education_cell(
         resource_mode=resource_mode,
     )
     if save:
-        cell_code = bs.education_cell_code(education, program_year)
+        cell_code = bs.budget_education_cell_code(education, program_year)
         if specification in ("parental_income_basic", "parental_income_loan_type"):
             prefix = (
                 f"budgetshock_educ{education}_year{program_year}_{specification}_"
@@ -3269,7 +3310,10 @@ def estimate_budget_shock_education_cells(
     ccp_cache_mode="reuse",
 ):
     """Estimate multiple program-year cells with shared risk aversion."""
-    program_years = tuple(int(year) for year in program_years)
+    program_years = tuple(dict.fromkeys(
+        int(bs.budget_program_year(education, year))
+        for year in program_years
+    ))
     interp_dict = get_interp_dict_cached(force_rebuild=False)
     packs_by_program_year = {year: [] for year in program_years}
     for year in program_years:
@@ -3302,7 +3346,8 @@ def estimate_budget_shock_education_cells(
     )
     if save:
         cell_codes = [
-            bs.education_cell_code(education, year) for year in program_years
+            bs.budget_education_cell_code(education, year)
+            for year in program_years
         ]
         years_label = "-".join(str(year) for year in program_years)
         prefix = (
@@ -3330,17 +3375,21 @@ def estimate_budget_shock_education_cells(
                 "smm_program_years": np.asarray(program_years, dtype=np.int64),
                 "smm_risk_aversion_shared_across_cells": True,
                 "smm_debt_penalties_shared_across_cells": True,
+                "smm_debt_penalty_timing": bs.DEBT_PENALTY_TIMING,
                 "smm_optimizer": optimizer,
                 "smm_annealing_maxfun": int(annealing_maxfun),
                 "smm_cell_workers": int(result.smm_cell_workers),
                 "smm_cell_numba_threads": int(result.smm_cell_numba_threads),
+                "smm_cell_weighting": "enrolled_observations_over_mean_cell_size",
+                "smm_cell_observations": result.smm_cell_observations.copy(),
+                "smm_cell_weights": result.smm_cell_weights.copy(),
             },
         )
     return result, data_summary
 
 
 def discover_observed_education_cells():
-    """Return all education-choice/program-year cells present in model data."""
+    """Return the fixed grouped education-year budget supports in model data."""
     cells = set()
     for period in range(1, T):
         _, state, _, _, choices, _ = load_data_superfeasible(
@@ -3352,12 +3401,21 @@ def discover_observed_education_cells():
             if not np.any(selected):
                 continue
             codes = np.unique(
-                bs.education_cell_from_state(state[selected], education)
+                bs.budget_education_cell_from_state(
+                    state[selected], education
+                )
             )
             cells.update(
                 (education, int(code - 100 * education)) for code in codes
             )
-    return tuple(sorted(cells))
+    expected = set(bs.BUDGET_EDUCATION_CELLS)
+    missing = expected.difference(cells)
+    if missing:
+        raise ValueError(
+            "The data do not contain all required grouped budget cells: "
+            f"{tuple(sorted(missing))}"
+        )
+    return bs.BUDGET_EDUCATION_CELLS
 
 
 def estimate_budget_shock_all_education(
@@ -3398,7 +3456,7 @@ def estimate_budget_shock_all_education(
                 )
                 packs_by_cell[(education, year)].append(pack)
 
-    cell_codes = [bs.education_cell_code(*cell) for cell in cells]
+    cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
     expected_size = (
         len(cells) * bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL + 8
     )
@@ -3416,6 +3474,13 @@ def estimate_budget_shock_all_education(
             if candidate.size == expected_size:
                 initial = candidate
                 print(f"[restart] Using production estimate {raw_path}")
+        if initial is None and current is not None:
+            print(
+                "[restart] Existing production budget vector is incompatible "
+                "with the grouped education-year support. Starting the new "
+                f"{expected_size}-parameter specification; canonical files "
+                "will be overwritten after successful estimation."
+            )
 
     result, data_summary = fit_education_cells(
         packs_by_cell,
@@ -3454,10 +3519,14 @@ def estimate_budget_shock_all_education(
             "smm_n_sample": None if n_sample is None else int(n_sample),
             "smm_risk_aversion_shared_across_cells": True,
             "smm_debt_penalties_shared_across_cells": True,
+            "smm_debt_penalty_timing": bs.DEBT_PENALTY_TIMING,
             "smm_optimizer": optimizer,
             "smm_annealing_maxfun": int(annealing_maxfun),
             "smm_cell_workers": int(result.smm_cell_workers),
             "smm_cell_numba_threads": int(result.smm_cell_numba_threads),
+            "smm_cell_weighting": "enrolled_observations_over_mean_cell_size",
+            "smm_cell_observations": result.smm_cell_observations.copy(),
+            "smm_cell_weights": result.smm_cell_weights.copy(),
         },
     )
     return result, data_summary

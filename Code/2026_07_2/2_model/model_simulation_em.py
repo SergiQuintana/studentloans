@@ -18,21 +18,37 @@ from numba import njit
 mu = 0
 gamma = 0.57721
 beta = 0.98
-r = 0.05
 T = 10 
 sigma_u = 1.4
-from model_solution_em import (
+from debt_limits import (
+    CONSUMPTION_FLOOR,
+    INTEREST_RATE,
     get_annual_cap_by_stage,
+    get_simulation_bounds_indices,
     get_lifetime_cap_by_stage,
     lower_bound_index,
     upper_bound_index,
 )
+r = INTEREST_RATE
 
 # Parameters for the wage equations:
 from pathlib import Path
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, LIK
 import budget_shock as bs
-from financial_process import load_education_grant_process, expected_grants_vectorized
+from financial_process import (
+    draw_grants_vectorized,
+    draw_transfers_vectorized,
+    expected_grants_vectorized,
+    expected_transfers_vectorized,
+    load_auxiliary_financial_process,
+)
+from latent_types import (
+    TYPE_GRANT,
+    TYPE_LOAN,
+    TYPE_TRANSFER,
+    draw_type_ids,
+    validate_q,
+)
 pathfunctions   = DIR["MODEL_FUNCOEF"]
 path_realdata   = DIR["MODEL_REALDATA"]
 path_estimates  = DIR["MODEL_ESTIMATES"]
@@ -66,14 +82,6 @@ def load_all_parameters():
     
     sigmas = np.load(f"{pathfunctions}/sigmas.npy")
     
-    # Grants
-    
-    grant_process = load_education_grant_process(pathfunctions)
-    
-    # Parental Transfers
-    
-    param_fam = np.load(f"{pathfunctions}/parental_transfers.npy")
-    
     # Graduation Probability
     
     grad_2 = np.load(f"{pathfunctions}/prob_grad_twoyear.npy")[...,None].T
@@ -82,7 +90,7 @@ def load_all_parameters():
     
     param_prob_grad = [grad_2,grad_4,grad_grad]
     
-    return wage_0, param_wage, sigmas, grant_process, param_fam, param_prob_grad
+    return wage_0, param_wage, sigmas, param_prob_grad
 
 def initial_state():
 
@@ -109,12 +117,17 @@ def get_types(x1,q,conterfactual,cohort):
     """
     
     if conterfactual == 0:
-    
-        types  = np.random.binomial(1, q[:,1], np.shape(q)[0]) +1
+        q = validate_q(q, n_individuals=np.shape(x1)[0])
+        types = draw_type_ids(q, np.random.random(np.shape(q)[0]))
         
         np.save(f"{OUT('types')}/types_{cohort}.npy", types)
     else:
-        types = np.load(f"{OUT('types')}/types_{cohort}.npy")
+        types = np.load(f"{OUT('types')}/types_{cohort}.npy").astype(np.int64)
+        if len(types) != np.shape(x1)[0]:
+            raise ValueError(
+                f"Saved cohort {cohort} types contain {len(types)} rows; "
+                f"expected {np.shape(x1)[0]}."
+            )
     return types
     
     
@@ -714,7 +727,7 @@ def move_debt_repayment(x1,x2,period,debt,j,conter):
         
     if conter == 0 :
         
-        paid = np.maximum(0,np.minimum(real_wage-2000,(1/periods)*debt_range[debt]*(1+r)))
+        paid = np.maximum(0,np.minimum(real_wage-CONSUMPTION_FLOOR,(1/periods)*debt_range[debt]*(1+r)))
     
         debtnew = (1+r)*debt_range[debt] - paid
         
@@ -722,7 +735,7 @@ def move_debt_repayment(x1,x2,period,debt,j,conter):
         
         discretionary_income = real_wage-2.25*15000
         
-        paid = np.maximum(0,np.minimum(real_wage-2000,np.minimum(0.05*discretionary_income,(1/periods)*debt_range[debt]*(1+r))))
+        paid = np.maximum(0,np.minimum(real_wage-CONSUMPTION_FLOOR,np.minimum(0.05*discretionary_income,(1/periods)*debt_range[debt]*(1+r))))
                 
         debtnew = (1+r)*debt_range[debt] - paid
         
@@ -738,55 +751,97 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     # First identify individuals that are making educational choices
     educ_choices,not_educ_choices = which_educ()
     
-    # Break the set of individuals into those who make educational choices and those who don't. 
-    x_educ = x[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
-    x_noteduc = x[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
-    choices_educ = choices[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
-    choices_noteduc = choices[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
+    # Break the set of individuals into those who make educational choices and
+    # those who do not.  ``choices`` contains indices into ``get_total_choices``.
+    # Keep one common row map for states, choices, and permanent types.
+    education_rows = np.flatnonzero(np.isin(choices, educ_choices.reshape(-1)))
+    noneducation_rows = np.flatnonzero(
+        np.isin(choices, not_educ_choices.reshape(-1))
+    )
+    x_educ = x[education_rows]
+    x_noteduc = x[noneducation_rows]
+    choices_educ = choices[education_rows]
+    choices_noteduc = choices[noneducation_rows]
+    types_educ = types[education_rows].astype(np.int64)
+    types_noteduc = types[noneducation_rows].astype(np.int64)
+    total_choices = get_total_choices()
+    choices_educ_original = total_choices[choices_educ]
 
     # Draw distinct shocks in their correct units. The wage shock is in log
     # wages; the fitted budget shock is additive in dollar consumption.
     if budget_params is None:
         reload_budget_shock_params(raise_if_missing=True)
-    wage_psi_educ = np.random.normal(loc=0.0, scale=sigmas[0], size=np.shape(x_educ)[0])
+    if auxiliary_financial_process is None:
+        reload_auxiliary_financial_process()
+    n_educ = np.shape(x_educ)[0]
+    wage_psi_educ = np.random.normal(loc=0.0, scale=sigmas[0], size=n_educ)
     x1_educ = x_educ[:, 1:5]
     x2_educ = x_educ[:, 5:15]
     x1_new_educ = get_x1_new(x1_educ)
-    expected_help = fin_help_agents(
-        x1_new_educ, x2_educ, choices_educ, period
+    grant_types = TYPE_GRANT[types_educ - 1]
+    transfer_types = TYPE_TRANSFER[types_educ - 1]
+    loan_types = TYPE_LOAN[types_educ - 1]
+
+    # Realize the grant and parental-transfer processes estimated inside the
+    # auxiliary EM.  These are the same typed parameter blocks used by the
+    # Bellman solver; supplied draws keep them under the cohort's simulation
+    # seed instead of creating independent random generators internally.
+    grants = draw_grants_vectorized(
+        x1_new_educ,
+        choices_educ_original[:, 1],
+        choices_educ_original[:, 2],
+        auxiliary_financial_process["grant"],
+        grant_type=grant_types,
+        receipt_uniform=np.random.random(n_educ),
+        amount_standard_normal=np.random.standard_normal(n_educ),
     )
+    transfers = draw_transfers_vectorized(
+        x1_new_educ,
+        choices_educ_original[:, 1],
+        choices_educ_original[:, 2],
+        auxiliary_financial_process["transfer"],
+        transfer_type=transfer_types,
+        receipt_uniform=np.random.random(n_educ),
+        amount_standard_normal=np.random.standard_normal(n_educ),
+    )
+    realized_help = grants + transfers
     wage_index = wage0(x1_new_educ, x2_educ)
     realized_wage = (
         np.exp(wage_index + wage_psi_educ)
-        * choices_educ[:, 2] * 0.5 * (40 * 52)
+        * choices_educ_original[:, 2] * 0.5 * (40 * 52)
     )
     pre_choice_resources = (
-        expected_help + realized_wage
-        - tuition_agents(conterfactual, choices_educ)
+        realized_help + realized_wage
+        - tuition_agents(conterfactual, choices_educ_original)
         - (1.0 + r) * debt_range[x_educ[:, 15].astype(np.int64)]
     )
-    budget_psi_educ = np.empty(len(x_educ), dtype=np.float64)
+    budget_psi_educ = np.empty(n_educ, dtype=np.float64)
+    budget_standard_draw = np.random.standard_normal(n_educ)
     for education in (1, 2, 3):
         education_rows = np.flatnonzero(
-            choices_educ[:, 1].astype(np.int64) == education
+            choices_educ_original[:, 1].astype(np.int64) == education
         )
         if not education_rows.size:
             continue
-        cell_codes = bs.education_cell_from_state(
+        cell_codes = bs.budget_education_cell_from_state(
             x2_educ[education_rows], education
         )
         for cell_code in np.unique(cell_codes):
             rows = education_rows[cell_codes == cell_code]
             program_year = int(cell_code - 100 * education)
-            budget_psi_educ[rows] = bs.draw(
+            budget_psi_educ[rows] = bs.realization(
                 budget_params,
                 x1_educ[rows],
                 period,
+                budget_standard_draw[rows],
+                loan_type=loan_types[rows],
                 education=education,
                 program_year=program_year,
                 pre_choice_resources=pre_choice_resources[rows],
             )
-    sigma_educ = bs.risk_aversion(budget_params, x_educ[:, 1:5])
+    sigma_educ = bs.risk_aversion(
+        budget_params, x_educ[:, 1:5], loan_type=loan_types
+    )
     
     # Move debt for not education choices.
     # The individuals that are not making educational choices will have tomorrow debt based on the repayment rule.
@@ -799,8 +854,9 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     # Notice here hta the choices are only for the subset of individuals that make education chioces
     
     payoff = get_conditional_agents(sigma_educ,x_educ[:,1:5],x_educ[:,5:15],x_educ[:,15],
-                                    budget_psi_educ,wage_psi_educ,choices_educ,period,
-                                    conterfactual,types,maxdebt)
+                                    realized_help,budget_psi_educ,wage_psi_educ,
+                                    choices_educ,period,conterfactual,
+                                    types_educ,maxdebt)
     debt_educ = np.nanargmax(payoff,axis=1)
 
     
@@ -818,8 +874,6 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     
     # Before that, map choices back to its original form.
     
-    total_choices = get_total_choices()
-    
     choices_original = total_choices[choices_together,:]
     
             
@@ -827,14 +881,13 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     
     # Also move types since the individuals have now changed
     
-    types = move_types(types,choices,educ_choices,not_educ_choices)
+    types = np.concatenate((types_noteduc,types_educ))
     
     return x_new, types
     
 def move_types(types,choices,educ_choices,not_educ_choices):
-    
-    types_educ = types[np.where( (choices[...,None]==educ_choices[:,None]).all(-1) )[1]]
-    types_noteduc = types[np.where( (choices[...,None]==not_educ_choices[:,None]).all(-1) )[1]]
+    types_educ = types[np.isin(choices, educ_choices.reshape(-1))]
+    types_noteduc = types[np.isin(choices, not_educ_choices.reshape(-1))]
     typesnew = np.concatenate((types_noteduc,types_educ))
     return typesnew
 
@@ -854,6 +907,12 @@ def simulate_choices(cohort,sigma_u,conterfactual,q,maxdebt,uparams):
     
     """
     np.random.seed(seed=cohort)
+    reload_budget_shock_params(raise_if_missing=True)
+    reload_auxiliary_financial_process()
+    if len(uparams) != validate_q(q).shape[1]:
+        raise ValueError(
+            "uparams must contain one utility-parameter block per joint type."
+        )
     # initialize states
     
     x, types = initialize_states(q,conterfactual,cohort)
@@ -891,7 +950,7 @@ def get_debt_range():
     
     return debt_range
     
-def get_conditional_agents(sigma_u,x1,x2,b,budget_psi,wage_psi,j,period,conterfactual,types,maxdebt):
+def get_conditional_agents(sigma_u,x1,x2,b,financial_help,budget_psi,wage_psi,j,period,conterfactual,types,maxdebt):
     
     "this function returns the conditional value function associated with each alternative"
     
@@ -904,7 +963,10 @@ def get_conditional_agents(sigma_u,x1,x2,b,budget_psi,wage_psi,j,period,conterfa
     
     j = total_choices[j,:]
             
-    u = get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfactual,maxdebt)
+    u = get_utility_agents(
+        sigma_u, x1, x2, b, b1, financial_help, budget_psi,
+        wage_psi, j, period, conterfactual, maxdebt
+    )
 
     continuation = beta*VT_agents(x1,x2,b1,period,j,conterfactual,types,maxdebt)
         
@@ -1510,8 +1572,8 @@ def check_consumption(c):
     
     for col in range(columns):
         for row in range(rows):
-            if c[row,col] < 2000:
-                c[row,col] = 2000
+            if c[row,col] < CONSUMPTION_FLOOR:
+                c[row,col] = CONSUMPTION_FLOOR
     return c
 
 
@@ -1556,7 +1618,7 @@ def wage(x1_new,x2_new,j,param_wage):
 
 
 #@njit()
-def get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfactual,maxdebt):
+def get_utility_agents(sigma_u,x1,x2,b,b1,financial_help,budget_psi,wage_psi,j,period,conterfactual,maxdebt):
     
     " this function returns the utility associated with a particular alternative"
     
@@ -1568,7 +1630,7 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfac
     # Get expanded version of x1
     
     x1_new = get_x1_new(x1)
-    h = fin_help_agents(x1_new,x2,j,period)
+    h = np.asarray(financial_help, dtype=np.float64)
     
     full_part_time = j[:,2].copy()
     
@@ -1590,7 +1652,10 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfac
     if sigma_rows.ndim == 0:
         sigma_rows = np.full(c.shape[0], float(sigma_rows))
     sigma_matrix = sigma_rows[:, None]
-    scaled_c = 0.00001 * c
+    # Choices below the consumption floor are removed by ``get_debt_rules``.
+    # Evaluate them at the floor here so the forced maximum-debt fallback has
+    # a finite payoff even if raw consumption remains non-positive.
+    scaled_c = 0.00001 * np.maximum(c, CONSUMPTION_FLOOR)
     with np.errstate(divide="ignore", invalid="ignore"):
         u = np.where(
             np.abs(sigma_matrix - 1.0) < 1e-8,
@@ -1598,8 +1663,14 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,budget_psi,wage_psi,j,period,conterfac
             0.1 * scaled_c ** (1.0 - sigma_matrix) / (1.0 - sigma_matrix),
         )
 
-    # Apply exactly the same participation penalty as the SMM loan objective.
-    penalty = bs.debt_penalty(budget_params, x1)[:, None]
+    # Match the SMM shortcut: debt persists along the home-reference path, so
+    # one estimated flow penalty is accumulated through explicit period T-1.
+    penalty_multiplier = bs.explicit_debt_penalty_multiplier(
+        period, beta=beta, terminal_period=T
+    )
+    penalty = (
+        bs.debt_penalty(budget_params, x1) * penalty_multiplier
+    )[:, None]
     u = u + penalty * (b1[None, :] > 0.0)
     
     # Incorporate debt  rules! 
@@ -1630,108 +1701,6 @@ def minimum_debt_maxdebt(u,b):
         
     return u
 
-
-
-@njit()
-def get_simulation_bounds_indices(b_idx, x2, j, debt_grid):
-    """
-    Compute row-specific admissible debt-choice bounds for the simulation.
-
-    Inputs
-    ------
-    b_idx : (n,) int array
-        Current debt positions on the debt grid.
-    x2 : (n, K) int array
-        Current time-varying state variables.
-    j : (n, 3) int array
-        Current choices in original tuple form:
-            j[:,1] = schooling choice
-                0 = no school
-                1 = 2-year
-                2 = 4-year
-                3 = grad school
-    debt_grid : (B,) float array
-        Debt grid in dollars.
-
-    Returns
-    -------
-    lo_idx : (n,) int array
-        Minimum admissible debt index tomorrow.
-    hi_idx : (n,) int array
-        Maximum admissible debt index tomorrow.
-    cap_region : (n,) int array
-        Indicator for the no-new-borrowing region:
-            0 = active borrowing region
-            1 = debt evolves mechanically with interest only
-
-    Economic rules
-    --------------
-    Let debt_today be current debt in dollars and accrued = (1+r)*debt_today.
-
-    If the individual is not enrolled:
-        tomorrow debt is pinned down by accrued debt only.
-
-    If the individual is enrolled and accrued < lifetime cap:
-        admissible tomorrow debt lies in
-            [ accrued , min(accrued + annual cap, lifetime cap) ]
-
-    If the individual is enrolled and accrued >= lifetime cap:
-        no new borrowing is allowed and tomorrow debt is pinned down by
-        accrued debt only.
-    """
-    n = b_idx.shape[0]
-
-    lo_idx = np.empty(n, dtype=np.int64)
-    hi_idx = np.empty(n, dtype=np.int64)
-    cap_region = np.zeros(n, dtype=np.int64)
-
-    for i in range(n):
-        debt_today = debt_grid[int(b_idx[i])]
-        accrued = (1.0 + r) * debt_today
-
-        educ_choice = int(j[i, 1])
-
-        # No-school choices do not involve a new borrowing decision.
-        # Debt tomorrow is the mechanically evolved debt level.
-        if educ_choice == 0:
-            idx = lower_bound_index(debt_grid, accrued)
-            lo_idx[i] = idx
-            hi_idx[i] = idx
-            cap_region[i] = 1
-            continue
-
-        # State variables that determine annual borrowing limits.
-        twoy_exp = int(x2[i, 1])
-        foury_exp = int(x2[i, 2])
-
-        annual_cap = get_annual_cap_by_stage(educ_choice, twoy_exp, foury_exp)
-        lifetime_cap = get_lifetime_cap_by_stage(educ_choice)
-
-        # Once debt with accrued interest reaches the lifetime cap,
-        # no additional borrowing is allowed. Debt still evolves with interest.
-        if accrued >= lifetime_cap:
-            idx = lower_bound_index(debt_grid, accrued)
-            lo_idx[i] = idx
-            hi_idx[i] = idx
-            cap_region[i] = 1
-
-        # Otherwise, the student can borrow on top of accrued debt, but only
-        # up to the annual cap unless the lifetime cap binds first.
-        else:
-            debt_min = accrued
-            debt_max = accrued + annual_cap
-            if debt_max > lifetime_cap:
-                debt_max = lifetime_cap
-
-            lo_idx[i] = lower_bound_index(debt_grid, debt_min)
-            hi_idx[i] = upper_bound_index(debt_grid, debt_max)
-
-            if hi_idx[i] < lo_idx[i]:
-                hi_idx[i] = lo_idx[i]
-
-            cap_region[i] = 0
-
-    return lo_idx, hi_idx, cap_region
 
 
 def get_debt_rules(c, u, b, x2, j, maxdebt):
@@ -1783,7 +1752,7 @@ def get_debt_rules(c, u, b, x2, j, maxdebt):
     #   - consumption must satisfy the floor
     #   - tomorrow debt cannot be below today's debt index
     if maxdebt == False:
-        u[c < 2000.0] = BIGNEG
+        u[c < CONSUMPTION_FLOOR] = BIGNEG
         u = minimum_debt(u, b)
         return u
 
@@ -1820,7 +1789,7 @@ def get_debt_rules(c, u, b, x2, j, maxdebt):
         found_feasible = False
 
         for k in range(lo, hi + 1):
-            if c[i, k] >= 2000.0:
+            if c[i, k] >= CONSUMPTION_FLOOR:
                 found_feasible = True
             else:
                 u[i, k] = BIGNEG
@@ -1850,25 +1819,22 @@ def get_x1_new(x1):
     
 
 #@njit()
-def fin_help_agents(x1_new,x2,j,period):
+def fin_help_agents(x1_new,x2,j,period,types):
     
     "this function returns the amount of financial help individuals will recieve"
 
-    # Generate 4y or grad school dummy
-    
-    dum = np.zeros((np.shape(x1_new)[0]))
-    dum[j[:,1]>1] = 1
-    
-    # put together
-    x = np.hstack((x1_new,dum[...,None]))
-    
-    # perform the product.
-    
-    p_trans =  x@param_fam.T
+    types = np.asarray(types, dtype=np.int64)
+    grant_types = TYPE_GRANT[types - 1]
+    transfer_types = TYPE_TRANSFER[types - 1]
     grants = expected_grants_vectorized(
-        x1_new, j[:, 1], j[:, 2], grant_process
+        x1_new, j[:, 1], j[:, 2], auxiliary_financial_process["grant"],
+        grant_type=grant_types,
     )
-    h = np.exp(p_trans) + grants
+    transfers = expected_transfers_vectorized(
+        x1_new, j[:, 1], j[:, 2], auxiliary_financial_process["transfer"],
+        transfer_type=transfer_types,
+    )
+    h = transfers + grants
 
     return h
 
@@ -1887,9 +1853,10 @@ def tuition_agents(conterfactual,j):
 
 
 #param_g = temp_param_g()
-wage_0, params_wage, sigmas, grant_process, param_fam, param_prob_grad = load_all_parameters()
+wage_0, params_wage, sigmas, param_prob_grad = load_all_parameters()
 debt_range = get_debt_range()
 budget_params = bs.load(raise_if_missing=False)
+auxiliary_financial_process = None
 
 def reload_budget_shock_params(raise_if_missing=True):
     """Reload the shared specification after re-estimating it in this process."""
@@ -1897,18 +1864,15 @@ def reload_budget_shock_params(raise_if_missing=True):
     budget_params = bs.load(raise_if_missing=raise_if_missing)
     return budget_params
 
-#n=200000
-#sigma_u = 1.4
-#conterfactual = 1 
-#q = np.load("estimates/em_q_typeff2.npy")
-#maxdebt = True
-#os.chdir(r"C:/Users/Sergi/Dropbox/PhD/Projects/Papers/1_financial_constraints/Code/2024_10/2_model/RealModel/codes")
-#import model_solution_em as ms
-#utility_parameters1 = ms.load_param_g(1,real=1)
-#utility_parameters2 = ms.load_param_g(2,real=1)
-#uparams = [utility_parameters1,utility_parameters2]
-#simulate_choices(1,sigma_u,conterfactual,q,maxdebt,uparams)
-#--------------------------------------------#
+
+def reload_auxiliary_financial_process():
+    """Reload the typed grant/transfer process saved by the auxiliary EM."""
+    global auxiliary_financial_process
+    auxiliary_financial_process = load_auxiliary_financial_process(
+        EST("auxiliary_em_results.npz")
+    )
+    return auxiliary_financial_process
+
 # PROBLEMS I HAVE IDENETIFIED
 
 # In the toymodel, debt level is tracked as the argmax of the optimal

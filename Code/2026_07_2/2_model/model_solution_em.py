@@ -27,7 +27,6 @@ from os import environ
 mu = 0
 gamma = 0.57721
 beta = 0.98
-r = 0.05
 T = 10
 
 # param wage now depends on:
@@ -44,12 +43,22 @@ T = 10
 # major at graduation
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, STATES
 import budget_shock as bs
+from debt_limits import (
+    CONSUMPTION_FLOOR,
+    INTEREST_RATE,
+    get_annual_cap_by_stage,
+    get_debt_region_bounds,
+    get_lifetime_cap_by_stage,
+    lower_bound_index,
+    upper_bound_index,
+)
 from financial_process import (
     expected_financial_help_numba,
     load_auxiliary_financial_process,
     prepare_type_financial_parameters,
 )
 from latent_types import N_TYPES, TYPE_NAMES, type_components
+r = INTEREST_RATE
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathcont = DIR["MODEL_CONTINUATION"]
@@ -345,7 +354,7 @@ def get_x1_poli(x1):
 @njit
 def get_power_utility(sigma_u,c):
     
-    c = np.maximum(c,2000)
+    c = np.maximum(c,CONSUMPTION_FLOOR)
     
     return 0.1*((0.00001*c)**(1-sigma_u)/(1-sigma_u))
 
@@ -369,8 +378,8 @@ def check_consumption(c):
     
     for col in range(columns):
         for row in range(rows):
-            if c[row,col] < 2000:
-                c[row,col] = 2000
+            if c[row,col] < CONSUMPTION_FLOOR:
+                c[row,col] = CONSUMPTION_FLOOR
     return c
 
 @njit()
@@ -380,7 +389,7 @@ def check_consumption_new(c):
     
     c = c.flatten()
 
-    c[c<2000] = 2000
+    c[c<CONSUMPTION_FLOOR] = CONSUMPTION_FLOOR
 
     c.reshape(shape)
     return c
@@ -797,7 +806,7 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
                 # Get the bound
                 firstbound = np.shape(b)[0]-len(c2new)
             
-                u = get_power_utility(sigma_u,np.maximum(c2new,2000))
+                u = get_power_utility(sigma_u,np.maximum(c2new,CONSUMPTION_FLOOR))
                 
                 final = u + continuation[firstbound:]
                 
@@ -829,7 +838,7 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
                         # If this is the case debt is the maximum for all possible
                         # values of debt today, because no matter your debt consumption
                         # wont be positive.
-                        vjt = get_power_utility(sigma_u,np.maximum(c[it+np.shape(continuation)[0]*e:(e+1)*np.shape(continuation)[0],-1],2000)) + continuation[-1]
+                        vjt = get_power_utility(sigma_u,np.maximum(c[it+np.shape(continuation)[0]*e:(e+1)*np.shape(continuation)[0],-1],CONSUMPTION_FLOOR)) + continuation[-1]
                         
                         payoff[it+np.shape(continuation)[0]*e:(e+1)*np.shape(continuation)[0]] = vjt
                         alert = 1
@@ -843,7 +852,7 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
                     
                 # Get the set of maximum candidates
                 
-                c_new  =  np.maximum(c2[bound_left:bound_right],2000) # Not sure if this will work with numba
+                c_new  =  np.maximum(c2[bound_left:bound_right],CONSUMPTION_FLOOR) # Not sure if this will work with numba
                 
                 # compute the payoff
                 u = get_power_utility(sigma_u,c_new)
@@ -865,7 +874,7 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
                     
                     # Now everything is 99? Yes
 
-                    vjt = get_power_utility(sigma_u,np.maximum(c[it+np.shape(continuation)[0]*e:(e+1)*np.shape(continuation)[0],-1],2000)) + continuation[-1]
+                    vjt = get_power_utility(sigma_u,np.maximum(c[it+np.shape(continuation)[0]*e:(e+1)*np.shape(continuation)[0],-1],CONSUMPTION_FLOOR)) + continuation[-1]
                     
                     payoff[it+np.shape(continuation)[0]*e:(e+1)*np.shape(continuation)[0]] =vjt
                     check = 1
@@ -886,7 +895,7 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
                         c2new = c2[c2>0]
                         # Get the bound
                         firstbound = np.shape(b)[0]-len(c2new)
-                        clast = np.maximum(c2new,2000)
+                        clast = np.maximum(c2new,CONSUMPTION_FLOOR)
                         u = get_power_utility(sigma_u,clast)
                         final = u + continuation[firstbound:]
                         amax = np.argmax(final)
@@ -910,143 +919,20 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
                 
     return payoff
 
-@njit()
-def get_annual_cap_by_stage(educ_choice, twoy_exp, foury_exp):
-    """
-    educ_choice:
-        1 = 2-year
-        2 = 4-year
-        3 = grad
-    """
-    if educ_choice == 1:
-        if twoy_exp <= 0:
-            return 8391.0
-        elif twoy_exp == 1:
-            return 9309.0
-        else:
-            return 12581.0
-
-    elif educ_choice == 2:
-        if foury_exp <= 0:
-            return 8391.0
-        elif foury_exp == 1:
-            return 9309.0
-        else:
-            return 12581.0
-
-    elif educ_choice == 3:
-        return 23222.0
-
-    return 0.0
-
-
-@njit()
-def get_lifetime_cap_by_stage(educ_choice):
-    if educ_choice == 3:
-        return 150000.0
-    else:
-        return 70786.0
-
-
-@njit()
-def lower_bound_index(grid, value):
-    """
-    First index k such that grid[k] >= value.
-    """
-    n = grid.shape[0]
-    for k in range(n):
-        if grid[k] >= value:
-            return k
-    return n - 1
-
-
-@njit()
-def upper_bound_index(grid, value):
-    """
-    Last index k such that grid[k] <= value.
-    """
-    n = grid.shape[0]
-    idx = 0
-    for k in range(n):
-        if grid[k] <= value:
-            idx = k
-        else:
-            break
-    return idx
-
-
-@njit()
-def get_debt_region_bounds(b, x2, j):
-    """
-    For each current debt level b[it], return row-specific feasible bounds:
-      lo_idx[it], hi_idx[it]
-
-    Also return cap_start:
-      first row where accrued debt >= lifetime cap.
-      From cap_start onward there is no borrowing choice left.
-
-    This is the two-region version.
-    """
-    n = b.shape[0]
-    lo_idx = np.empty(n, dtype=np.int64)
-    hi_idx = np.empty(n, dtype=np.int64)
-
-    educ_choice = int(j[1])
-
-    # safety
-    if educ_choice == 0:
-        for it in range(n):
-            accrued = (1.0 + r) * b[it]
-            idx = lower_bound_index(b, accrued)
-            lo_idx[it] = idx
-            hi_idx[it] = idx
-        return lo_idx, hi_idx, 0
-
-    twoy_exp  = int(x2[1])
-    foury_exp = int(x2[2])
-
-    annual_cap   = get_annual_cap_by_stage(educ_choice, twoy_exp, foury_exp)
-    lifetime_cap = get_lifetime_cap_by_stage(educ_choice)
-
-    cap_start = n
-
-    for it in range(n):
-        accrued = (1.0 + r) * b[it]
-
-        if accrued >= lifetime_cap:
-            # Region 2: no new borrowing, only mechanical evolution
-            idx = lower_bound_index(b, accrued)
-            lo_idx[it] = idx
-            hi_idx[it] = idx
-            if cap_start == n:
-                cap_start = it
-        else:
-            # Region 1: active borrowing
-            debt_min = accrued
-            debt_max = accrued + annual_cap
-            if debt_max > lifetime_cap:
-                debt_max = lifetime_cap
-
-            lo_idx[it] = lower_bound_index(b, debt_min)
-            hi_idx[it] = upper_bound_index(b, debt_max)
-
-            if hi_idx[it] < lo_idx[it]:
-                hi_idx[it] = lo_idx[it]
-
-    return lo_idx, hi_idx, cap_start
-
 @njit
 def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
     """
     Two-region version:
 
     Region 1: accrued debt < lifetime cap
-        -> search over [lo_idx[it], hi_idx[it]]
+        -> search over [lo_idx[it], hi_idx[it]] among choices with c >= 2000
+        -> if none meets the consumption floor, force hi_idx[it]
 
     Region 2: accrued debt >= lifetime cap
         -> no search, debt evolves mechanically
     """
     payoff = np.zeros(np.shape(c)[0])
+    consumption_floor = CONSUMPTION_FLOOR
 
     continuation = continuation[:, 0]
     ncont = np.shape(continuation)[0]
@@ -1070,7 +956,9 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
             if it >= cap_start:
                 idx_use = lo_idx[it]   # here lo_idx[it] == hi_idx[it]
                 payoff[row_idx] = (
-                    get_power_utility(sigma_u, np.maximum(c2[idx_use], 2000.0))
+                    get_power_utility(
+                        sigma_u, np.maximum(c2[idx_use], consumption_floor)
+                    )
                     + continuation[idx_use]
                 )
                 it += 1
@@ -1086,18 +974,20 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
 
             if it == 0:
                 c2temp = c2[lo:hi+1]
-                c2new = c2temp[c2temp > 0]
+                c2new = c2temp[c2temp >= consumption_floor]
 
                 if len(c2new) == 0:
                     idx_use = hi
                     payoff[row_idx] = (
-                        get_power_utility(sigma_u, np.maximum(c2[idx_use], 2000.0))
+                        get_power_utility(
+                            sigma_u, np.maximum(c2[idx_use], consumption_floor)
+                        )
                         + continuation[idx_use]
                     )
                     amax_new = idx_use
                 else:
                     firstbound = hi + 1 - len(c2new)
-                    u = get_power_utility(sigma_u, np.maximum(c2new, 2000.0))
+                    u = get_power_utility(sigma_u, c2new)
                     final = u + continuation[firstbound:hi+1]
                     amax = np.argmax(final)
                     amax_new = amax + firstbound
@@ -1115,16 +1005,19 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                         bound_left = it
                     bound_right = hi + 1
 
-                if c2[bound_left] < 0:
+                if c2[bound_left] < consumption_floor:
                     c2temp = c2[lo:hi+1]
-                    c2new = c2temp[c2temp > 0]
+                    c2new = c2temp[c2temp >= consumption_floor]
 
                     if len(c2new) == 0:
                         idx_use = hi
                         payoff[row_idx] = (
-                            get_power_utility(sigma_u, np.maximum(c2[idx_use], 2000.0))
+                            get_power_utility(
+                                sigma_u, np.maximum(c2[idx_use], consumption_floor)
+                            )
                             + continuation[idx_use]
                         )
+                        amax_new = idx_use
                         it += 1
                         if it == ncont:
                             check = 1
@@ -1137,7 +1030,7 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                             bound_left = it
                         bound_right = hi + 1
 
-                c_new = np.maximum(c2[bound_left:bound_right], 2000.0)
+                c_new = c2[bound_left:bound_right]
                 u = get_power_utility(sigma_u, c_new)
                 final = u + continuation[bound_left:bound_right]
                 amax = np.argmax(final)
@@ -1148,14 +1041,18 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
 
                     if (amax_new - amax_old) > 9:
                         c2temp = c2[lo:hi+1]
-                        c2new = c2temp[c2temp > 0]
+                        c2new = c2temp[c2temp >= consumption_floor]
 
                         if len(c2new) == 0:
                             idx_use = hi
                             payoff[row_idx] = (
-                                get_power_utility(sigma_u, np.maximum(c2[idx_use], 2000.0))
+                                get_power_utility(
+                                    sigma_u,
+                                    np.maximum(c2[idx_use], consumption_floor),
+                                )
                                 + continuation[idx_use]
                             )
+                            amax_new = idx_use
                             it += 1
                             if it == ncont:
                                 check = 1
@@ -1167,7 +1064,7 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                             if firstbound < it:
                                 firstbound = it
 
-                            clast = np.maximum(c2[firstbound:hi+1], 2000.0)
+                            clast = c2[firstbound:hi+1]
                             u = get_power_utility(sigma_u, clast)
                             final = u + continuation[firstbound:hi+1]
                             amax = np.argmax(final)
@@ -1184,7 +1081,8 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
 def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2):
     """
     Only prints REAL argmax threats.
-    Preserves original behavior.
+    Retained diagnostic for the legacy fixed-index cap, using the shared
+    consumption floor.
     """
 
     maxdebt = 76
@@ -1205,10 +1103,10 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
 
             if it == 0:
                 c2temp = c2[:maxdebt]
-                c2new = c2temp[c2temp > 0]
+                c2new = c2temp[c2temp >= CONSUMPTION_FLOOR]
 
                 firstbound = maxdebt - len(c2new)
-                u = get_power_utility(sigma_u, np.maximum(c2new, 2000))
+                u = get_power_utility(sigma_u, np.maximum(c2new, CONSUMPTION_FLOOR))
                 final = u + continuation[firstbound:maxdebt]
 
                 if len(final) == 0:
@@ -1219,8 +1117,8 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
                     print("len(c2new) =", len(c2new))
                     print("firstbound =", firstbound)
                     print("len(final) =", len(final))
-                    print("any positive capped =", np.any(c2[:maxdebt] > 0))
-                    print("any positive full =", np.any(c2 > 0))
+                    print("any feasible capped =", np.any(c2[:maxdebt] >= CONSUMPTION_FLOOR))
+                    print("any feasible full =", np.any(c2 >= CONSUMPTION_FLOOR))
                     print("min capped =", np.min(c2[:maxdebt]))
                     print("max capped =", np.max(c2[:maxdebt]))
                     print("min full =", np.min(c2))
@@ -1242,16 +1140,16 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
                     print("amax_new =", amax_new)
                     print("bound_left =", bound_left, "bound_right =", bound_right)
 
-                if c2[bound_left] < 0:
+                if c2[bound_left] < CONSUMPTION_FLOOR:
                     c2temp = c2[:maxdebt]
-                    c2new = c2temp[c2temp > 0]
+                    c2new = c2temp[c2temp >= CONSUMPTION_FLOOR]
 
                     if len(c2new) == 0:
                         idx_fallback = np.maximum(it, maxdebt)
                         vjt = (
                             get_power_utility(
                                 sigma_u,
-                                np.maximum(c2[idx_fallback], 2000)
+                                np.maximum(c2[idx_fallback], CONSUMPTION_FLOOR)
                             )
                             + continuation[idx_fallback]
                         )
@@ -1261,7 +1159,7 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
                         bound_left = maxdebt - len(c2new)
                         bound_right = maxdebt
 
-                c_new = np.maximum(c2[bound_left:bound_right], 2000)
+                c_new = np.maximum(c2[bound_left:bound_right], CONSUMPTION_FLOOR)
                 u = get_power_utility(sigma_u, c_new)
                 final = u + continuation[bound_left:bound_right]
 
@@ -1284,10 +1182,10 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
 
                         if (amax_new - amax_old) > 9:
                             c2temp = c2[:maxdebt]
-                            c2new = c2temp[c2temp > 0]
+                            c2new = c2temp[c2temp >= CONSUMPTION_FLOOR]
 
                             firstbound = maxdebt - len(c2new)
-                            clast = np.maximum(c2new, 2000)
+                            clast = np.maximum(c2new, CONSUMPTION_FLOOR)
                             u = get_power_utility(sigma_u, clast)
                             final = u + continuation[firstbound:maxdebt]
 
@@ -1313,7 +1211,7 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
                 payoff[row_idx] = (
                     get_power_utility(
                         sigma_u,
-                        np.maximum(c2[idx_fallback], 2000)
+                        np.maximum(c2[idx_fallback], CONSUMPTION_FLOOR)
                     )
                     + continuation[idx_fallback]
                 )
@@ -1405,7 +1303,7 @@ def get_debt_income_home(x1_new,x2_new,x2,period,j,debt,e,conter):
         
         discretionary_income = real_wage-2.25*15000
         
-        paid = np.maximum(0,np.minimum(real_wage-2000,np.minimum(0.05*discretionary_income,(1/periods)*debt_vis*(1+r))))
+        paid = np.maximum(0,np.minimum(real_wage-CONSUMPTION_FLOOR,np.minimum(0.05*discretionary_income,(1/periods)*debt_vis*(1+r))))
         
         income = real_wage-paid
         
@@ -1424,7 +1322,7 @@ def get_debt_income_home(x1_new,x2_new,x2,period,j,debt,e,conter):
     else:
         
         
-        paid = np.maximum(0,np.minimum(real_wage-2000,(1/periods)*debt_vis*(1+r)))
+        paid = np.maximum(0,np.minimum(real_wage-CONSUMPTION_FLOOR,(1/periods)*debt_vis*(1+r)))
         
         debtnew = (1+r)*debt_vis - paid
         
@@ -1468,7 +1366,7 @@ def get_debt_income(x1_new,x2_new,x2,period,j,debt,e,conter,param_wage_j):
         
         discretionary_income = real_wage-2.25*15000
         
-        paid = np.maximum(0,np.minimum(real_wage-2000,np.minimum(0.05*discretionary_income,(1/periods)*debt_vis*(1+r))))
+        paid = np.maximum(0,np.minimum(real_wage-CONSUMPTION_FLOOR,np.minimum(0.05*discretionary_income,(1/periods)*debt_vis*(1+r))))
         
         income = real_wage-paid
         
@@ -1487,7 +1385,7 @@ def get_debt_income(x1_new,x2_new,x2,period,j,debt,e,conter,param_wage_j):
     else:
         
         
-        paid = np.maximum(0,np.minimum(real_wage-2000,(1/periods)*debt_vis*(1+r)))
+        paid = np.maximum(0,np.minimum(real_wage-CONSUMPTION_FLOOR,(1/periods)*debt_vis*(1+r)))
         
         debtnew = (1+r)*debt_vis - paid
         
@@ -1568,10 +1466,12 @@ def get_conditional(
         )
         continuation = beta*VT(x1,x1_new,x2,x2_new,b1,period,j,evt,0)  # shape (nb,1) or (nb,?)
 
-        # IMPORTANT: include penalty INSIDE the maximization.
-        # continuation used inside get_maximum_loop is flattened to (nb,)
-        # so just add (debt_pen * mask_nb) to it (broadcast over column 0).
-        continuation[:,0] += debt_pen * mask_nb
+        # The flow penalty is attached to the candidate next-period debt.
+        # This charges the first penalty in the period in which borrowing is
+        # chosen. Future explicit periods charge the same flow parameter
+        # recursively; the period-T terminal value adds no further penalty.
+        candidate_debt_mask = (b1 > 0).astype(np.float64)
+        continuation[:,0] += debt_pen * candidate_debt_mask
 
         max_vjt = get_maximum(sigma_u,c,continuation,x1,b,j,x2,maxdebt)
         return max_vjt

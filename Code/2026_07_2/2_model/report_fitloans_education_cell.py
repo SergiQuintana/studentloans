@@ -71,7 +71,7 @@ def load_saved_bundle(prefix, heterogeneity, education, program_year, specificat
     bestx = np.asarray(np.load(paths["bestx"]), dtype=np.float64).reshape(-1)
     saved_spec = bs.validate(np.load(paths["params"], allow_pickle=True).item())
     separate_risk = np.asarray(np.load(paths["risk_aversion"]), dtype=np.float64)
-    cell_code = bs.education_cell_code(education, program_year)
+    cell_code = bs.budget_education_cell_code(education, program_year)
     if specification == "parental_income_basic":
         vector_spec = bs.unpack_parental_income_estimation_vector(
             bestx, [cell_code], index_kind="education_cell"
@@ -274,7 +274,9 @@ def reevaluate_model_fit(bestx, args):
         type_integration=args.type_integration,
         resource_mode=args.resource_mode,
     )
-    cell_code = bs.education_cell_code(args.education, args.program_year)
+    cell_code = bs.budget_education_cell_code(
+        args.education, args.program_year
+    )
 
     # The objective prints its detailed table every tenth call. This is a
     # reporting-only process, so make the single evaluation the tenth call.
@@ -356,6 +358,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    args.program_year = int(
+        bs.budget_program_year(args.education, args.program_year)
+    )
     if args.specification in (
         "parental_income_basic", "parental_income_loan_type",
     ) and args.heterogeneity != "homogeneous":

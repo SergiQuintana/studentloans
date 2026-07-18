@@ -45,6 +45,7 @@ import model_simulation_em as msim
 
 from pathlib import Path
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, LIK
+from latent_types import TYPE_IDS, load_em_posteriors
 
 def _mk(p): Path(p).mkdir(parents=True, exist_ok=True)
 
@@ -94,166 +95,52 @@ def _out_welfare(): return Path(OUT("welfare"))
 def _out_grad():    return Path(OUT("grad_prob"))
 
 
-if __name__ == '__main__':
-    
-    # The first thing is to simulate the vjts with the parameters obtained during 
-    # estimation
-    
-    debt_range = ms.get_debt_range()
-        
-    print("Solving the model...")
+def solve_simulation_values(conterfactual, maxdebt, uparams, debt_range):
+    """Solve every invariant state for all permanent joint types."""
     solution_mode = 1
     ccp_real = []
     models = []
+    args = [
+        (
+            i, ms.invariant_states, debt_range, debt_range, ccp_real,
+            uparams[type_id - 1], models, solution_mode, conterfactual,
+            type_id, maxdebt,
+        )
+        for type_id in TYPE_IDS
+        for i in range(np.shape(ms.invariant_states)[0])
+    ]
+    with multiprocessing.Pool(
+        60, initializer=ms.reload_budgetshock_params
+    ) as pool_obj:
+        pool_obj.starmap(ms.get_all_evt, args, chunksize=1)
+
+
+def simulate_cohorts(conterfactual, maxdebt, q, uparams, samples=30):
+    # ``sigma_u`` remains in the legacy public interface.  The simulation now
+    # reloads parental-income/type risk aversion from the canonical budget file.
     sigma_u = 1.4
-    conter = 0
-    maxdebt = True
-    utility_parameters1 = ms.load_param_g(1,real=1)
-    utility_parameters2 = ms.load_param_g(2,real=1)
-    uparams = [utility_parameters1,utility_parameters2]
-    args = [(i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters1,models,solution_mode,conter,1,maxdebt) for i in range(np.shape(ms.invariant_states)[0])]
-    args.extend(((i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters2,models,solution_mode,conter,2,maxdebt) for i in range(np.shape(ms.invariant_states)[0])))
-    pool_obj = multiprocessing.Pool(60)
-    results = pool_obj.starmap(ms.get_all_evt, args)
-    pool_obj.close()
-        
-    # Now simulate choices. The idea is to simulate 10 times each individual
-    
-    print("Simulating model choices...")
-    samples=30
-    sigma_u =  1.4
-    conterfactual = 0
-    maxdebt = True 
-    q = np.load(f"{path_estimates}/em_q_typeff2.npy")
-    args = [(i,sigma_u,conterfactual,q,maxdebt,uparams) for i in range(1,samples+1)]
-    pool_obj = multiprocessing.Pool(samples)
-    results = pool_obj.starmap(msim.simulate_choices, args)
-    pool_obj.close()
-    
-    #-------------------------------------------------------------------------#
-    
-    # Now generate the conterfactual vjts
-
-    print("Simulating counterfactual terminal values...")
+    args = [
+        (cohort, sigma_u, conterfactual, q, maxdebt, uparams)
+        for cohort in range(1, samples + 1)
+    ]
+    with multiprocessing.Pool(samples) as pool_obj:
+        pool_obj.starmap(msim.simulate_choices, args, chunksize=1)
 
 
-    
-    print("Simulating counterfactual vjts...")
-    conter = 1
-    solution_mode = 1
-    maxdebt = False
-    args = [(i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters1,models,solution_mode,conter,1,maxdebt) for i in range(np.shape(ms.invariant_states)[0])]
-    args.extend(((i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters2,models,solution_mode,conter,2,maxdebt) for i in range(np.shape(ms.invariant_states)[0])))
-    #pool_obj = multiprocessing.Pool(60)
-    #results = pool_obj.starmap(ms.get_all_evt, args)
-    #pool_obj.close()
-    
-    print("Simulating conterfactual choices...")
-    samples=30
-    sigma_u =  1.4
-    conterfactual = 1
-    maxdebt = False
-    args = [(i,sigma_u,conterfactual,q,maxdebt,uparams) for i in range(1,samples+1)]
-    #pool_obj = multiprocessing.Pool(samples)
-    #results = pool_obj.starmap(msim.simulate_choices, args)
-    #pool_obj.close()
-    
-    #-------------------------------------------------------------------------#
+if __name__ == '__main__':
+    debt_range = ms.get_debt_range()
+    uparams = [ms.load_param_g(type_id, real=1) for type_id in TYPE_IDS]
+    q = load_em_posteriors(EST("auxiliary_em_results.npz"))
 
-    # Now generate the conterfactual vjts with maximum debt established
-    print("Simulating counterfactual terminal values...")
+    print("Solving and simulating the estimated baseline model...")
+    solve_simulation_values(conterfactual=0, maxdebt=True,
+                            uparams=uparams, debt_range=debt_range)
+    simulate_cohorts(conterfactual=0, maxdebt=True, q=q, uparams=uparams)
 
-   
-    a  = False
-    if a == True:
-        debt_range = ms.get_debt_range()
-        sigma_u = np.load(sigmas)
+    print("Solving and simulating the income-driven-repayment counterfactual...")
+    solve_simulation_values(conterfactual=1, maxdebt=True,
+                            uparams=uparams, debt_range=debt_range)
+    simulate_cohorts(conterfactual=1, maxdebt=True, q=q, uparams=uparams)
 
-        #sigma_range = [for sigma in sigmas_u]
-        conter = 1
-        # load the data
-        df = mcf.load_data()
-        n = 100000
-        args = [(df,initialdebt,lastperiod,sigma_u,n,conter) for lastperiod in range(0,T) for initialdebt in debt_range]
-        pool_obj = multiprocessing.Pool(60)
-        results = pool_obj.starmap(mcf.geteverything, args)
-        pool_obj.close()
-        # Now put everything together
-            
-        mcf.give_model_format_plan(debt_range,sigma_u,conter)
-                
-        # And finally give numpy format
-                    
-        mcf.data_to_numpy(sigma_u,conter)
-
-        print("Simulating counterfactual vjts...")
-        conter = 1
-        solution_mode = 1
-        maxdebt = True
-        args = [(i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters1,models,solution_mode,conter,1,maxdebt) for i in range(np.shape(ms.invariant_states)[0])]
-        args.extend(((i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters2,models,solution_mode,conter,2,maxdebt) for i in range(np.shape(ms.invariant_states)[0])))
-        pool_obj = multiprocessing.Pool(60)
-        results = pool_obj.starmap(ms.get_all_evt, args)
-        pool_obj.close()
-    
-    print("Simulating conterfactual choices...")
-    samples=30
-    sigma_u =  1.4
-    conterfactual = 1
-    maxdebt = True
-    args = [(i,sigma_u,conterfactual,q,maxdebt,uparams) for i in range(1,samples+1)]
-    pool_obj = multiprocessing.Pool(samples)
-    results = pool_obj.starmap(msim.simulate_choices, args)
-    pool_obj.close()
-    
-    
-    #-------------------------------------------------------------------------#
-    
-    # Now generate conterfactual without debt
-    
-    conter = 0
-    solution_mode = 1
-    maxdebt = True
-    args = [(i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters1,models,solution_mode,conter,1,maxdebt) for i in range(np.shape(msnodebt.invariant_states)[0])]
-    args.extend(((i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters2,models,solution_mode,conter,2,maxdebt) for i in range(np.shape(msnodebt.invariant_states)[0])))
-    #pool_obj = multiprocessing.Pool(60)
-    #results = pool_obj.starmap(msnodebt.get_all_evt, args)
-    #pool_obj.close()
-    
-    
-    
-    print("Simulating conterfactual choices...")
-    samples=30
-    sigma_u =  1.4
-    conterfactual = 0
-    maxdebt = True
-    args = [(i,sigma_u,conterfactual,q,maxdebt,uparams) for i in range(1,samples+1)]
-    #pool_obj = multiprocessing.Pool(samples)
-    #results = pool_obj.starmap(msimnodebt.simulate_choices, args)
-    #pool_obj.close()
-    
-    
-    #-------------------------------------------------------------------------#
-    
-    # Now generate conterfactual without debt but with grants
-    
-    conter = 1
-    solution_mode = 1
-    maxdebt = True
-    args = [(i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters1,models,solution_mode,conter,1,maxdebt) for i in range(np.shape(msnodebt.invariant_states)[0])]
-    args.extend(((i,ms.invariant_states,debt_range,debt_range,ccp_real,utility_parameters2,models,solution_mode,conter,2,maxdebt) for i in range(np.shape(msnodebt.invariant_states)[0])))
-    #pool_obj = multiprocessing.Pool(60)
-    #results = pool_obj.starmap(msnodebt.get_all_evt, args)
-    #pool_obj.close()
-    
-    
-    
-    print("Simulating conterfactual choices...")
-    samples=30
-    sigma_u =  1.4
-    conterfactual = 1
-    maxdebt = True
-    args = [(i,sigma_u,conterfactual,q,maxdebt,uparams) for i in range(1,samples+1)]
-    #pool_obj = multiprocessing.Pool(samples)
-    #results = pool_obj.starmap(msimnodebt.simulate_choices, args)
-    #pool_obj.close()
+    # The separate no-debt solver/simulation still uses the legacy two-type
+    # interface.  It is intentionally not run from this sixteen-type driver.

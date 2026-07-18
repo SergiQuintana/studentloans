@@ -19,7 +19,7 @@ import numpy as np
 from config import EST, ENSURE_DIR
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 N_MEAN_PARAMETERS = 7
 N_RISK_PARAMETERS = 4
 N_DEBT_PENALTY_PARAMETERS = 4
@@ -27,6 +27,14 @@ DEBT_PENALTY_PARAMETERIZATION = "baseline_plus_deviations"
 LOAN_HETEROGENEITY_MODES = ("homogeneous", "mean", "variance", "both")
 INDEX_KINDS = ("model_period", "education_cell")
 EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
+EDUCATION_BUDGET_YEAR_CAP = {1: 3, 2: 5, 3: 2}
+BUDGET_EDUCATION_YEAR_GROUPING = "capped_upper_years_v1"
+DEBT_PENALTY_TIMING = "flow_explicit_horizon_periods_1_through_9"
+BUDGET_EDUCATION_CELLS = tuple(
+    (education, year)
+    for education, cap in EDUCATION_BUDGET_YEAR_CAP.items()
+    for year in range(1, cap + 1)
+)
 LEGACY_PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 13
 PARENTAL_INCOME_ESTIMATION_VECTOR_SIZE = 14
 PARENTAL_INCOME_LOAN_TYPE_VECTOR_SIZE = 18
@@ -52,6 +60,58 @@ def education_cell_from_state(state: np.ndarray, education: int):
     state = np.asarray(state)
     experience = state[..., EDUCATION_YEAR_STATE_COLUMN[education]].astype(np.int64)
     return 100 * education + experience + 1
+
+
+def budget_program_year(education: int, program_year):
+    """Map an actual program year to the estimated budget-shock support."""
+    education = int(education)
+    if education not in EDUCATION_BUDGET_YEAR_CAP:
+        raise ValueError("education must be 1, 2, or 3")
+    year = np.asarray(program_year, dtype=np.int64)
+    if np.any(year < 1):
+        raise ValueError("program_year must be positive")
+    grouped = np.minimum(year, EDUCATION_BUDGET_YEAR_CAP[education])
+    return int(grouped) if grouped.ndim == 0 else grouped
+
+
+def budget_education_cell_code(education: int, program_year: int) -> int:
+    """Return the capped education-year support code used by budget parameters."""
+    return education_cell_code(
+        education, budget_program_year(education, program_year)
+    )
+
+
+def budget_education_cell_from_state(state: np.ndarray, education: int):
+    """Map the unmodified x2 state into a capped budget-shock support code."""
+    actual_code = education_cell_from_state(state, education)
+    actual_year = np.asarray(actual_code, dtype=np.int64) - 100 * int(education)
+    grouped_year = budget_program_year(education, actual_year)
+    return 100 * int(education) + grouped_year
+
+
+def budget_program_year_label(education: int, program_year: int) -> str:
+    """Human-readable label, marking the top grouped support with a plus."""
+    grouped = int(budget_program_year(education, program_year))
+    cap = EDUCATION_BUDGET_YEAR_CAP[int(education)]
+    return f"{grouped}+" if grouped == cap else str(grouped)
+
+
+def explicit_debt_penalty_multiplier(period, beta: float, terminal_period: int):
+    """Discounted count of flow penalties through period ``terminal_period-1``.
+
+    Model periods are one-based. With terminal_period=10, period 1 receives
+    penalties for periods 1,...,9 and period 9 receives one penalty. The
+    terminal continuation itself is deliberately left unchanged.
+    """
+    period_array = np.asarray(period, dtype=np.int64)
+    remaining = int(terminal_period) - period_array
+    if np.any(remaining < 0):
+        raise ValueError("period cannot exceed terminal_period")
+    if np.isclose(beta, 1.0):
+        multiplier = remaining.astype(np.float64)
+    else:
+        multiplier = (1.0 - float(beta) ** remaining) / (1.0 - float(beta))
+    return float(multiplier) if multiplier.ndim == 0 else multiplier
 
 
 def _validate_heterogeneity_mode(mode: str) -> str:
@@ -104,8 +164,9 @@ def unpack_estimation_vector(
     if mode in ("variance", "both"):
         loan_log_sigma_ratio = vector[cursor:cursor + p]
 
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
+        "debt_penalty_timing": DEBT_PENALTY_TIMING,
         "index_kind": index_kind,
         "periods": periods,
         "mu_blocks": vector[:sigma_start].reshape(p, N_MEAN_PARAMETERS),
@@ -118,6 +179,9 @@ def unpack_estimation_vector(
         "loan_log_sigma_ratio": loan_log_sigma_ratio,
         "budget_resource_slope": np.zeros(p, dtype=np.float64),
     }
+    if index_kind == "education_cell":
+        result["education_year_grouping"] = BUDGET_EDUCATION_YEAR_GROUPING
+    return result
 
 
 def unpack_parental_income_estimation_vector(
@@ -153,8 +217,9 @@ def unpack_parental_income_estimation_vector(
 
     mean_levels = vector[0:4]
     debt_levels = vector[9:13]
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
+        "debt_penalty_timing": DEBT_PENALTY_TIMING,
         "index_kind": index_kind,
         "periods": periods,
         "mu_blocks": np.asarray(
@@ -188,6 +253,9 @@ def unpack_parental_income_estimation_vector(
         ),
         "estimation_parameterization": "parental_income_basic",
     }
+    if index_kind == "education_cell":
+        result["education_year_grouping"] = BUDGET_EDUCATION_YEAR_GROUPING
+    return result
 
 
 def unpack_parental_income_multicell_estimation_vector(
@@ -238,8 +306,9 @@ def unpack_parental_income_multicell_estimation_vector(
         ],
         dtype=np.float64,
     )
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
+        "debt_penalty_timing": DEBT_PENALTY_TIMING,
         "index_kind": index_kind,
         "periods": periods,
         "mu_blocks": mu_blocks,
@@ -253,6 +322,9 @@ def unpack_parental_income_multicell_estimation_vector(
         "budget_resource_slope": blocks[:, 5].copy(),
         "estimation_parameterization": "parental_income_basic_multicell_shared_risk_debt",
     }
+    if index_kind == "education_cell":
+        result["education_year_grouping"] = BUDGET_EDUCATION_YEAR_GROUPING
+    return result
 
 
 def unpack_parental_income_loan_type_estimation_vector(
@@ -298,6 +370,12 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     out["index_kind"] = str(out.get("index_kind", "model_period"))
     if out["index_kind"] not in INDEX_KINDS:
         raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
+    grouping = out.get("education_year_grouping")
+    if grouping is not None and grouping != BUDGET_EDUCATION_YEAR_GROUPING:
+        raise ValueError(f"Unsupported education_year_grouping: {grouping!r}")
+    timing = out.get("debt_penalty_timing")
+    if timing is not None and timing != DEBT_PENALTY_TIMING:
+        raise ValueError(f"Unsupported debt_penalty_timing: {timing!r}")
     out["mu_blocks"] = np.asarray(out["mu_blocks"], dtype=np.float64)
     out["sigma_e"] = np.asarray(out["sigma_e"], dtype=np.float64)
     out["debt_pen_parinc"] = np.asarray(out["debt_pen_parinc"], dtype=np.float64)
@@ -414,11 +492,19 @@ def support_value(
         return int(period)
     if education is None:
         raise ValueError("education is required for an education-cell shock specification")
+    grouped = (
+        spec.get("education_year_grouping") == BUDGET_EDUCATION_YEAR_GROUPING
+    )
     if program_year is not None:
+        if grouped:
+            return budget_education_cell_code(education, program_year)
         return education_cell_code(education, program_year)
     if state is None:
         raise ValueError("state or program_year is required for an education-cell specification")
-    code = np.asarray(education_cell_from_state(state, education)).reshape(-1)
+    code = np.asarray(
+        budget_education_cell_from_state(state, education)
+        if grouped else education_cell_from_state(state, education)
+    ).reshape(-1)
     if code.size != 1:
         raise ValueError("A scalar education cell is required for this model call")
     return int(code[0])

@@ -80,6 +80,23 @@ def validate_q(q, n_individuals=None, atol=1.0e-8):
     return q
 
 
+def draw_type_ids(q, uniforms):
+    """Draw one-based joint type IDs from individual posterior rows."""
+    q = validate_q(q)
+    uniforms = np.asarray(uniforms, dtype=float).reshape(-1)
+    if uniforms.shape != (len(q),):
+        raise ValueError("uniforms must contain one draw per posterior row.")
+    if not np.all(np.isfinite(uniforms)) or np.any(
+        (uniforms < 0.0) | (uniforms >= 1.0)
+    ):
+        raise ValueError("uniforms must be finite values in [0, 1).")
+    cumulative = np.cumsum(q, axis=1)
+    cumulative[:, -1] = 1.0
+    return (np.sum(uniforms[:, None] > cumulative, axis=1) + 1).astype(
+        np.int64
+    )
+
+
 def validate_saved_layout(
     type_names, type_school, type_grant, type_transfer, type_loan
 ):

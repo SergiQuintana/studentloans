@@ -24,7 +24,8 @@ Estimation-side status:
 - [ ] Loan type does not yet shift the budget-shock distribution. Until that
       refinement is implemented, each adjacent L0/L1 pair has identical value
       functions conditional on the same S, G, and T components.
-- [ ] Forward baseline and counterfactual simulation remains to be converted.
+- [x] Forward baseline and income-driven-repayment simulation use all sixteen
+      types, the full posterior, and typed grant/transfer resources.
 - [ ] No-debt solution and simulation remains to be converted.
 
 The remainder of this document records the earlier eight-type conversion. It

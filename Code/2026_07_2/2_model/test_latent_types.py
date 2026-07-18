@@ -8,6 +8,7 @@ from latent_types import (
     TYPE_IDS,
     TYPE_LOAN,
     TYPE_NAMES,
+    draw_type_ids,
     sgt_index,
     type_components,
     validate_q,
@@ -46,6 +47,16 @@ class LatentTypeLayoutTests(unittest.TestCase):
                 TYPE_COMPONENTS[:, 2],
                 TYPE_COMPONENTS[:, 3],
             )
+        )
+
+    def test_categorical_type_draws_are_one_based(self):
+        q = np.zeros((3, N_TYPES))
+        q[0, 0] = 1.0
+        q[1, 5] = 1.0
+        q[2, -1] = 1.0
+        np.testing.assert_array_equal(
+            draw_type_ids(q, np.array([0.25, 0.50, 0.75])),
+            np.array([1, 6, 16]),
         )
 
 
