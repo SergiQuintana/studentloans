@@ -12,6 +12,7 @@ RUN apt-get update && \
     sudo \
     nano \
     git \
+    tmux \
     python3 \
     python3-venv \
     python3-pip \
