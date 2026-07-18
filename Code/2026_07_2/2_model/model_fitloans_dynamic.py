@@ -97,7 +97,7 @@ EDUCATION_CELL_SPECIFICATIONS = (
     "parental_income_basic", "parental_income_loan_type", "joint_type",
 )
 TYPE_INTEGRATION_MODES = ("sampled", "exact")
-PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock")
+PARENTAL_INCOME_MOMENT_SPECS = ("fast_stock", "flow_stock", "fast_flow")
 EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
 DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
@@ -695,6 +695,8 @@ def parental_income_distribution_moments(
     mean positive stock, share positive stock, standard deviation of positive
     stock, and its 80th percentile. ``flow_stock`` keeps the stock share but
     uses positive annual loan flow for the other three distribution moments.
+    ``fast_flow`` uses annual loan flow for all four moments, including the
+    share receiving a positive new loan.
 
     One-dimensional outcomes are ordinary simulated/data observations. Two-
     dimensional ``(16, N)`` outcomes require ``q`` and provide the retained
@@ -738,7 +740,11 @@ def parental_income_distribution_moments(
         total = w.sum()
         positive = values > 0.0
         positive_weight = w[positive].sum()
-        share = np.sum(w * (stocks > 0.0)) / total if total > 0.0 else eps
+        participation = flows if moment_spec == "fast_flow" else stocks
+        share = (
+            np.sum(w * (participation > 0.0)) / total
+            if total > 0.0 else eps
+        )
         if total <= 0.0 or positive_weight <= 0.0:
             mean, std, p80 = eps, eps, eps
             if moment_spec == "fast_stock":
@@ -819,8 +825,11 @@ def parental_income_loan_type_distribution_moments(
             total = weights.sum()
             positive = distribution_values > 0.0
             positive_weight = weights[positive].sum()
+            participation_values = (
+                flow_values if moment_spec == "fast_flow" else stock_values
+            )
             share = (
-                np.sum(weights * (stock_values > 0.0)) / total
+                np.sum(weights * (participation_values > 0.0)) / total
                 if total > 0.0 else eps
             )
             if total <= 0.0 or positive_weight <= 0.0:
@@ -2083,14 +2092,22 @@ def _print_parental_income_fit(
 ):
     print("\n" + "=" * 132)
     print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    share_name = (
+        "share new-flow>0" if moment_spec == "fast_flow"
+        else "share end-stock>0"
+    )
+    share_weight_name = (
+        "share receiving new loans" if moment_spec == "fast_flow"
+        else "share indebted"
+    )
     print(
         " loss weights per parinc group: "
         f"mean positive={primary_moment_weight:g}, "
-        f"share indebted={primary_moment_weight:g}, std=1, p80=1"
+        f"{share_weight_name}={primary_moment_weight:g}, std=1, p80=1"
     )
     source = "stock" if moment_spec == "fast_stock" else "annual flow"
     print(
-        f" parinc | mean positive {source}: data/sim/diff | share end-stock>0: "
+        f" parinc | mean positive {source}: data/sim/diff | {share_name}: "
         f"data/sim/diff | std positive {source}: data/sim/diff | "
         f"p80 positive {source}: data/sim/diff"
     )
@@ -2122,15 +2139,23 @@ def _print_parental_income_loan_type_fit(
 ):
     print("\n" + "=" * 144)
     print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    share_name = (
+        "share new-flow>0" if moment_spec == "fast_flow"
+        else "share end-stock>0"
+    )
+    share_weight_name = (
+        "share receiving new loans" if moment_spec == "fast_flow"
+        else "share indebted"
+    )
     print(
         " TARGETED LOAN-TYPE MOMENTS; loss weights per cell: "
         f"mean positive={primary_moment_weight:g}, "
-        f"share indebted={primary_moment_weight:g}, std=1, p80=1"
+        f"{share_weight_name}={primary_moment_weight:g}, std=1, p80=1"
     )
     source = "stock" if moment_spec == "fast_stock" else "annual flow"
     print(
         f" loan type | parinc | mean positive {source}: data/sim/diff | "
-        "share end-stock>0: data/sim/diff | std: data/sim/diff | "
+        f"{share_name}: data/sim/diff | std: data/sim/diff | "
         "p80: data/sim/diff | positive-flow share"
     )
     for row, (loan_type, parinc) in enumerate(labels):
@@ -2735,7 +2760,7 @@ def fit_education_cell(
     draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
     seed=12345, initial=None,
     fixed_common=None, specification="parental_income_basic",
-    type_integration="sampled", moment_spec="fast_stock",
+    type_integration="sampled", moment_spec="fast_flow",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
 ):
@@ -2914,7 +2939,7 @@ def fit_education_cell(
 def fit_education_cells(
     packs_by_program_year, education=2, program_years=(1, 2, 3, 4),
     draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
-    seed=12345, initial=None, moment_spec="fast_stock",
+    seed=12345, initial=None, moment_spec="fast_flow",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated", optimizer="nelder-mead",
     annealing_maxfun=500, education_cells=None, cell_workers=None,
@@ -3220,7 +3245,7 @@ def estimate_budget_shock_education_cell(
     shock_heterogeneity="homogeneous",
     specification="parental_income_basic",
     type_integration="sampled",
-    moment_spec="fast_stock",
+    moment_spec="fast_flow",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
     draws=20,
@@ -3293,7 +3318,7 @@ def estimate_budget_shock_education_cell(
 def estimate_budget_shock_education_cells(
     education=2,
     program_years=(1, 2, 3, 4),
-    moment_spec="fast_stock",
+    moment_spec="fast_flow",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
     draws=20,
@@ -3425,7 +3450,7 @@ def estimate_budget_shock_all_education(
     seed=12345,
     optimizer="hybrid",
     annealing_maxfun=500,
-    moment_spec="fast_stock",
+    moment_spec="fast_flow",
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated",
     initial=None,

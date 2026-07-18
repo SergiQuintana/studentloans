@@ -47,7 +47,7 @@ class Tee:
 
 def result_prefix(
     education, program_year, heterogeneity, specification,
-    type_integration="sampled", moment_spec="fast_stock", resource_mode="simulated",
+    type_integration="sampled", moment_spec="fast_flow", resource_mode="simulated",
 ):
     if specification in ("parental_income_basic", "parental_income_loan_type"):
         return (
@@ -321,7 +321,8 @@ def build_parser():
         "--type-integration", choices=("sampled", "exact"), default="sampled"
     )
     parser.add_argument(
-        "--moment-spec", choices=("fast_stock", "flow_stock"), default="fast_stock"
+        "--moment-spec", choices=("fast_stock", "flow_stock", "fast_flow"),
+        default="fast_flow"
     )
     parser.add_argument(
         "--primary-moment-weight",

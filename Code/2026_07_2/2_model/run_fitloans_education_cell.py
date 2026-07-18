@@ -60,15 +60,18 @@ def build_parser():
     parser.add_argument(
         "--moment-spec",
         choices=PARENTAL_INCOME_MOMENT_SPECS,
-        default="fast_stock",
-        help="fast_stock exactly matches the four model_fitloans_fast moment definitions.",
+        default="fast_flow",
+        help=(
+            "fast_flow targets mean, receipt share, standard deviation, and "
+            "p80 of positive annual new-loan flows."
+        ),
     )
     parser.add_argument(
         "--primary-moment-weight",
         type=float,
         default=DEFAULT_PRIMARY_MOMENT_WEIGHT,
         help=(
-            "Loss weight on mean positive loans and share indebted in every "
+            "Loss weight on mean positive loans and the participation share in every "
             "parinc group; std and p80 each retain weight 1 (default: 4)."
         ),
     )

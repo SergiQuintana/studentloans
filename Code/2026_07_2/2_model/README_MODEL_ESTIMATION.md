@@ -184,19 +184,22 @@ loan-type heterogeneity remains available but is not used by
 
 ## Active moments and loss
 
-Production currently uses `moment_spec="fast_stock"`. For every education cell
-and parental-income group it targets:
+Production currently uses `moment_spec="fast_flow"`. New annual borrowing is
+defined consistently in data and simulation as
+`b_next - (1 + interest_rate) * b_current`. For every education cell and
+parental-income group it targets:
 
-1. mean positive end-of-period debt stock;
-2. share with positive end-of-period debt stock;
-3. standard deviation of positive debt stock;
-4. 80th percentile of positive debt stock.
+1. mean positive new-loan flow, conditional on receiving a new loan;
+2. share receiving a positive new-loan flow;
+3. standard deviation of positive new-loan flow;
+4. 80th percentile of positive new-loan flow.
 
 Each error is divided by the absolute data moment, with a small numerical
 floor. The first two moments receive weight 4 each; the dispersion moments
 receive weight 1 each. Parental-income groups themselves receive equal weight,
-regardless of their sample sizes. Positive new-flow shares are printed as a
-diagnostic but are not targeted under `fast_stock`.
+regardless of their sample sizes. Stock-based `fast_stock` and the mixed
+`flow_stock` specification remain available for comparison, but are not the
+active production moments.
 
 Across education cells, the cell loss is weighted by enrolled observations:
 `N_cell / mean(N_cell)`. This gives more influence to education-year groups
@@ -204,12 +207,9 @@ with more data without changing the equal treatment of parental-income groups
 inside a cell. Every printed fit block reports the cell's N, normalized weight,
 raw loss, and weighted contribution.
 
-The current objective therefore prioritizes average positive debt and the debt
-participation share, as requested. However, the longer-run research preference
-is likely to use positive annual loan flows for the amount moment while keeping
-the indebtedness share based on debt stock. This is not the active production
-definition yet. Do not silently switch it: confirm the exact moment and its
-interest-rate treatment first.
+The current objective therefore prioritizes the average positive new loan and
+the new-loan receipt share. Interest accumulation on existing debt is removed
+before determining whether an individual receives a new loan.
 
 Model fit is printed every ten objective evaluations for every education cell
 and parental-income group. Preserve these data/simulation comparisons when
@@ -309,8 +309,8 @@ must not change the working directory.
 
 ## Open questions; do not resolve without confirmation
 
-- Whether the amount target should change from positive debt stock to positive
-  annual loan flow while retaining stock-based indebtedness.
+- Whether later specifications should reintroduce stock-based indebtedness or
+  debt persistence as additional moments alongside the active flow moments.
 - Whether the present grouped education-year support should be revised after
   the joint estimates are evaluated.
 - Whether and how latent loan type should enter the structural budget process
