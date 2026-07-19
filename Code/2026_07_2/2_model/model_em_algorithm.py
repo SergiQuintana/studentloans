@@ -560,63 +560,104 @@ def map_vjt_columns(vjt_i,column_map,idx,total_choices,i):
     return vjt_column
     
 def prepare_vjt_feasible(period):
-    
-    """"This function loads the vjts to avoid doing that at each iteration of the 
-    likelihood function. I should parallelize this function at some point,
-    it takes a lot of time..."""
-    
-    # At some point I could parallelize this!
-        
+    """Build likelihood-ready VJTs while opening each compressed bundle once.
+
+    Bellman output is stored in one ``.npz`` bundle for each period, permanent
+    type, and invariant state. The legacy implementation reopened that same
+    bundle for every observed individual. Here observations are grouped first
+    by invariant state and then by dynamic state, so all required debt rows are
+    selected in batches from a single open archive.
+
+    The saved arrays retain the legacy layout: rows follow the estimation
+    sample, columns follow ``get_total_choices()``, and dynamically infeasible
+    choices contain ``-np.inf``.
+    """
+
     print("Current period is", period)
-            
-    x1,state,debt,choices = load_data_superfeasible(period, return_income=False)
-        
-    #x1,state,debt,choices = get_data_simulated(period)
-            
-    # Loop over all individuals
-    total_choices = get_total_choices()  # This should load the array with all set of choices
-    # Generate column map
-    column_map = np.repeat(np.nan,np.shape(state)[0]*np.shape(total_choices)[0]).reshape(np.shape(state)[0],np.shape(total_choices)[0])  # This array will hold how to map from columns in payoff, to the corresponding choice. As safety I will create it with nans
-     
+
+    x1, state, debt, choices = load_data_superfeasible(
+        period, return_income=False
+    )
+    del choices  # Choice realizations are not needed to prepare all alternatives.
+
+    x1 = np.asarray(x1, dtype=np.int64)
+    state = np.asarray(state, dtype=np.int64)
+    debt = np.asarray(debt, dtype=np.int64).reshape(-1)
+    total_choices = get_total_choices()
+    number_observations = state.shape[0]
+    number_choices = total_choices.shape[0]
+
+    if x1.shape[0] != number_observations or debt.shape[0] != number_observations:
+        raise ValueError(
+            "Invariant states, dynamic states, and debt indices must have "
+            "the same number of observations."
+        )
+
+    unique_x1, x1_group = np.unique(x1, axis=0, return_inverse=True)
+    unique_state, state_group = np.unique(state, axis=0, return_inverse=True)
+
+    # Choice feasibility depends only on the dynamic state, not on the latent
+    # type or invariant state. Compute this mapping once and reuse it for all
+    # sixteen type-specific arrays.
+    choice_columns_by_state = []
+    for x2i in unique_state:
+        possible_choices = get_possible_choices(x2i)
+        choice_columns = np.where(
+            (total_choices == possible_choices[:, None]).all(-1)
+        )[1]
+        if choice_columns.shape[0] != possible_choices.shape[0]:
+            raise ValueError(
+                f"Could not map every feasible choice for dynamic state {x2i}."
+            )
+        choice_columns_by_state.append(choice_columns)
+
+    rows_by_x1 = [
+        np.flatnonzero(x1_group == group)
+        for group in range(unique_x1.shape[0])
+    ]
+
     # Keep the public one-based IDs used in the Bellman filenames, while taking
     # the number and ordering of types from the shared latent-type definition.
     for em_type in TYPE_IDS:
-        
-        vjt = np.zeros((np.shape(state)[0],np.shape(total_choices)[0]))
-                
-        # Now loop over all individuals
-                
-        for i in range(np.shape(state)[0]):
-                
-            # Get individual i
-                
-            x2i = state[i,:].astype("int")
-            x1i = x1[i,:].astype("int")
-            bi = int(debt[i])
-                
-            #Check which choices are feasible
-                    
-            # Identify the index of choices.
-                    
-            Jx  = get_possible_choices(x2i)
-                    
-            idx = np.where( (total_choices==Jx[:,None]).all(-1) )[1]  # This tells which index in tota_choices corresponds to each choice in Jx
-        
-            idx = np.concatenate((idx[...,np.newaxis],np.arange(0,np.shape(idx)[0]).reshape(np.shape(idx)[0],1)),axis=1)  # This just includes the index of Jx as a column in the array. 
-        
-            column_map[i,idx[:,0]] = idx[:,1]  # This performs the match to this individual of the corresponding mapping.
-                    
-            # At some point I could load all the individuals with the same x1 at once
-            # I should use the column map strategy:
+        vjt = np.full(
+            (number_observations, number_choices), -np.inf, dtype=np.float64
+        )
 
-            vjt_i_temp = np.load(f"{pathout}/vjt_nog/{period}/vjt_t{period}_[{x1i}]_em{em_type}.npz")
-            vjt_i = vjt_i_temp[f"vjt_t{period}_[{x1i}]_{x2i}"][bi,:]
-            vjt[i,:] =  map_vjt_columns(vjt_i,column_map,idx,total_choices,i)
+        for group, x1i in enumerate(unique_x1):
+            group_rows = rows_by_x1[group]
+            bundle_path = (
+                f"{pathout}/vjt_nog/{period}/"
+                f"vjt_t{period}_[{x1i}]_em{em_type}.npz"
+            )
 
+            with np.load(bundle_path, allow_pickle=False) as bundle:
+                group_state_ids = state_group[group_rows]
+                for state_id in np.unique(group_state_ids):
+                    rows = group_rows[group_state_ids == state_id]
+                    x2i = unique_state[state_id]
+                    key = f"vjt_t{period}_[{x1i}]_{x2i}"
+                    state_vjt = np.asarray(bundle[key])
+                    choice_columns = choice_columns_by_state[state_id]
 
-            # now save the data
-        print(f"Period {period} finsihed")
-        np.save(f"{pathout}/likelihood/vjt_super_t{period}_em{em_type}.npy",vjt)
+                    if state_vjt.ndim != 2:
+                        raise ValueError(
+                            f"Bellman array {key} in {bundle_path} must be "
+                            f"two-dimensional; received {state_vjt.shape}."
+                        )
+                    if state_vjt.shape[1] != choice_columns.shape[0]:
+                        raise ValueError(
+                            f"Bellman array {key} has {state_vjt.shape[1]} "
+                            f"choice columns; expected {choice_columns.shape[0]}."
+                        )
+
+                    selected = state_vjt[debt[rows], :]
+                    vjt[np.ix_(rows, choice_columns)] = selected
+
+        print(f"Period {period}, type {em_type} finished")
+        np.save(
+            f"{pathout}/likelihood/vjt_super_t{period}_em{em_type}.npy",
+            vjt,
+        )
     
     
 def prepare_vjt(period):
