@@ -125,6 +125,7 @@ class DebugRecorder:
         self.x1_index = int(x1_index)
         self.failures: list[dict[str, Any]] = []
         self.checks = 0
+        self.observations: dict[str, dict[str, Any]] = {}
         self.started = time.time()
         self.directory = (
             Path(config.output_dir)
@@ -206,6 +207,42 @@ class DebugRecorder:
     def note(self, reason: str, metadata: dict[str, Any], arrays=None) -> None:
         self.record(reason, metadata, arrays=arrays, fatal=False)
 
+    def observe(self, name: str, array: Any) -> None:
+        """Accumulate compact numeric ranges without retaining successful arrays."""
+        array = np.asarray(array)
+        if not np.issubdtype(array.dtype, np.number):
+            return
+        finite = np.isfinite(array)
+        finite_values = array[finite]
+        current = self.observations.setdefault(
+            str(name),
+            {
+                "arrays": 0,
+                "size": 0,
+                "finite": 0,
+                "nan": 0,
+                "positive_inf": 0,
+                "negative_inf": 0,
+                "zero": 0,
+                "finite_min": None,
+                "finite_max": None,
+            },
+        )
+        current["arrays"] += 1
+        current["size"] += int(array.size)
+        current["finite"] += int(np.count_nonzero(finite))
+        current["nan"] += int(np.count_nonzero(np.isnan(array)))
+        current["positive_inf"] += int(np.count_nonzero(np.isposinf(array)))
+        current["negative_inf"] += int(np.count_nonzero(np.isneginf(array)))
+        current["zero"] += int(np.count_nonzero(array == 0.0))
+        if finite_values.size:
+            minimum = float(np.min(finite_values))
+            maximum = float(np.max(finite_values))
+            if current["finite_min"] is None or minimum < current["finite_min"]:
+                current["finite_min"] = minimum
+            if current["finite_max"] is None or maximum > current["finite_max"]:
+                current["finite_max"] = maximum
+
     def _write_summary(self):
         summary = {
             "pid": os.getpid(),
@@ -216,6 +253,7 @@ class DebugRecorder:
             "failures": len(self.failures),
             "elapsed_seconds": time.time() - self.started,
             "failure_reasons": [item["reason"] for item in self.failures],
+            "observations": self.observations,
         }
         (self.directory / "summary.json").write_text(
             json.dumps(_json_value(summary), indent=2, sort_keys=True),
@@ -230,5 +268,6 @@ class DebugRecorder:
             "x1_index": self.x1_index,
             "checks": self.checks,
             "failures": len(self.failures),
+            "observations": self.observations,
             "output_dir": str(self.directory),
         }

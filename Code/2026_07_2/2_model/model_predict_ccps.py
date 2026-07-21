@@ -299,6 +299,8 @@ def get_all_ccps_debug(i, x1, b, model_parameters, type_id, debug_config):
             )
             home_log_ccp = home_vjt - log_denom
             all_ccps = np.exp(home_log_ccp)
+            recorder.observe("initial_home_log_ccp", home_log_ccp)
+            recorder.observe("initial_home_ccp", all_ccps)
             recorder.check(
                 "initial_home_ccp",
                 all_ccps,

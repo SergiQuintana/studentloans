@@ -18,7 +18,7 @@ PRODUCTION_AST_HASHES = {
     ("model_solution_em.py", "get_expected_conditional"):
         "6f4a253f5a3ffd21ceb6fa50d021996a5b26144884e56daa903b006c8cad6d21",
     ("model_solution_em.py", "get_all_choices"):
-        "26a2e63d8ed6d4c03de99b8b3d543df829c5a070539bebd00bbba4b2ffd7d828",
+        "54ef43f1a77c86b6eb44a65215b7cb3c0b94fbadb36876a07af09341fcf2961b",
     ("model_solution_em.py", "loop_rows"):
         "a2f19b953ed9b30b6e81efe4f12a578174ea668abcbaee6ed1c94f8c69051564",
     ("model_solution_em.py", "loop_over_states"):
@@ -76,3 +76,31 @@ def test_scalar_problem_is_detected():
     assert finite_problems(np.asarray(np.nan), "risk_aversion") == [
         {"reason": "risk_aversion_nonfinite", "index": ()}
     ]
+
+
+def test_full_debugger_contains_the_production_npl_stages():
+    tree = ast.parse(
+        (HERE / "estimation_all_em_debugger.py").read_text(encoding="utf-8-sig")
+    )
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_full_estimation"
+    )
+    identifiers = {
+        node.id for node in ast.walk(function) if isinstance(node, ast.Name)
+    }
+    attributes = {
+        node.attr for node in ast.walk(function) if isinstance(node, ast.Attribute)
+    }
+    assert {
+        "get_feasible",
+        "get_feasible_pubid",
+        "get_x_g_superfeasible",
+        "estimate_budget_shock_all_education",
+        "_bellman_worker",
+        "_prepare_and_diagnose_likelihood",
+        "_optimize_structural_likelihood",
+    }.issubset(identifiers | attributes)
+    source = ast.unparse(function)
+    assert "ccp_real = 0 if iteration == 0 else 1" in source
+    assert "x0_next = param_g * 0.7 + x0 * 0.3" in source

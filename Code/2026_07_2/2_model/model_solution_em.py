@@ -1937,11 +1937,18 @@ def get_all_choices(
             
             all_vjt_temp = all_vjt + g
             
-            ccp = np.exp(all_vjt_temp[:,base]) / np.sum(np.exp(all_vjt_temp),axis=1)
+            log_ccp = (
+                all_vjt_temp[:,base]
+                - scipy.special.logsumexp(all_vjt_temp,axis=1)
+            )
+            ccp = np.exp(log_ccp)
             
         vjt_ccp = all_vjt[:,base]
         
-        evt = vjt_ccp -np.log(ccp) + gamma
+        if ccp_real == 1:
+            evt = vjt_ccp - log_ccp + gamma
+        else:
+            evt = vjt_ccp -np.log(ccp) + gamma
         
     elif solution_mode == 1:
         
@@ -2639,21 +2646,53 @@ def get_all_choices_debug(
             g = get_all_g(utility_parameters, x1, x1_new, x2, Jx, period)
             recorder.check("g", g, finite_problems(g, "g"), state_metadata)
             all_vjt_temp = all_vjt + g
-            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-                ccp = np.exp(all_vjt_temp[:, base]) / np.sum(
-                    np.exp(all_vjt_temp), axis=1
-                )
+            log_ccp = (
+                all_vjt_temp[:, base]
+                - scipy.special.logsumexp(all_vjt_temp, axis=1)
+            )
+            recorder.check(
+                "home_log_ccp",
+                log_ccp,
+                finite_problems(log_ccp, "home_log_ccp"),
+                state_metadata,
+                arrays={
+                    "debt_grid": b,
+                    "choices": Jx,
+                    "choice_vjt": all_vjt,
+                    "g": g,
+                    "total_choice_utility": all_vjt_temp,
+                    "home_log_ccp": log_ccp,
+                },
+            )
+            recorder.observe("updated_home_log_ccp", log_ccp)
+            ccp = np.exp(log_ccp)
+        recorder.observe(
+            "initial_home_ccp_consumed" if ccp_real == 0 else "updated_home_ccp",
+            ccp,
+        )
         recorder.check(
             "home_ccp", ccp, ccp_problems(ccp), state_metadata,
-            arrays={"debt_grid": b, "choices": Jx, "choice_vjt": all_vjt, "ccp": ccp},
+            arrays={
+                "debt_grid": b,
+                "choices": Jx,
+                "choice_vjt": all_vjt,
+                "home_log_ccp": (
+                    np.array([]) if ccp_real == 0 else log_ccp
+                ),
+                "ccp": ccp,
+            },
         )
         vjt_ccp = all_vjt[:, base]
         recorder.check(
             "home_vjt", vjt_ccp, finite_problems(vjt_ccp, "home_vjt"),
             {**state_metadata, "choice_index": int(base % len(Jx)), "choice": Jx[base]},
         )
-        with np.errstate(divide="ignore", invalid="ignore"):
-            expected_vjt = vjt_ccp - np.log(ccp) + gamma
+        if ccp_real == 1:
+            expected_vjt = vjt_ccp - log_ccp + gamma
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                expected_vjt = vjt_ccp - np.log(ccp) + gamma
+        recorder.observe("outgoing_evt", expected_vjt)
     elif solution_mode == 1:
         g = get_all_g(utility_parameters, x1, x1_new, x2, Jx, period)
         recorder.check("g", g, finite_problems(g, "g"), state_metadata)
@@ -2739,10 +2778,35 @@ def loop_over_states_debug(
         save_evt, names_vjt, result_vjt, names_exp, result_exp, save_npz_here
     )
     if ccp_real == 1 and period < T:
+        relative_ccp_path = f"ccp/{period}/ccp_t{period}_{x1i}_em{em_type}.npz"
         save_npz_here(
-            f"ccp/{period}/ccp_t{period}_{x1i}_em{em_type}.npz",
+            relative_ccp_path,
             names_ccp, results_ccp, compressed=True,
         )
+        if recorder.config.verify_saved:
+            saved_ccp_path = os.path.join(pathout, *relative_ccp_path.split("/"))
+            with np.load(saved_ccp_path, allow_pickle=False) as saved_ccps:
+                expected_keys = set(names_ccp)
+                saved_keys = set(saved_ccps.files)
+                if saved_keys != expected_keys:
+                    recorder.record(
+                        "saved_updated_ccp_keys_mismatch",
+                        {
+                            "period": int(period),
+                            "path": saved_ccp_path,
+                            "missing_keys": sorted(expected_keys - saved_keys),
+                            "extra_keys": sorted(saved_keys - expected_keys),
+                        },
+                    )
+                for key, expected in zip(names_ccp, results_ccp):
+                    if key in saved_ccps and not np.array_equal(
+                        saved_ccps[key], expected
+                    ):
+                        recorder.record(
+                            "saved_updated_ccp_value_mismatch",
+                            {"period": int(period), "path": saved_ccp_path, "key": key},
+                            arrays={"expected": expected, "saved": saved_ccps[key]},
+                        )
     return dict(zip(names_exp, result_exp))
 
 
