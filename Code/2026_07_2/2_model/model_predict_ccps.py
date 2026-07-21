@@ -199,6 +199,151 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
         )
 
 
+def get_all_ccps_debug(i, x1, b, model_parameters, type_id, debug_config):
+    """Checked initial-CCP solve used only by ``estimation_all_em_debugger``.
+
+    This deliberately lives beside, rather than inside, :func:`get_all_ccps`.
+    The production function therefore retains its exact code path and runtime.
+    """
+    from model_debug_checks import (
+        DebugRecorder,
+        ccp_problems,
+        finite_problems,
+        vjt_problems,
+    )
+
+    recorder = DebugRecorder(debug_config, "initial_ccp", type_id, i)
+    inv_row = np.asarray(x1[i, :], dtype=int)
+    inv = inv_row[None, :]
+    x1_new = get_x1_new(inv_row)
+    debt = np.asarray(b, dtype=float)
+
+    for period in INITIAL_CCP_PERIODS:
+        x2_set = get_x2(period)
+        results_ccp = []
+        names_ccp = []
+        for x2_index, x2_value in enumerate(x2_set):
+            x2 = np.asarray(x2_value, dtype=int)
+            choices = get_possible_choices(x2)
+            metadata = {
+                "period": int(period),
+                "x1": inv_row,
+                "x2_index": int(x2_index),
+                "x2": x2,
+            }
+
+            expected_consumption = get_expected_consumption(
+                x1_new, x2, choices, type_id, model_parameters
+            )
+            recorder.check(
+                "expected_consumption",
+                expected_consumption,
+                finite_problems(expected_consumption, "expected_consumption"),
+                metadata,
+            )
+            g = get_all_g(
+                model_parameters["utility_parameters"],
+                inv,
+                x1_new,
+                x2,
+                choices,
+                period,
+            )
+            recorder.check("g", g, finite_problems(g, "g"), metadata)
+
+            # Use the same public numerical kernel as production.
+            all_vjt = get_all_choices(
+                inv, x1_new, x2, debt, period, model_parameters, type_id
+            )
+            recorder.check(
+                "initial_vjt",
+                all_vjt,
+                vjt_problems(all_vjt),
+                metadata,
+                arrays={
+                    "x1": inv_row,
+                    "x1_new": x1_new,
+                    "x2": x2,
+                    "debt_grid": debt,
+                    "choices": choices,
+                    "expected_consumption": expected_consumption,
+                    "g": g,
+                    "initial_vjt": all_vjt,
+                },
+            )
+
+            home = np.flatnonzero(np.all(choices == 0, axis=1))
+            if len(home) != 1:
+                recorder.record(
+                    "home_choice_count",
+                    {**metadata, "home_choice_count": int(len(home))},
+                    arrays={"choices": choices},
+                )
+                continue
+            base = int(home[0])
+            home_vjt = all_vjt[:, base]
+            home_metadata = {**metadata, "choice_index": base, "choice": choices[base]}
+            recorder.check(
+                "home_vjt",
+                home_vjt,
+                finite_problems(home_vjt, "home_vjt"),
+                home_metadata,
+            )
+
+            log_denom = logsumexp(all_vjt, axis=1)
+            recorder.check(
+                "log_denom",
+                log_denom,
+                finite_problems(log_denom, "log_denom"),
+                home_metadata,
+            )
+            home_log_ccp = home_vjt - log_denom
+            all_ccps = np.exp(home_log_ccp)
+            recorder.check(
+                "initial_home_ccp",
+                all_ccps,
+                ccp_problems(all_ccps),
+                home_metadata,
+                arrays={
+                    "debt_grid": debt,
+                    "choices": choices,
+                    "initial_vjt": all_vjt,
+                    "log_denom": log_denom,
+                    "home_log_ccp": home_log_ccp,
+                    "initial_home_ccp": all_ccps,
+                },
+            )
+            results_ccp.append(all_ccps)
+            names_ccp.append(f"ccp_t{period}_{inv}_{x2}")
+
+        relative_path = f"ccp/{period}/ccp_t{period}_{inv}_em{type_id}.npz"
+        save_npz_here(relative_path, names_ccp, results_ccp, compressed=True)
+        if debug_config.verify_saved:
+            saved_path = Path(path_out) / relative_path
+            with np.load(saved_path, allow_pickle=False) as saved:
+                expected_keys = set(names_ccp)
+                actual_keys = set(saved.files)
+                if actual_keys != expected_keys:
+                    recorder.record(
+                        "saved_ccp_keys_mismatch",
+                        {
+                            "period": int(period),
+                            "missing_keys": sorted(expected_keys - actual_keys),
+                            "extra_keys": sorted(actual_keys - expected_keys),
+                            "path": saved_path,
+                        },
+                    )
+                for key, expected in zip(names_ccp, results_ccp):
+                    if key in saved and not np.array_equal(saved[key], expected):
+                        recorder.record(
+                            "saved_ccp_value_mismatch",
+                            {"period": int(period), "key": key, "path": saved_path},
+                            arrays={"expected": expected, "saved": saved[key]},
+                        )
+
+    return recorder.finalize()
+
+
 def initial_ccp_bundle_path(period, invariant_state, type_id, output_root=None):
     """Return the exact initial-CCP filename consumed by the Bellman solver."""
     if output_root is None:

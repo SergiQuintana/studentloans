@@ -230,7 +230,10 @@ def _selected_worst_rows(arrays, limit):
     return np.concatenate((problem_order, finite_order))[:limit]
 
 
-def diagnose_likelihood_inputs(q, x0, worst_rows=10):
+def diagnose_likelihood_inputs(q, x0, worst_rows=10, prepared_arrays=None):
+    """Diagnose structural likelihood inputs, optionally reusing loaded arrays."""
+    if prepared_arrays is None:
+        prepared_arrays = model.load_all_arrays_feasible()
     (
         choices_all,
         vjt_all_types,
@@ -242,7 +245,7 @@ def diagnose_likelihood_inputs(q, x0, worst_rows=10):
         x_first4,
         x_firstgrad,
         x_exp,
-    ) = model.load_all_arrays_feasible()
+    ) = prepared_arrays
 
     utility_parameters = model.build_param_g(x0)
     summaries = []

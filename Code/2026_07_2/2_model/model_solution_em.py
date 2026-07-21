@@ -2399,6 +2399,404 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
             f"| task={time.perf_counter() - task_started:.2f}s",
             flush=True,
         )
+
+
+def _trace_expected_conditional_debug(
+    sigma_u, x1, x1_new, x2, x2_new, b, b1, j, period, evt,
+    conterfactual, maxdebt, financial_parameters, deg=5, deg_budget=5
+):
+    """Replay one choice without aggregation and retain quadrature identities."""
+    nb = np.shape(b)[0]
+    e_nodes, we = get_quadrature_wage(deg, mu, j)
+
+    if j[1] == 0:
+        if j[2] != 0:
+            param_wage_j = get_params_wage(j)
+            debtnew, income = get_debt_income(
+                x1_new, x2_new, x2, period, j, b, e_nodes,
+                conterfactual, param_wage_j,
+            )
+        else:
+            debtnew, income = get_debt_income_home(
+                x1_new, x2_new, x2, period, j, b, e_nodes, conterfactual
+            )
+        debt_position = map_debt_position(b, debtnew)
+        flow_utility = get_power_utility(sigma_u, income)
+        continuation = evolve_continuation(
+            x1, x1_new, x2, x2_new, b, period, e_nodes, j, evt, debt_position
+        )
+        debt_penalty = float(x1_new @ debt_pen_vec) * np.tile(
+            (b > 0).astype(np.float64), len(e_nodes)
+        )
+        raw_flat = flow_utility + continuation + debt_penalty
+        raw = raw_flat.reshape((len(e_nodes), nb)).T
+        weighted = raw * we[None, :]
+        return {
+            "income_by_node_debt": income.reshape((len(e_nodes), nb)),
+            "next_debt_by_node_debt": debtnew.reshape((len(e_nodes), nb)),
+            "next_debt_index_by_node_debt": debt_position.reshape((len(e_nodes), nb)),
+            "flow_utility_by_node_debt": flow_utility.reshape((len(e_nodes), nb)),
+            "continuation_by_node_debt": continuation.reshape((len(e_nodes), nb)),
+            "debt_penalty_by_node_debt": debt_penalty.reshape((len(e_nodes), nb)),
+            "raw_vjt_by_debt_node": raw,
+            "weighted_vjt_by_debt_node": weighted,
+            "integrated_vjt": np.sum(weighted, axis=1),
+            "wage_nodes": e_nodes,
+            "wage_weights": we,
+            "budget_standard_nodes": np.array([0.0]),
+            "budget_weights": np.array([1.0]),
+            "actual_budget_shock_by_node_debt": np.zeros((len(e_nodes), nb)),
+            "pre_choice_resources_by_node_debt": np.zeros((len(e_nodes), nb)),
+            "joint_wage_index": np.arange(len(e_nodes), dtype=int),
+            "joint_budget_index": np.zeros(len(e_nodes), dtype=int),
+        }
+
+    standard_nodes, wz = np.polynomial.hermite.hermgauss(deg_budget)
+    standard_nodes = np.sqrt(2.0) * standard_nodes
+    wz = wz / np.sqrt(np.pi)
+    e_joint = np.tile(e_nodes, len(standard_nodes))
+    z_standard_joint = np.repeat(standard_nodes, len(e_nodes))
+    w_joint = np.kron(wz, we)
+
+    h0 = float(fin_help(x1_new, j, financial_parameters))
+    wage_index = float(np.asarray(wage0(x1_new, x2)).reshape(-1)[0])
+    real_wage = np.exp(wage_index + e_joint) * (j[2] / 2.0) * 52.0 * 40.0
+    pre_choice_resources = (
+        h0 + real_wage[:, None] - tuition(j) - (1.0 + r) * b[None, :]
+    )
+    z_joint = bs.realization(
+        budget_params, x1, period, z_standard_joint[:, None],
+        education=int(j[1]), state=x2,
+        pre_choice_resources=pre_choice_resources,
+    ).reshape(-1)
+    conditional_utility = get_utility(
+        sigma_u, x1, x1_new, x2_new, b, b1, e_joint, j, period,
+        financial_parameters, z=z_joint,
+    )
+    continuation = beta * VT(x1, x1_new, x2, x2_new, b1, period, j, evt, 0)
+    continuation = np.asarray(continuation).copy()
+    candidate_debt_penalty = float(x1_new @ debt_pen_vec) * (
+        b1 > 0
+    ).astype(np.float64)
+    continuation[:, 0] += candidate_debt_penalty
+    raw_flat = get_maximum(
+        sigma_u, conditional_utility, continuation, x1, b, j, x2, maxdebt
+    )
+    raw = raw_flat.reshape((len(w_joint), nb)).T
+    weighted = raw * w_joint[None, :]
+    return {
+        "raw_vjt_by_debt_node": raw,
+        "weighted_vjt_by_debt_node": weighted,
+        "integrated_vjt": np.sum(weighted, axis=1),
+        "wage_nodes": e_nodes,
+        "wage_weights": we,
+        "budget_standard_nodes": standard_nodes,
+        "budget_weights": wz,
+        "actual_budget_shock_by_node_debt": z_joint.reshape(len(w_joint), nb),
+        "pre_choice_resources_by_node_debt": pre_choice_resources,
+        "conditional_utility": conditional_utility,
+        "continuation_by_candidate_debt": continuation,
+        "candidate_debt_penalty": candidate_debt_penalty,
+        "joint_wage_index": np.tile(
+            np.arange(len(e_nodes), dtype=int), len(standard_nodes)
+        ),
+        "joint_budget_index": np.repeat(
+            np.arange(len(standard_nodes), dtype=int), len(e_nodes)
+        ),
+    }
+
+
+def get_all_choices_debug(
+    x1, x1_new, x2, x2_new, b, b1, period, evt, ccp_real, sigma_u,
+    utility_parameters, models, solution_mode, conterfactual, maxdebt,
+    financial_parameters, recorder, state_metadata
+):
+    """Checked Bellman choice calculation; production entry point is untouched."""
+    from model_debug_checks import ccp_problems, finite_problems, vjt_problems
+
+    Jx = get_possible_choices(x2)
+    all_vjt = np.zeros((np.shape(b)[0], np.shape(Jx)[0]))
+    for choice_index, j in enumerate(Jx):
+        metadata = {
+            **state_metadata,
+            "choice_index": int(choice_index),
+            "choice": np.asarray(j, dtype=int),
+        }
+        vjt = get_expected_conditional(
+            sigma_u, x1, x1_new, x2, x2_new, b, b1, j, period, 5,
+            evt, conterfactual, maxdebt, financial_parameters
+        )
+        problems = vjt_problems(vjt)
+        if problems:
+            trace = _trace_expected_conditional_debug(
+                sigma_u, x1, x1_new, x2, x2_new, b, b1, j, period,
+                evt, conterfactual, maxdebt, financial_parameters
+            )
+            bad = np.argwhere(
+                np.isnan(trace["raw_vjt_by_debt_node"])
+                | np.isposinf(trace["raw_vjt_by_debt_node"])
+            )
+            if bad.size:
+                debt_index, joint_index = (int(value) for value in bad[0])
+                metadata.update(
+                    debt_index=debt_index,
+                    debt=float(np.asarray(b)[debt_index]),
+                    joint_node_index=joint_index,
+                    wage_node_index=int(trace["joint_wage_index"][joint_index]),
+                    budget_node_index=int(trace["joint_budget_index"][joint_index]),
+                    wage_shock=float(
+                        trace["wage_nodes"][trace["joint_wage_index"][joint_index]]
+                    ),
+                    budget_standard_shock=float(
+                        trace["budget_standard_nodes"][
+                            trace["joint_budget_index"][joint_index]
+                        ]
+                    ),
+                    budget_actual_shock=float(
+                        trace["actual_budget_shock_by_node_debt"][
+                            joint_index, debt_index
+                        ]
+                    ),
+                    pre_choice_resources=float(
+                        trace["pre_choice_resources_by_node_debt"][
+                            joint_index, debt_index
+                        ]
+                    ),
+                )
+            replay_matches = np.allclose(
+                trace["integrated_vjt"], vjt, rtol=1e-12, atol=1e-12,
+                equal_nan=True,
+            )
+            metadata["quadrature_replay_matches"] = bool(replay_matches)
+            for intermediate_name in (
+                "income_by_node_debt",
+                "next_debt_by_node_debt",
+                "flow_utility_by_node_debt",
+                "conditional_utility",
+                "continuation_by_node_debt",
+                "continuation_by_candidate_debt",
+                "raw_vjt_by_debt_node",
+                "weighted_vjt_by_debt_node",
+                "integrated_vjt",
+            ):
+                if intermediate_name not in trace:
+                    continue
+                intermediate = np.asarray(trace[intermediate_name])
+                invalid = np.isnan(intermediate) | np.isposinf(intermediate)
+                coordinates = np.argwhere(invalid)
+                if coordinates.size:
+                    metadata["first_nonfinite_stage"] = intermediate_name
+                    metadata["first_nonfinite_stage_index"] = tuple(
+                        int(value) for value in coordinates[0]
+                    )
+                    break
+            recorder.check(
+                "choice_vjt",
+                vjt,
+                problems,
+                metadata,
+                arrays={
+                    "x1": x1,
+                    "x1_new": x1_new,
+                    "x2": x2,
+                    "choice": j,
+                    "debt_grid": b,
+                    "next_debt_grid": b1,
+                    "production_integrated_vjt": vjt,
+                    **trace,
+                },
+            )
+        all_vjt[:, choice_index] = vjt
+
+    recorder.check(
+        "all_choice_vjt", all_vjt, vjt_problems(all_vjt), state_metadata,
+        arrays={"debt_grid": b, "choices": Jx, "all_choice_vjt": all_vjt},
+    )
+    home = np.flatnonzero(np.all(Jx == 0, axis=1))
+    if home.size != 1:
+        recorder.record(
+            "home_choice_count",
+            {**state_metadata, "home_choice_count": int(home.size)},
+            arrays={"choices": Jx},
+        )
+    base = -1
+    if home.size == 1 and int(home[0]) != base % len(Jx):
+        recorder.record(
+            "home_choice_not_last",
+            {**state_metadata, "home_choice_index": int(home[0])},
+            arrays={"choices": Jx},
+        )
+
+    if solution_mode == 0:
+        if ccp_real == 0:
+            key = f"ccp_t{period}_{x1}_{x2}"
+            if key not in models:
+                recorder.record("initial_ccp_key_missing", {**state_metadata, "key": key})
+                ccp = np.full(np.shape(b), np.nan)
+            else:
+                ccp = np.asarray(models[key])
+        else:
+            g = get_all_g(utility_parameters, x1, x1_new, x2, Jx, period)
+            recorder.check("g", g, finite_problems(g, "g"), state_metadata)
+            all_vjt_temp = all_vjt + g
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                ccp = np.exp(all_vjt_temp[:, base]) / np.sum(
+                    np.exp(all_vjt_temp), axis=1
+                )
+        recorder.check(
+            "home_ccp", ccp, ccp_problems(ccp), state_metadata,
+            arrays={"debt_grid": b, "choices": Jx, "choice_vjt": all_vjt, "ccp": ccp},
+        )
+        vjt_ccp = all_vjt[:, base]
+        recorder.check(
+            "home_vjt", vjt_ccp, finite_problems(vjt_ccp, "home_vjt"),
+            {**state_metadata, "choice_index": int(base % len(Jx)), "choice": Jx[base]},
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            expected_vjt = vjt_ccp - np.log(ccp) + gamma
+    elif solution_mode == 1:
+        g = get_all_g(utility_parameters, x1, x1_new, x2, Jx, period)
+        recorder.check("g", g, finite_problems(g, "g"), state_metadata)
+        all_vjt = all_vjt + g
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            expected_vjt = np.log(np.exp(all_vjt).sum(axis=1)) + gamma
+        ccp = None
+    else:
+        raise ValueError(f"Unknown solution_mode={solution_mode}")
+
+    recorder.check(
+        "outgoing_evt",
+        expected_vjt,
+        finite_problems(expected_vjt, "outgoing_evt"),
+        state_metadata,
+        arrays={
+            "debt_grid": b,
+            "choices": Jx,
+            "choice_vjt": all_vjt,
+            "home_ccp": np.array([]) if ccp is None else ccp,
+            "outgoing_evt": expected_vjt,
+        },
+    )
+    return all_vjt, expected_vjt[..., None], ccp
+
+
+def loop_over_states_debug(
+    i, x1, x2_set, b, b1, period, ccp_real, sigma_u,
+    utility_parameters, models, solution_mode, conterfactual, evtnew,
+    em_type, maxdebt, financial_parameters, recorder, save_evt=1
+):
+    """Debug-only counterpart of :func:`loop_over_states`."""
+    from model_debug_checks import finite_problems
+
+    names_vjt, names_exp, names_ccp = [], [], []
+    result_vjt, result_exp, results_ccp = [], [], []
+    x1i = x1[i, :][None, :]
+    if period < T:
+        evt = evtnew
+    elif conterfactual == 1:
+        evt = np.load(
+            f"{pathcontfinal}/continuation_conter_s{x1i[0,2]}_eth{x1i[0,3]}_sigma{sigma_u}.npz"
+        )
+    else:
+        evt = {}
+
+    for x2_index, x2_value in enumerate(x2_set):
+        x2 = np.asarray(x2_value, dtype=int)
+        metadata = {
+            "period": int(period),
+            "x1": x1i[0],
+            "x2_index": int(x2_index),
+            "x2": x2,
+        }
+        name_exp = f"evt_t{period}_{x1i}_{x2}"
+        if period < T:
+            x1_new = get_x1_new(x1i[0])
+            x2_new = get_x2_new(x2)
+            all_vjt, exp_vjt, ccp = get_all_choices_debug(
+                x1i, x1_new, x2, x2_new, b, b1, period, evt, ccp_real,
+                sigma_u, utility_parameters, models, solution_mode,
+                conterfactual, maxdebt, financial_parameters, recorder, metadata
+            )
+            names_vjt.append(f"vjt_t{period}_{x1i}_{x2}")
+            names_ccp.append(f"ccp_t{period}_{x1i}_{x2}")
+            result_vjt.append(all_vjt)
+            results_ccp.append(ccp)
+        else:
+            if conterfactual == 1:
+                exp_vjt = get_terminal_pandas(evt, x1i, x2, sigma_u, conterfactual)[..., None]
+            else:
+                exp_vjt = terminal_from_interp(x1i, x2, sigma_u, b)[..., None]
+            recorder.check(
+                "terminal_evt", exp_vjt,
+                finite_problems(exp_vjt, "terminal_evt"), metadata,
+                arrays={"debt_grid": b, "terminal_evt": exp_vjt},
+            )
+        names_exp.append(name_exp)
+        result_exp.append(exp_vjt)
+
+    persist_outputs_for_period(
+        period, x1i, em_type, solution_mode, conterfactual, maxdebt,
+        save_evt, names_vjt, result_vjt, names_exp, result_exp, save_npz_here
+    )
+    if ccp_real == 1 and period < T:
+        save_npz_here(
+            f"ccp/{period}/ccp_t{period}_{x1i}_em{em_type}.npz",
+            names_ccp, results_ccp, compressed=True,
+        )
+    return dict(zip(names_exp, result_exp))
+
+
+def get_all_evt_debug(
+    i, x1, b, b1, ccp_real, utility_parameters, models,
+    solution_mode, conterfactual, em_type, maxdebt, debug_config
+):
+    """Solve one full Bellman task with exact-state and draw diagnostics."""
+    from model_debug_checks import DebugRecorder, finite_problems
+
+    recorder = DebugRecorder(debug_config, "bellman", em_type, i)
+    financial_parameters = get_type_financial_parameters(em_type)
+    evtnext = 0
+    sigma_u = float(bs.risk_aversion(budget_params, x1[i, :]))
+    recorder.check(
+        "risk_aversion", np.asarray(sigma_u),
+        finite_problems(np.asarray(sigma_u), "risk_aversion"),
+        {"x1": np.asarray(x1[i, :], dtype=int)},
+    )
+    total_states = len(x1)
+    task_started = time.perf_counter()
+    for period in range(T, 0, -1):
+        period_started = time.perf_counter()
+        archive = None
+        if period < T:
+            archive_path = f"{pathout}/ccp/{period}/ccp_t{period}_[{x1[i,:]}]_em{em_type}.npz"
+            try:
+                archive = np.load(archive_path, allow_pickle=False)
+                models_period = archive
+            except Exception as error:
+                recorder.record(
+                    "initial_ccp_bundle_load_failed",
+                    {"period": int(period), "path": archive_path, "exception": repr(error)},
+                )
+                models_period = {}
+        else:
+            models_period = 0
+        try:
+            evtnext = loop_over_states_debug(
+                i, x1, get_x2(period), b, b1, period, ccp_real, sigma_u,
+                utility_parameters, models_period, solution_mode, conterfactual,
+                evtnext, em_type, maxdebt, financial_parameters, recorder,
+            )
+        finally:
+            if archive is not None:
+                archive.close()
+        print(
+            f"[Bellman DEBUG | pid={os.getpid()} | type={em_type}/{N_TYPES}:"
+            f"{TYPE_NAMES[em_type - 1]} | state={i + 1}/{total_states}] "
+            f"period {period}/{T} checked | period={time.perf_counter() - period_started:.2f}s "
+            f"| task={time.perf_counter() - task_started:.2f}s",
+            flush=True,
+        )
+    return recorder.finalize()
         
         
         
