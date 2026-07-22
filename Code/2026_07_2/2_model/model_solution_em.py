@@ -52,6 +52,10 @@ from debt_limits import (
     lower_bound_index,
     upper_bound_index,
 )
+from fused_debt_search import (
+    fused_consumption_search_enabled,
+    get_maximum_loop_modified_resources_maxdebt,
+)
 from financial_process import (
     expected_financial_help_numba,
     load_auxiliary_financial_process,
@@ -59,6 +63,7 @@ from financial_process import (
 )
 from latent_types import N_TYPES, TYPE_NAMES, type_components
 r = INTEREST_RATE
+USE_FUSED_CONSUMPTION_SEARCH = fused_consumption_search_enabled()
 pathfunctions = DIR["MODEL_FUNCOEF"]
 path = DIR["MODEL_REALDATA"]
 pathcont = DIR["MODEL_CONTINUATION"]
@@ -461,13 +466,13 @@ def get_g(x1_new,x2,j,param_g,param_g_last):
 
 
 
-#@njit()
-def get_utility(
-    sigma_u, x1, x1_new, x2, b, b1, e, j, period,
-    financial_parameters, z=0.0
+def get_consumption_resources(
+    x1_new, x2, b, e, j, financial_parameters, z=0.0
 ):
     """
-    Studying consumption for each (shock point, b) pair.
+    Studying resources before adding candidate next-period debt.
+
+    The returned vector has one entry for each (shock point, current b) pair.
     e: array length Q
     z: either scalar or array length Q (budget shock)
     """
@@ -495,9 +500,19 @@ def get_utility(
 
     b_vis = numba_tile_new(b, Q)             # length Q*nb
 
-    c = (h_vis - (1+r)*b_vis - tuition(j) + real_wage)
-    c = c[...,np.newaxis] + b1
-    return c
+    return h_vis - (1+r)*b_vis - tuition(j) + real_wage
+
+
+#@njit()
+def get_utility(
+    sigma_u, x1, x1_new, x2, b, b1, e, j, period,
+    financial_parameters, z=0.0
+):
+    """Materialize the legacy studying-consumption matrix."""
+    resources = get_consumption_resources(
+        x1_new, x2, b, e, j, financial_parameters, z=z
+    )
+    return resources[..., np.newaxis] + b1
 
 
 
@@ -1460,9 +1475,8 @@ def get_conditional(
 
     else:
         # ---- STUDYING ----
-        c = get_utility(
-            sigma_u, x1, x1_new, x2_new, b, b1, e, j, period,
-            financial_parameters, z=z
+        resources = get_consumption_resources(
+            x1_new, x2_new, b, e, j, financial_parameters, z=z
         )
         continuation = beta*VT(x1,x1_new,x2,x2_new,b1,period,j,evt,0)  # shape (nb,1) or (nb,?)
 
@@ -1473,7 +1487,16 @@ def get_conditional(
         candidate_debt_mask = (b1 > 0).astype(np.float64)
         continuation[:,0] += debt_pen * candidate_debt_mask
 
-        max_vjt = get_maximum(sigma_u,c,continuation,x1,b,j,x2,maxdebt)
+        if USE_FUSED_CONSUMPTION_SEARCH and maxdebt:
+            max_vjt = get_maximum_loop_modified_resources_maxdebt(
+                sigma_u, b, b1, resources, continuation, j, x2
+            )
+        else:
+            # Retained fallback for comparisons, debugging, and maxdebt=False.
+            c = resources[..., np.newaxis] + b1
+            max_vjt = get_maximum(
+                sigma_u, c, continuation, x1, b, j, x2, maxdebt
+            )
         return max_vjt
 
 
