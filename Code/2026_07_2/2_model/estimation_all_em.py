@@ -60,6 +60,7 @@ if str(THIS_DIR) not in sys.path:
 
 # Now import without any chdir()
 import model_solution_em as ms
+import model_solution_fast as msf
 import model_em_algorithm as me
 import solve_many_continuations as mcf
 import model_predict_ccps as mccp
@@ -105,10 +106,16 @@ total_n = n_param_g_x1 + n_param_g_change + n_param_g_work + n_param_g_educ + n_
 
 
 solve_model = False
-solve_continuation = False 
+solve_continuation = False
 solve_qs = False
 solve_initial_ccps = False
 get_budget = True
+
+# Optional fast Bellman solver (Phase 1 of Agents_Readme/Tasks/SPEED_PLAN_FINAL.md).
+# Exact drop-in for ms.get_all_evt: same signature, same artifacts, same numbers.
+# Keep False until test_fast_solver_equivalence.py passes on this machine; then
+# flipping to True is the only change needed to make it the default.
+USE_FAST_SOLVER = False
 
 # Production loan-SMM controls. The auxiliary EM results are loaded above and
 # remain fixed. A deliberately small annealing budget keeps each NPL iteration
@@ -125,8 +132,18 @@ if __name__ == '__main__':
     # Simulate all model states
     print("Simulating all model states...")
     ms.simulate_all_states(11)
-    
+
     debt_range = ms.get_debt_range()
+
+    # Select the Bellman solver. The fast solver is a validated drop-in; its
+    # per-period static structure is prebuilt here so forked workers inherit
+    # it instead of rebuilding it per process.
+    if USE_FAST_SOLVER:
+        print("Using FAST Bellman solver (model_solution_fast)")
+        msf.build_all_period_statics()
+        bellman_solver = msf.get_all_evt_fast
+    else:
+        bellman_solver = ms.get_all_evt
 
 
     # First check if continuation value should be estimated
@@ -173,7 +190,7 @@ if __name__ == '__main__':
         ]
 
         pool_obj = multiprocessing.Pool(60)
-        results = pool_obj.starmap(ms.get_all_evt, args, chunksize=1)
+        results = pool_obj.starmap(bellman_solver, args, chunksize=1)
         pool_obj.close()
         print("Simulating choices...")
     
@@ -319,9 +336,9 @@ if __name__ == '__main__':
             for i in range(np.shape(ms.invariant_states)[0])
         ]
     
-        results = pool_obj.starmap(ms.get_all_evt, args, chunksize=1)
+        results = pool_obj.starmap(bellman_solver, args, chunksize=1)
         pool_obj.close()
-    
+
         #--------------------------------------#
         # Now prepare the data and evaluate the likelihood
         print("Preparing the data for the estimation")
