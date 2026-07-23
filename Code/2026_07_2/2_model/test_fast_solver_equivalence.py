@@ -152,12 +152,64 @@ def unit_check_g(rng, em_type=2, periods=(2, 5, 9), sample=50):
     print("  g(): OK")
 
 
+def unit_check_flow_keys(rng, periods=(5, 9), pairs=40):
+    """Key sufficiency: states sharing a flow key must produce identical flow
+    objects. Checks the work/home payload directly (runnable locally); the
+    education payload is certified end-to-end by the server bitwise test."""
+    x1 = ms.invariant_states
+    inv = x1[0, :][..., None].T
+    x1_new = ms.get_x1_new(inv[0])
+    b = ms.debt_range
+    test_js = [np.array([1, 0, 2]), np.array([2, 0, 1]), np.array([0, 0, 0])]
+    for period in periods:
+        st = msf.get_period_statics(period)
+        assert sorted(st.solve_order) == list(range(st.n_states)), \
+            "solve_order is not a permutation"
+        groups = {}
+        for s in range(st.n_states):
+            groups.setdefault(st.work_key[s], []).append(s)
+        multi = [g for g in groups.values() if len(g) > 1]
+        checked = 0
+        for g in multi:
+            if checked >= pairs:
+                break
+            s_a, s_b = g[0], g[rng.integers(1, len(g))]
+            for j in test_js:
+                e_nodes, we = msf._wage_quadrature(j)
+                out = []
+                for s in (s_a, s_b):
+                    if j[2] != 0:
+                        pw = ms.get_params_wage(j)
+                        out.append(ms.get_debt_income(
+                            x1_new, st.x2_new[s], st.x2_int[s], period, j,
+                            b, e_nodes, 0, pw))
+                    else:
+                        out.append(ms.get_debt_income_home(
+                            x1_new, st.x2_new[s], st.x2_int[s], period, j,
+                            b, e_nodes, 0))
+                assert np.array_equal(out[0][0], out[1][0]) \
+                    and np.array_equal(out[0][1], out[1][1]), \
+                    f"work flow key insufficient: t={period} states {s_a},{s_b} j={j}"
+            checked += 1
+        # Education wage quirk: same edu key -> same raw-x2 wage index.
+        egroups = {}
+        for s in range(st.n_states):
+            egroups.setdefault(st.edu_key[s], []).append(s)
+        for g in [g for g in egroups.values() if len(g) > 1][:pairs]:
+            w = [float(np.asarray(ms.wage0(x1_new, st.x2_int[s])).reshape(-1)[0])
+                 for s in (g[0], g[-1])]
+            assert w[0] == w[1], f"edu flow key insufficient at t={period}"
+        print(f"  flow keys t={period}: OK ({checked} work groups, "
+              f"{len(multi)} shareable)")
+
+
 def run_units():
     rng = np.random.default_rng(0)
     print("Unit checks (fast vs original implementations):")
     unit_check_snapping(rng)
     unit_check_quadrature()
     unit_check_statics(rng)
+    unit_check_flow_keys(rng)
     unit_check_g(rng)
     print("All unit checks passed.")
 

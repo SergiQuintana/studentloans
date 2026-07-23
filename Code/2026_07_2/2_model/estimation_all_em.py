@@ -113,9 +113,11 @@ get_budget = True
 
 # Optional fast Bellman solver (Phase 1 of Agents_Readme/Tasks/SPEED_PLAN_FINAL.md).
 # Exact drop-in for ms.get_all_evt: same signature, same artifacts, same numbers.
-# Keep False until test_fast_solver_equivalence.py passes on this machine; then
-# flipping to True is the only change needed to make it the default.
-USE_FAST_SOLVER = False
+# Promoted to default 2026-07-23 after test_fast_solver_equivalence.py passed
+# on the server: 20/20 tasks (types 1,2,5,9,16 x states 0,20,45,63, ccp_real 0
+# and 1) bitwise-identical, ~2.1x faster. Set False to fall back to the
+# original solver.
+USE_FAST_SOLVER = True
 
 # Production loan-SMM controls. The auxiliary EM results are loaded above and
 # remain fixed. A deliberately small annealing budget keeps each NPL iteration

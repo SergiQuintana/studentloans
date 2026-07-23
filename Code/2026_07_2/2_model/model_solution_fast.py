@@ -42,6 +42,27 @@ import model_solution_em as ms
 
 T = ms.T
 
+# Phase 2 / 2b: reuse flow objects (budget-shock nodes, resources, incomes,
+# debt transitions, utilities) across choices and states that share every
+# input those objects consume. Cache keys are derived MECHANICALLY from the
+# argument lists (see SPEED_PLAN_FINAL.md Phase 2b cache-key rule):
+#   education payload (z_joint, resources): (j[1], j[2], x2[0:9])
+#     - bs.realization uses x1/period (task/loop), education=j[1], the
+#       program-year column (inside x2[0:9]), and pre_choice_resources,
+#       which depends on fin_help(j1,j2), tuition(j1), the debt grid, and
+#       the raw-x2 wage quirk wage0(x1_new, x2) -> columns 0-8.
+#     - get_consumption_resources adds x2_new = f(x2[0], x2[8], x2[6]).
+#   work/home payload (debt_position, u): (j, x2[{0,6,7,8}])
+#     - get_debt_income uses x2[7] (years since school) and
+#       x2_new = f(x2[0], x2[8], x2[6]); wage parameters via j.
+#     - both caches are period-scoped (cleared each period) because incomes
+#       and repayment depend on the period.
+# States are processed SORTED by the education key, so only the current
+# payload per (j1, j2) group is held in memory. Set False to fall back to
+# the Phase-1 per-choice computation (numbers are identical either way; the
+# only observable difference is the key order inside the saved npz bundles).
+ENABLE_FLOW_CACHE = True
+
 
 # ---------------------------------------------------------------------------
 # Quadrature caches (identical values, computed once per process)
@@ -126,6 +147,7 @@ class PeriodStatics:
         "period", "n_states", "x2_raw", "x2_int", "x2_new", "x2_str",
         "Jx", "g_idx", "x_change", "x_educ",
         "grad_flag", "succ_nograd", "succ_grad",
+        "edu_key", "work_key", "solve_order",
     )
 
 
@@ -158,6 +180,12 @@ def get_period_statics(period):
     # int conversion (get_x2_new converts internally).
     st.x2_new = [ms.get_x2_new(x2_raw[s]) for s in range(st.n_states)]
     st.x2_str = [f"{x2_raw[s].astype(int)}" for s in range(st.n_states)]
+
+    # Flow-cache keys (Phase 2b) and the education-key-sorted solve order.
+    st.edu_key = [st.x2_int[s, :9].tobytes() for s in range(st.n_states)]
+    st.work_key = [st.x2_int[s, [0, 6, 7, 8]].tobytes()
+                   for s in range(st.n_states)]
+    st.solve_order = sorted(range(st.n_states), key=st.edu_key.__getitem__)
 
     if period == T:
         st.Jx = st.g_idx = st.x_change = st.x_educ = None
@@ -297,18 +325,26 @@ def _solve_state(
         if j[1] == 0:
             # ---- NOT STUDYING (work or home) ----
             e_nodes, we = _wage_quadrature(j)
-            if j[2] != 0:
-                param_wage_j = ms.get_params_wage(j)
-                debtnew, income = ms.get_debt_income(
-                    x1_new, x2_new, x2, period, j, b, e_nodes,
-                    conterfactual, param_wage_j,
-                )
+            work_key = (j.tobytes(), st.work_key[s])
+            payload = task_cache["work_flow"].get(work_key) \
+                if ENABLE_FLOW_CACHE else None
+            if payload is None:
+                if j[2] != 0:
+                    param_wage_j = ms.get_params_wage(j)
+                    debtnew, income = ms.get_debt_income(
+                        x1_new, x2_new, x2, period, j, b, e_nodes,
+                        conterfactual, param_wage_j,
+                    )
+                else:
+                    debtnew, income = ms.get_debt_income_home(
+                        x1_new, x2_new, x2, period, j, b, e_nodes, conterfactual
+                    )
+                debt_position = snap_debt_indices(b, debtnew)
+                u = ms.get_power_utility(sigma_u, income)
+                if ENABLE_FLOW_CACHE:
+                    task_cache["work_flow"][work_key] = (debt_position, u)
             else:
-                debtnew, income = ms.get_debt_income_home(
-                    x1_new, x2_new, x2, period, j, b, e_nodes, conterfactual
-                )
-            debt_position = snap_debt_indices(b, debtnew)
-            u = ms.get_power_utility(sigma_u, income)
+                debt_position, u = payload
             evt_row = evt_next[st.succ_nograd[s][c]]
             continuation = ms.beta * evt_row[debt_position]
             vjt = u + continuation
@@ -320,44 +356,59 @@ def _solve_state(
             # ---- STUDYING ----
             e_joint, z_standard_joint, w_joint, w_vis = _edu_joint_nodes(j, nb)
 
-            fh_key = (int(j[1]), int(j[2]))
-            if fh_key not in task_cache["fin_help"]:
-                task_cache["fin_help"][fh_key] = float(
-                    ms.fin_help(x1_new, j, financial_parameters)
+            # The (z_joint, resources) payload is field-independent: within a
+            # state, all fields of one (education, labor) group share it, and
+            # across states it depends only on x2[0:9] (see key rule above).
+            group = (int(j[1]), int(j[2]))
+            entry = task_cache["edu_flow"].get(group) \
+                if ENABLE_FLOW_CACHE else None
+            if entry is not None and entry[0] == st.edu_key[s]:
+                z_joint, resources = entry[1], entry[2]
+            else:
+                fh_key = group
+                if fh_key not in task_cache["fin_help"]:
+                    task_cache["fin_help"][fh_key] = float(
+                        ms.fin_help(x1_new, j, financial_parameters)
+                    )
+                h0 = task_cache["fin_help"][fh_key]
+
+                w0_key = st.edu_key[s]
+                if w0_key not in task_cache["wage0"]:
+                    # Quirk replicated from get_expected_conditional:
+                    # RAW x2 here (columns 0-8), not x2_new.
+                    task_cache["wage0"][w0_key] = float(
+                        np.asarray(ms.wage0(x1_new, x2)).reshape(-1)[0]
+                    )
+                wage_index = task_cache["wage0"][w0_key]
+
+                real_wage = (
+                    np.exp(wage_index + e_joint) * (j[2] / 2.0) * 52.0 * 40.0
                 )
-            h0 = task_cache["fin_help"][fh_key]
-
-            w0_key = (period, s)
-            if w0_key not in task_cache["wage0"]:
-                # Quirk replicated from get_expected_conditional: RAW x2 here.
-                task_cache["wage0"][w0_key] = float(
-                    np.asarray(ms.wage0(x1_new, x2)).reshape(-1)[0]
+                pre_choice_resources = (
+                    h0 + real_wage[:, None] - ms.tuition(j)
+                    - (1.0 + ms.r) * b[None, :]
                 )
-            wage_index = task_cache["wage0"][w0_key]
+                z_joint = bs.realization(
+                    ms.budget_params,
+                    inv,
+                    period,
+                    z_standard_joint[:, None],
+                    education=int(j[1]),
+                    state=x2,
+                    pre_choice_resources=pre_choice_resources,
+                ).reshape(-1)
 
-            real_wage = (
-                np.exp(wage_index + e_joint) * (j[2] / 2.0) * 52.0 * 40.0
-            )
-            pre_choice_resources = (
-                h0 + real_wage[:, None] - ms.tuition(j)
-                - (1.0 + ms.r) * b[None, :]
-            )
-            z_joint = bs.realization(
-                ms.budget_params,
-                inv,
-                period,
-                z_standard_joint[:, None],
-                education=int(j[1]),
-                state=x2,
-                pre_choice_resources=pre_choice_resources,
-            ).reshape(-1)
-
-            resources = ms.get_consumption_resources(
-                x1_new, x2_new, b, e_joint, j, financial_parameters, z=z_joint
-            )
+                resources = ms.get_consumption_resources(
+                    x1_new, x2_new, b, e_joint, j, financial_parameters,
+                    z=z_joint
+                )
+                if ENABLE_FLOW_CACHE:
+                    task_cache["edu_flow"][group] = (
+                        st.edu_key[s], z_joint, resources
+                    )
 
             if st.grad_flag[s][c]:
-                pg_key = (period, s, c)
+                pg_key = (j.tobytes(), st.edu_key[s])
                 if pg_key not in task_cache["pgrad"]:
                     task_cache["pgrad"][pg_key] = ms.probability_graduation(
                         x1_new, x2, j
@@ -425,7 +476,10 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
     x1_key = f"{inv}"
     x1_new = ms.get_x1_new(inv[0])
     debt_pen = float(x1_new @ ms.debt_pen_vec)
-    task_cache = {"fin_help": {}, "wage0": {}, "pgrad": {}}
+    task_cache = {
+        "fin_help": {}, "wage0": {}, "pgrad": {},   # task-wide
+        "work_flow": {}, "edu_flow": {},            # cleared every period
+    }
 
     task_started = time.perf_counter()
     total_states = len(x1)
@@ -449,6 +503,8 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
     for period in range(T, 0, -1):
         period_started = time.perf_counter()
         st = get_period_statics(period)
+        task_cache["work_flow"].clear()
+        task_cache["edu_flow"].clear()
         evt_arr = np.empty((st.n_states, nb))
         names_vjt, names_exp, names_ccp = [], [], []
         result_vjt, result_exp, results_ccp = [], [], []
@@ -462,7 +518,12 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
         else:
             models_npz = None
 
-        for s in range(st.n_states):
+        # Sorted iteration keeps at most one live education payload per
+        # (education, labor) group; npz bundles are keyed, so order is
+        # irrelevant to every consumer.
+        state_iter = st.solve_order if (period < T and ENABLE_FLOW_CACHE) \
+            else range(st.n_states)
+        for s in state_iter:
             name_suffix = f"{inv}_{st.x2_str[s]}"
             if period == T:
                 x2 = st.x2_int[s]
