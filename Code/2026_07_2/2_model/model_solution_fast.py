@@ -73,9 +73,11 @@ ENABLE_FLOW_CACHE = True
 # (shock, current debt) row and reuses it. Every field keeps its own search
 # window, previous-argmax state, fallbacks, and tie-breaking, replicated
 # branch-for-branch from fused_debt_search — so results are bitwise identical.
-# Off by default until test_fast_solver_equivalence.py (run with --grouped 1)
-# passes on the server; then flip this to True to promote.
-ENABLE_GROUPED_KERNEL = False
+# Promoted to default 2026-07-23 after the server equivalence test passed:
+# 20/20 tasks (types 1,2,5,9,16 x states 0,20,45,63, ccp_real=1) bitwise
+# identical, cumulative speedup 5.6-6.1x (~395s -> ~66s per task). Set False
+# to fall back to the per-choice search path.
+ENABLE_GROUPED_KERNEL = True
 
 
 # ---------------------------------------------------------------------------
