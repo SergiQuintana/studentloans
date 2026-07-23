@@ -211,46 +211,75 @@ def _compare(ref, new, tol):
     return ok, msg
 
 
-def run_full(em_types, states, ccp_real, solution_mode, params_mode, tol,
-             restore):
-    ms.reload_budgetshock_params()
+def _run_one_task(task):
+    """Run reference + fast solver for one (type, state) task; compare & time."""
+    em_type, i, ccp_real, solution_mode, params_mode, tol, restore = task
+    import time
+
     x1 = ms.invariant_states
     b = ms.debt_range
-    conter = 0
-    maxdebt = True
+    if params_mode == "npl":
+        x0 = np.load(f"{ms.path_estimates}/param_g.npy")
+        utility_parameters = ms.build_param_g(em_type, x0)
+    else:
+        utility_parameters = ms.load_param_g(em_type, real=0)
+
+    inv = x1[i, :][..., None].T
+    args = (i, x1, b, b, ccp_real, utility_parameters, 0,
+            solution_mode, 0, em_type, True)
+
+    t0 = time.perf_counter()
+    ms.get_all_evt(*args)
+    t_ref = time.perf_counter() - t0
+    paths = _artifact_paths(inv, em_type, ccp_real)
+    ref = _load_artifacts(paths)
+
+    t0 = time.perf_counter()
+    msf.get_all_evt_fast(*args)
+    t_fast = time.perf_counter() - t0
+    new = _load_artifacts(paths)
+
+    ok, msg = _compare(ref, new, tol)
+    if not ok and restore:
+        print(f"[em{em_type} i={i}] restoring reference artifacts", flush=True)
+        ms.get_all_evt(*args)
+    return em_type, i, ok, msg, t_ref, t_fast
+
+
+def _init_worker():
+    ms.reload_budgetshock_params()
+
+
+def run_full(em_types, states, ccp_real, solution_mode, params_mode, tol,
+             restore, workers):
+    import multiprocessing
+
+    ms.reload_budgetshock_params()
+    tasks = [
+        (em_type, i, ccp_real, solution_mode, params_mode, tol, restore)
+        for em_type in em_types
+        for i in states
+    ]
+    print(f"Running {len(tasks)} task(s) with {workers} worker(s); each task "
+          f"solves reference + fast sequentially and compares artifacts.")
+
+    if workers > 1:
+        # Prebuild the fast solver's statics so forked workers inherit them.
+        msf.build_all_period_statics()
+        with multiprocessing.Pool(workers, initializer=_init_worker) as pool:
+            results = pool.map(_run_one_task, tasks, chunksize=1)
+    else:
+        results = [_run_one_task(t) for t in tasks]
+
+    print("\n===== SUMMARY =====")
+    print(f"{'type':>5} {'state':>6} {'result':>7} {'ref [s]':>9} "
+          f"{'fast [s]':>9} {'speedup':>8}   detail")
     overall_ok = True
-
-    for em_type in em_types:
-        if params_mode == "npl":
-            x0 = np.load(f"{ms.path_estimates}/param_g.npy")
-            utility_parameters = ms.build_param_g(em_type, x0)
-        else:
-            utility_parameters = ms.load_param_g(em_type, real=0)
-
-        for i in states:
-            inv = x1[i, :][..., None].T
-            print(f"\n=== task: em_type={em_type}, state i={i} ({x1[i, :]}) ===")
-            args = (i, x1, b, b, ccp_real, utility_parameters, 0,
-                    solution_mode, conter, em_type, maxdebt)
-
-            print("--- reference solver (model_solution_em) ---")
-            ms.get_all_evt(*args)
-            paths = _artifact_paths(inv, em_type, ccp_real)
-            ref = _load_artifacts(paths)
-
-            print("--- fast solver (model_solution_fast) ---")
-            msf.get_all_evt_fast(*args)
-            new = _load_artifacts(paths)
-
-            ok, msg = _compare(ref, new, tol)
-            print(f"RESULT em_type={em_type} i={i}: "
-                  f"{'PASS' if ok else 'FAIL'} | {msg}")
-            if not ok:
-                overall_ok = False
-                if restore:
-                    print("Restoring reference artifacts (re-running original)")
-                    ms.get_all_evt(*args)
-
+    for em_type, i, ok, msg, t_ref, t_fast in results:
+        overall_ok &= ok
+        speedup = t_ref / t_fast if t_fast > 0 else float("inf")
+        print(f"{em_type:>5} {i:>6} {'PASS' if ok else 'FAIL':>7} "
+              f"{t_ref:>9.1f} {t_fast:>9.1f} {speedup:>7.1f}x   {msg}")
     print("\n" + ("EQUIVALENCE TEST PASSED" if overall_ok
                   else "EQUIVALENCE TEST FAILED"))
     return overall_ok
@@ -274,6 +303,9 @@ def main():
     ap.add_argument("--restore", action="store_true",
                     help="re-run the reference solver after a failure so the "
                          "on-disk artifacts stay the production ones")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel workers over (type, state) tasks; each "
+                         "task still runs its two solvers sequentially")
     args = ap.parse_args()
 
     if args.units:
@@ -283,7 +315,7 @@ def main():
     em_types = [int(v) for v in args.em_types.split(",")]
     states = [int(v) for v in args.states.split(",")]
     ok = run_full(em_types, states, args.ccp_real, args.solution_mode,
-                  args.params_mode, args.tol, args.restore)
+                  args.params_mode, args.tol, args.restore, args.workers)
     sys.exit(0 if ok else 1)
 
 
