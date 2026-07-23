@@ -39,6 +39,9 @@ import scipy.special
 
 import budget_shock as bs
 import model_solution_em as ms
+from numba import njit
+from debt_limits import CONSUMPTION_FLOOR, get_debt_region_bounds
+from fused_debt_search import _flow_utility
 
 T = ms.T
 
@@ -62,6 +65,17 @@ T = ms.T
 # the Phase-1 per-choice computation (numbers are identical either way; the
 # only observable difference is the key order inside the saved npz bundles).
 ENABLE_FLOW_CACHE = True
+
+# Phase 2 grouped kernel: run the windowed debt search for ALL fields of one
+# (education, labor) group in a single Numba call. The CRRA flow utilities
+# u(resources + candidate_debt) are identical across fields (only the
+# continuation added on top differs), so the kernel computes each one once per
+# (shock, current debt) row and reuses it. Every field keeps its own search
+# window, previous-argmax state, fallbacks, and tie-breaking, replicated
+# branch-for-branch from fused_debt_search — so results are bitwise identical.
+# Off by default until test_fast_solver_equivalence.py (run with --grouped 1)
+# passes on the server; then flip this to True to promote.
+ENABLE_GROUPED_KERNEL = False
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +151,221 @@ def snap_debt_indices(debt_grid, values):
 
 
 # ---------------------------------------------------------------------------
+# Grouped education debt search (Phase 2 kernel)
+# ---------------------------------------------------------------------------
+
+@njit
+def _grouped_education_search(sigma_u, next_debt_grid, resources,
+                              continuations, lo_idx, hi_idx, cap_start,
+                              payoffs):
+    """Multi-field twin of ``get_maximum_loop_modified_resources_maxdebt``.
+
+    ``continuations`` is (n_fields, n_debt); ``payoffs`` (n_fields, n_rows) is
+    filled in place. Fields share ``resources`` and the borrowing bounds
+    (which depend only on the education level and years enrolled), so the CRRA
+    value ``u = _flow_utility(sigma_u, resource + next_debt_grid[k])`` is
+    computed once per (shock, current-debt) row and candidate ``k``, then
+    reused by every field. Each field keeps its own previous-argmax state and
+    follows the original kernel's control flow branch for branch, so the
+    selected debt choices and payoffs are bitwise identical to running the
+    single-field kernel once per field.
+    """
+    nf = continuations.shape[0]
+    ncont = continuations.shape[1]
+    quadrature = int(resources.shape[0] / ncont)
+
+    u_val = np.empty(ncont)
+    u_ok = np.empty(ncont, dtype=np.bool_)
+    amax = np.empty(nf, dtype=np.int64)
+
+    for shock_index in range(quadrature):
+        for f in range(nf):
+            amax[f] = 0
+
+        for it in range(ncont):
+            row_idx = it + ncont * shock_index
+            resource = resources[row_idx]
+            for k in range(ncont):
+                u_ok[k] = False
+            row_feasible = -1  # shared lazily across fields (same bounds)
+
+            if it >= cap_start:
+                idx_use = lo_idx[it]
+                if not u_ok[idx_use]:
+                    u_val[idx_use] = _flow_utility(
+                        sigma_u, resource + next_debt_grid[idx_use]
+                    )
+                    u_ok[idx_use] = True
+                for f in range(nf):
+                    payoffs[f, row_idx] = (
+                        u_val[idx_use] + continuations[f, idx_use]
+                    )
+                continue
+
+            lo = lo_idx[it]
+            hi = hi_idx[it]
+
+            for f in range(nf):
+                if it == 0:
+                    if row_feasible < 0:
+                        row_feasible = 0
+                        for candidate in range(lo, hi + 1):
+                            if (resource + next_debt_grid[candidate]
+                                    >= CONSUMPTION_FLOOR):
+                                row_feasible += 1
+
+                    if row_feasible == 0:
+                        idx_use = hi
+                        if not u_ok[idx_use]:
+                            u_val[idx_use] = _flow_utility(
+                                sigma_u, resource + next_debt_grid[idx_use]
+                            )
+                            u_ok[idx_use] = True
+                        payoffs[f, row_idx] = (
+                            u_val[idx_use] + continuations[f, idx_use]
+                        )
+                        amax[f] = idx_use
+                        continue
+
+                    firstbound = hi + 1 - row_feasible
+                    best_index = firstbound
+                    if not u_ok[firstbound]:
+                        u_val[firstbound] = _flow_utility(
+                            sigma_u, resource + next_debt_grid[firstbound]
+                        )
+                        u_ok[firstbound] = True
+                    best_value = (
+                        u_val[firstbound] + continuations[f, firstbound]
+                    )
+                    for candidate in range(firstbound + 1, hi + 1):
+                        if not u_ok[candidate]:
+                            u_val[candidate] = _flow_utility(
+                                sigma_u, resource + next_debt_grid[candidate]
+                            )
+                            u_ok[candidate] = True
+                        value = u_val[candidate] + continuations[f, candidate]
+                        if value > best_value:
+                            best_value = value
+                            best_index = candidate
+
+                    amax[f] = best_index
+                    payoffs[f, row_idx] = best_value
+                    continue
+
+                # Local window around the previous argmax, clipped as in the
+                # original kernel.
+                bound_left = max(amax[f] - 10, lo)
+                bound_left = max(bound_left, it)
+                bound_right = min(bound_left + 20, hi + 1)
+
+                if bound_right <= bound_left:
+                    bound_left = max(lo, it)
+                    bound_right = hi + 1
+
+                if resource + next_debt_grid[bound_left] < CONSUMPTION_FLOOR:
+                    if row_feasible < 0:
+                        row_feasible = 0
+                        for candidate in range(lo, hi + 1):
+                            if (resource + next_debt_grid[candidate]
+                                    >= CONSUMPTION_FLOOR):
+                                row_feasible += 1
+
+                    if row_feasible == 0:
+                        idx_use = hi
+                        if not u_ok[idx_use]:
+                            u_val[idx_use] = _flow_utility(
+                                sigma_u, resource + next_debt_grid[idx_use]
+                            )
+                            u_ok[idx_use] = True
+                        payoffs[f, row_idx] = (
+                            u_val[idx_use] + continuations[f, idx_use]
+                        )
+                        amax[f] = idx_use
+                        continue
+
+                    bound_left = hi + 1 - row_feasible
+                    bound_left = max(bound_left, lo)
+                    bound_left = max(bound_left, it)
+                    bound_right = hi + 1
+
+                best_index = bound_left
+                if not u_ok[bound_left]:
+                    u_val[bound_left] = _flow_utility(
+                        sigma_u, resource + next_debt_grid[bound_left]
+                    )
+                    u_ok[bound_left] = True
+                best_value = u_val[bound_left] + continuations[f, bound_left]
+                for candidate in range(bound_left + 1, bound_right):
+                    if not u_ok[candidate]:
+                        u_val[candidate] = _flow_utility(
+                            sigma_u, resource + next_debt_grid[candidate]
+                        )
+                        u_ok[candidate] = True
+                    value = u_val[candidate] + continuations[f, candidate]
+                    if value > best_value:
+                        best_value = value
+                        best_index = candidate
+
+                # A maximum at the window's right boundary does not update the
+                # center used for the next current-debt state (legacy rule).
+                if best_index != bound_right - 1:
+                    amax_old = amax[f]
+                    amax[f] = best_index
+
+                    if (amax[f] - amax_old) > 9:
+                        if row_feasible < 0:
+                            row_feasible = 0
+                            for candidate in range(lo, hi + 1):
+                                if (resource + next_debt_grid[candidate]
+                                        >= CONSUMPTION_FLOOR):
+                                    row_feasible += 1
+
+                        if row_feasible == 0:
+                            idx_use = hi
+                            if not u_ok[idx_use]:
+                                u_val[idx_use] = _flow_utility(
+                                    sigma_u,
+                                    resource + next_debt_grid[idx_use],
+                                )
+                                u_ok[idx_use] = True
+                            payoffs[f, row_idx] = (
+                                u_val[idx_use] + continuations[f, idx_use]
+                            )
+                            amax[f] = idx_use
+                            continue
+
+                        firstbound = hi + 1 - row_feasible
+                        firstbound = max(firstbound, lo)
+                        firstbound = max(firstbound, it)
+
+                        best_index = firstbound
+                        if not u_ok[firstbound]:
+                            u_val[firstbound] = _flow_utility(
+                                sigma_u, resource + next_debt_grid[firstbound]
+                            )
+                            u_ok[firstbound] = True
+                        best_value = (
+                            u_val[firstbound] + continuations[f, firstbound]
+                        )
+                        for candidate in range(firstbound + 1, hi + 1):
+                            if not u_ok[candidate]:
+                                u_val[candidate] = _flow_utility(
+                                    sigma_u,
+                                    resource + next_debt_grid[candidate],
+                                )
+                                u_ok[candidate] = True
+                            value = (
+                                u_val[candidate] + continuations[f, candidate]
+                            )
+                            if value > best_value:
+                                best_value = value
+                                best_index = candidate
+                        amax[f] = best_index
+
+                payoffs[f, row_idx] = best_value
+
+
+# ---------------------------------------------------------------------------
 # Per-period static structure (parameter-free; shared by all tasks/iterations)
 # ---------------------------------------------------------------------------
 
@@ -148,6 +377,7 @@ class PeriodStatics:
         "Jx", "g_idx", "x_change", "x_educ",
         "grad_flag", "succ_nograd", "succ_grad",
         "edu_key", "work_key", "solve_order",
+        "edu_groups", "noneduc_idx",
     )
 
 
@@ -190,6 +420,7 @@ def get_period_statics(period):
     if period == T:
         st.Jx = st.g_idx = st.x_change = st.x_educ = None
         st.grad_flag = st.succ_nograd = st.succ_grad = None
+        st.edu_groups = st.noneduc_idx = None
         _PERIOD_STATICS[period] = st
         return st
 
@@ -199,6 +430,7 @@ def get_period_statics(period):
 
     st.Jx, st.g_idx, st.x_change, st.x_educ = [], [], [], []
     st.grad_flag, st.succ_nograd, st.succ_grad = [], [], []
+    st.edu_groups, st.noneduc_idx = [], []
     for s in range(st.n_states):
         x2 = st.x2_int[s]
         Jx = ms.get_possible_choices(x2)
@@ -242,6 +474,21 @@ def get_period_statics(period):
         st.grad_flag.append(flags)
         st.succ_nograd.append(succ_ng)
         st.succ_grad.append(succ_g)
+        # Choice indices grouped for the grouped kernel: work/home choices,
+        # and education choices bundled by (education level, labor supply).
+        groups = {}
+        noneduc = []
+        for c in range(nJ):
+            if Jx[c][1] == 0:
+                noneduc.append(c)
+            else:
+                groups.setdefault(
+                    (int(Jx[c][1]), int(Jx[c][2])), []
+                ).append(c)
+        st.noneduc_idx.append(np.array(noneduc, dtype=np.int64))
+        st.edu_groups.append(
+            [np.array(v, dtype=np.int64) for v in groups.values()]
+        )
 
     _PERIOD_STATICS[period] = st
     return st
@@ -307,6 +554,114 @@ def _get_all_g_fast(utility_parameters, inv, x1_new, st, s, period):
 # + get_conditional, with dense-EVT continuation lookups)
 # ---------------------------------------------------------------------------
 
+def _noneduc_value(j, s, c, st, period, x1_new, x2, x2_new, sigma_u, debt_pen,
+                   b, evt_next, conterfactual, task_cache, mask_current_debt):
+    """Integrated value of one work/home choice (one column of all_vjt)."""
+    nb = b.shape[0]
+    e_nodes, we = _wage_quadrature(j)
+    work_key = (j.tobytes(), st.work_key[s])
+    payload = task_cache["work_flow"].get(work_key) \
+        if ENABLE_FLOW_CACHE else None
+    if payload is None:
+        if j[2] != 0:
+            param_wage_j = ms.get_params_wage(j)
+            debtnew, income = ms.get_debt_income(
+                x1_new, x2_new, x2, period, j, b, e_nodes,
+                conterfactual, param_wage_j,
+            )
+        else:
+            debtnew, income = ms.get_debt_income_home(
+                x1_new, x2_new, x2, period, j, b, e_nodes, conterfactual
+            )
+        debt_position = snap_debt_indices(b, debtnew)
+        u = ms.get_power_utility(sigma_u, income)
+        if ENABLE_FLOW_CACHE:
+            task_cache["work_flow"][work_key] = (debt_position, u)
+    else:
+        debt_position, u = payload
+    evt_row = evt_next[st.succ_nograd[s][c]]
+    continuation = ms.beta * evt_row[debt_position]
+    vjt = u + continuation
+    vjt += debt_pen * np.tile(mask_current_debt, e_nodes.shape[0])
+    w_vis = np.repeat(we, nb)
+    v = (vjt * w_vis).reshape((len(e_nodes), nb)).T
+    return np.sum(v, axis=1)
+
+
+def _edu_payload(j, s, st, period, inv, x1_new, x2, x2_new, b,
+                 financial_parameters, task_cache, e_joint, z_standard_joint):
+    """(z_joint, resources) for one (education, labor) group at one state.
+
+    Field-independent: within a state, all fields of one group share it, and
+    across states it depends only on x2[0:9] (see cache-key rule above).
+    """
+    group = (int(j[1]), int(j[2]))
+    entry = task_cache["edu_flow"].get(group) if ENABLE_FLOW_CACHE else None
+    if entry is not None and entry[0] == st.edu_key[s]:
+        return entry[1], entry[2]
+
+    if group not in task_cache["fin_help"]:
+        task_cache["fin_help"][group] = float(
+            ms.fin_help(x1_new, j, financial_parameters)
+        )
+    h0 = task_cache["fin_help"][group]
+
+    w0_key = st.edu_key[s]
+    if w0_key not in task_cache["wage0"]:
+        # Quirk replicated from get_expected_conditional:
+        # RAW x2 here (columns 0-8), not x2_new.
+        task_cache["wage0"][w0_key] = float(
+            np.asarray(ms.wage0(x1_new, x2)).reshape(-1)[0]
+        )
+    wage_index = task_cache["wage0"][w0_key]
+
+    real_wage = (
+        np.exp(wage_index + e_joint) * (j[2] / 2.0) * 52.0 * 40.0
+    )
+    pre_choice_resources = (
+        h0 + real_wage[:, None] - ms.tuition(j)
+        - (1.0 + ms.r) * b[None, :]
+    )
+    z_joint = bs.realization(
+        ms.budget_params,
+        inv,
+        period,
+        z_standard_joint[:, None],
+        education=int(j[1]),
+        state=x2,
+        pre_choice_resources=pre_choice_resources,
+    ).reshape(-1)
+
+    resources = ms.get_consumption_resources(
+        x1_new, x2_new, b, e_joint, j, financial_parameters, z=z_joint
+    )
+    if ENABLE_FLOW_CACHE:
+        task_cache["edu_flow"][group] = (st.edu_key[s], z_joint, resources)
+    return z_joint, resources
+
+
+def _edu_continuation(j, s, c, st, x1_new, x2, evt_next, debt_pen,
+                      mask_candidate_debt, task_cache):
+    """(nb, 1) continuation of one schooling alternative: graduation-risk
+    mixing plus the candidate-debt penalty, verbatim from get_conditional."""
+    if st.grad_flag[s][c]:
+        pg_key = (j.tobytes(), st.edu_key[s])
+        if pg_key not in task_cache["pgrad"]:
+            task_cache["pgrad"][pg_key] = ms.probability_graduation(
+                x1_new, x2, j
+            )
+        p_grad = task_cache["pgrad"][pg_key]
+        evt_grad = evt_next[st.succ_grad[s][c]][:, None]
+        evt_nograd = evt_next[st.succ_nograd[s][c]][:, None]
+        continuation = ms.beta * (
+            p_grad * evt_grad + (1 - p_grad) * evt_nograd
+        )
+    else:
+        continuation = ms.beta * evt_next[st.succ_nograd[s][c]][:, None]
+    continuation[:, 0] += debt_pen * mask_candidate_debt
+    return continuation
+
+
 def _solve_state(
     s, st, period, inv, x1_key, x1_new, sigma_u, debt_pen, b, b1, evt_next,
     ccp_real, models_npz, solution_mode, conterfactual, maxdebt,
@@ -320,120 +675,76 @@ def _solve_state(
     mask_current_debt = (b > 0).astype(np.float64)
     mask_candidate_debt = (b1 > 0).astype(np.float64)
 
-    for c in range(Jx.shape[0]):
-        j = Jx[c]
-        if j[1] == 0:
-            # ---- NOT STUDYING (work or home) ----
-            e_nodes, we = _wage_quadrature(j)
-            work_key = (j.tobytes(), st.work_key[s])
-            payload = task_cache["work_flow"].get(work_key) \
-                if ENABLE_FLOW_CACHE else None
-            if payload is None:
-                if j[2] != 0:
-                    param_wage_j = ms.get_params_wage(j)
-                    debtnew, income = ms.get_debt_income(
-                        x1_new, x2_new, x2, period, j, b, e_nodes,
-                        conterfactual, param_wage_j,
+    use_grouped = (
+        ENABLE_GROUPED_KERNEL and ms.USE_FUSED_CONSUMPTION_SEARCH and maxdebt
+    )
+    if use_grouped:
+        # ---- work/home choices, one at a time (as before) ----
+        for c in st.noneduc_idx[s]:
+            all_vjt[:, c] = _noneduc_value(
+                Jx[c], s, c, st, period, x1_new, x2, x2_new, sigma_u,
+                debt_pen, b, evt_next, conterfactual, task_cache,
+                mask_current_debt,
+            )
+        # ---- schooling: one kernel call per (education, labor) group ----
+        for idxs in st.edu_groups[s]:
+            j0 = Jx[idxs[0]]
+            e_joint, z_standard_joint, w_joint, w_vis = \
+                _edu_joint_nodes(j0, nb)
+            z_joint, resources = _edu_payload(
+                j0, s, st, period, inv, x1_new, x2, x2_new, b,
+                financial_parameters, task_cache, e_joint, z_standard_joint,
+            )
+            nf = idxs.shape[0]
+            continuations = np.empty((nf, nb))
+            for fi in range(nf):
+                continuations[fi, :] = _edu_continuation(
+                    Jx[idxs[fi]], s, idxs[fi], st, x1_new, x2, evt_next,
+                    debt_pen, mask_candidate_debt, task_cache,
+                )[:, 0]
+            # Bounds depend only on education level and years enrolled --
+            # identical for every field in the group.
+            lo_idx, hi_idx, cap_start = get_debt_region_bounds(b, x2, j0)
+            payoffs = np.zeros((nf, resources.shape[0]))
+            _grouped_education_search(
+                sigma_u, b1, resources, continuations,
+                lo_idx, hi_idx, cap_start, payoffs,
+            )
+            for fi in range(nf):
+                v = (payoffs[fi] * w_vis).reshape((len(w_joint), nb)).T
+                all_vjt[:, idxs[fi]] = np.sum(v, axis=1)
+    else:
+        for c in range(Jx.shape[0]):
+            j = Jx[c]
+            if j[1] == 0:
+                all_vjt[:, c] = _noneduc_value(
+                    j, s, c, st, period, x1_new, x2, x2_new, sigma_u,
+                    debt_pen, b, evt_next, conterfactual, task_cache,
+                    mask_current_debt,
+                )
+            else:
+                e_joint, z_standard_joint, w_joint, w_vis = \
+                    _edu_joint_nodes(j, nb)
+                z_joint, resources = _edu_payload(
+                    j, s, st, period, inv, x1_new, x2, x2_new, b,
+                    financial_parameters, task_cache, e_joint,
+                    z_standard_joint,
+                )
+                continuation = _edu_continuation(
+                    j, s, c, st, x1_new, x2, evt_next, debt_pen,
+                    mask_candidate_debt, task_cache,
+                )
+                if ms.USE_FUSED_CONSUMPTION_SEARCH and maxdebt:
+                    max_vjt = ms.get_maximum_loop_modified_resources_maxdebt(
+                        sigma_u, b, b1, resources, continuation, j, x2
                     )
                 else:
-                    debtnew, income = ms.get_debt_income_home(
-                        x1_new, x2_new, x2, period, j, b, e_nodes, conterfactual
+                    c_mat = resources[..., np.newaxis] + b1
+                    max_vjt = ms.get_maximum(
+                        sigma_u, c_mat, continuation, inv, b, j, x2, maxdebt
                     )
-                debt_position = snap_debt_indices(b, debtnew)
-                u = ms.get_power_utility(sigma_u, income)
-                if ENABLE_FLOW_CACHE:
-                    task_cache["work_flow"][work_key] = (debt_position, u)
-            else:
-                debt_position, u = payload
-            evt_row = evt_next[st.succ_nograd[s][c]]
-            continuation = ms.beta * evt_row[debt_position]
-            vjt = u + continuation
-            vjt += debt_pen * np.tile(mask_current_debt, e_nodes.shape[0])
-            w_vis = np.repeat(we, nb)
-            v = (vjt * w_vis).reshape((len(e_nodes), nb)).T
-            all_vjt[:, c] = np.sum(v, axis=1)
-        else:
-            # ---- STUDYING ----
-            e_joint, z_standard_joint, w_joint, w_vis = _edu_joint_nodes(j, nb)
-
-            # The (z_joint, resources) payload is field-independent: within a
-            # state, all fields of one (education, labor) group share it, and
-            # across states it depends only on x2[0:9] (see key rule above).
-            group = (int(j[1]), int(j[2]))
-            entry = task_cache["edu_flow"].get(group) \
-                if ENABLE_FLOW_CACHE else None
-            if entry is not None and entry[0] == st.edu_key[s]:
-                z_joint, resources = entry[1], entry[2]
-            else:
-                fh_key = group
-                if fh_key not in task_cache["fin_help"]:
-                    task_cache["fin_help"][fh_key] = float(
-                        ms.fin_help(x1_new, j, financial_parameters)
-                    )
-                h0 = task_cache["fin_help"][fh_key]
-
-                w0_key = st.edu_key[s]
-                if w0_key not in task_cache["wage0"]:
-                    # Quirk replicated from get_expected_conditional:
-                    # RAW x2 here (columns 0-8), not x2_new.
-                    task_cache["wage0"][w0_key] = float(
-                        np.asarray(ms.wage0(x1_new, x2)).reshape(-1)[0]
-                    )
-                wage_index = task_cache["wage0"][w0_key]
-
-                real_wage = (
-                    np.exp(wage_index + e_joint) * (j[2] / 2.0) * 52.0 * 40.0
-                )
-                pre_choice_resources = (
-                    h0 + real_wage[:, None] - ms.tuition(j)
-                    - (1.0 + ms.r) * b[None, :]
-                )
-                z_joint = bs.realization(
-                    ms.budget_params,
-                    inv,
-                    period,
-                    z_standard_joint[:, None],
-                    education=int(j[1]),
-                    state=x2,
-                    pre_choice_resources=pre_choice_resources,
-                ).reshape(-1)
-
-                resources = ms.get_consumption_resources(
-                    x1_new, x2_new, b, e_joint, j, financial_parameters,
-                    z=z_joint
-                )
-                if ENABLE_FLOW_CACHE:
-                    task_cache["edu_flow"][group] = (
-                        st.edu_key[s], z_joint, resources
-                    )
-
-            if st.grad_flag[s][c]:
-                pg_key = (j.tobytes(), st.edu_key[s])
-                if pg_key not in task_cache["pgrad"]:
-                    task_cache["pgrad"][pg_key] = ms.probability_graduation(
-                        x1_new, x2, j
-                    )
-                p_grad = task_cache["pgrad"][pg_key]
-                evt_grad = evt_next[st.succ_grad[s][c]][:, None]
-                evt_nograd = evt_next[st.succ_nograd[s][c]][:, None]
-                continuation = ms.beta * (
-                    p_grad * evt_grad + (1 - p_grad) * evt_nograd
-                )
-            else:
-                continuation = ms.beta * evt_next[st.succ_nograd[s][c]][:, None]
-            continuation[:, 0] += debt_pen * mask_candidate_debt
-
-            if ms.USE_FUSED_CONSUMPTION_SEARCH and maxdebt:
-                max_vjt = ms.get_maximum_loop_modified_resources_maxdebt(
-                    sigma_u, b, b1, resources, continuation, j, x2
-                )
-            else:
-                c_mat = resources[..., np.newaxis] + b1
-                max_vjt = ms.get_maximum(
-                    sigma_u, c_mat, continuation, inv, b, j, x2, maxdebt
-                )
-            v = (max_vjt * w_vis).reshape((len(w_joint), nb)).T
-            all_vjt[:, c] = np.sum(v, axis=1)
+                v = (max_vjt * w_vis).reshape((len(w_joint), nb)).T
+                all_vjt[:, c] = np.sum(v, axis=1)
 
     # ---- expectation / CCP step, verbatim from get_all_choices ----
     base = -1

@@ -203,6 +203,55 @@ def unit_check_flow_keys(rng, periods=(5, 9), pairs=40):
               f"{len(multi)} shareable)")
 
 
+def unit_check_grouped_kernel(rng, trials=40):
+    """Grouped kernel vs the original single-field kernel, exact equality.
+
+    Covers all education levels, work levels, group sizes 1/3/8, and
+    resource ranges that force the consumption-floor and no-feasible-debt
+    fallback branches."""
+    from fused_debt_search import get_maximum_loop_modified_resources_maxdebt
+    from debt_limits import get_debt_region_bounds
+    b = ms.debt_range
+    nb = b.shape[0]
+    field_of = {1: 12, 2: 3, 3: 13}
+    for trial in range(trials):
+        educ = int(rng.integers(1, 4))
+        work = int(rng.integers(0, 3))
+        nf = int(rng.choice([1, 3, 8]))
+        x2 = np.zeros(10, dtype=np.int64)
+        x2[1] = rng.integers(0, 3)
+        x2[2] = rng.integers(0, 6)
+        x2[3] = rng.integers(0, 2)
+        j0 = np.array([field_of[educ], educ, work], dtype=np.int64)
+        Q = 25 if work != 0 else 5
+        if trial % 3 == 0:
+            resources = rng.uniform(-80000.0, -1000.0, Q * nb)  # floor branch
+        elif trial % 3 == 1:
+            resources = rng.uniform(-30000.0, 60000.0, Q * nb)
+        else:
+            resources = rng.uniform(2000.0, 90000.0, Q * nb)
+        continuations = np.ascontiguousarray(rng.normal(-20.0, 5.0, (nf, nb)))
+        sigma_u = float(rng.uniform(1.2, 2.2))
+
+        ref = np.empty((nf, Q * nb))
+        for f in range(nf):
+            ref[f] = get_maximum_loop_modified_resources_maxdebt(
+                sigma_u, b, b, resources,
+                np.ascontiguousarray(continuations[f][:, None]), j0, x2,
+            )
+        lo_idx, hi_idx, cap_start = get_debt_region_bounds(b, x2, j0)
+        payoffs = np.zeros((nf, Q * nb))
+        msf._grouped_education_search(
+            sigma_u, b, resources, continuations,
+            lo_idx, hi_idx, cap_start, payoffs,
+        )
+        assert np.array_equal(ref, payoffs), (
+            f"grouped kernel differs: trial={trial} educ={educ} "
+            f"work={work} nf={nf}"
+        )
+    print(f"  grouped kernel: OK ({trials} random cases, bitwise)")
+
+
 def run_units():
     rng = np.random.default_rng(0)
     print("Unit checks (fast vs original implementations):")
@@ -210,6 +259,7 @@ def run_units():
     unit_check_quadrature()
     unit_check_statics(rng)
     unit_check_flow_keys(rng)
+    unit_check_grouped_kernel(rng)
     unit_check_g(rng)
     print("All unit checks passed.")
 
@@ -265,7 +315,8 @@ def _compare(ref, new, tol):
 
 def _run_one_task(task):
     """Run reference + fast solver for one (type, state) task; compare & time."""
-    em_type, i, ccp_real, solution_mode, params_mode, tol, restore = task
+    em_type, i, ccp_real, solution_mode, params_mode, tol, restore, grouped = task
+    msf.ENABLE_GROUPED_KERNEL = bool(grouped)
     import time
 
     x1 = ms.invariant_states
@@ -303,17 +354,20 @@ def _init_worker():
 
 
 def run_full(em_types, states, ccp_real, solution_mode, params_mode, tol,
-             restore, workers):
+             restore, workers, grouped):
     import multiprocessing
 
     ms.reload_budgetshock_params()
     tasks = [
-        (em_type, i, ccp_real, solution_mode, params_mode, tol, restore)
+        (em_type, i, ccp_real, solution_mode, params_mode, tol, restore,
+         grouped)
         for em_type in em_types
         for i in states
     ]
     print(f"Running {len(tasks)} task(s) with {workers} worker(s); each task "
           f"solves reference + fast sequentially and compares artifacts.")
+    print(f"Fast-solver config under test: flow cache="
+          f"{msf.ENABLE_FLOW_CACHE}, grouped kernel={bool(grouped)}")
 
     if workers > 1:
         # Prebuild the fast solver's statics so forked workers inherit them.
@@ -358,6 +412,10 @@ def main():
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel workers over (type, state) tasks; each "
                          "task still runs its two solvers sequentially")
+    ap.add_argument("--grouped", type=int, default=1, choices=[0, 1],
+                    help="test the fast solver WITH the grouped education "
+                         "kernel (default 1; use 0 to test the per-choice "
+                         "path)")
     args = ap.parse_args()
 
     if args.units:
@@ -367,7 +425,8 @@ def main():
     em_types = [int(v) for v in args.em_types.split(",")]
     states = [int(v) for v in args.states.split(",")]
     ok = run_full(em_types, states, args.ccp_real, args.solution_mode,
-                  args.params_mode, args.tol, args.restore, args.workers)
+                  args.params_mode, args.tol, args.restore, args.workers,
+                  args.grouped)
     sys.exit(0 if ok else 1)
 
 
