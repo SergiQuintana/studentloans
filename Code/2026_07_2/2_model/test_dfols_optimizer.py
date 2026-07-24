@@ -253,19 +253,22 @@ class DefaultPathUnchangedTests(unittest.TestCase):
             3000,
         )
 
-    def test_production_driver_still_requests_hybrid(self):
-        """estimation_all_em.py keeps hybrid as its default optimizer.
+    def test_production_driver_requests_dfols(self):
+        """estimation_all_em.py uses dfols as its production optimizer.
 
         The driver is inspected as text because importing it would pull
-        server-only inputs. The constant must default to "hybrid" and be the
-        only optimizer passed to estimate_budget_shock_all_education.
+        server-only inputs. Promoted "hybrid" -> "dfols" on 2026-07-24
+        (researcher approval; Agents_Readme/Tasks/
+        ESTIMATION_SPEED_ANALYSIS_2026_07_24.md, point 1). The constant must
+        default to "dfols" and be the only optimizer passed to
+        estimate_budget_shock_all_education.
         """
         driver_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "estimation_all_em.py"
         )
         with open(driver_path, "r", encoding="utf-8") as handle:
             driver_source = handle.read()
-        self.assertIn('BUDGET_SMM_OPTIMIZER = "hybrid"', driver_source)
+        self.assertIn('BUDGET_SMM_OPTIMIZER = "dfols"', driver_source)
         self.assertIn("optimizer=BUDGET_SMM_OPTIMIZER", driver_source)
         self.assertNotIn('optimizer="hybrid"', driver_source)
         self.assertNotIn('optimizer="dfols"', driver_source)

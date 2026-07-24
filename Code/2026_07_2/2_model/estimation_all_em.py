@@ -130,12 +130,17 @@ BUDGET_SMM_CCP_WORKERS = 60
 BUDGET_SMM_CELL_WORKERS = None  # automatically one worker per cell, CPU permitting
 # Profiling 2026-07-23: the pooled kernel is bitwise thread-count-invariant, so
 # raising this to 6 uses all 60 server cores (10 cell workers x 6 threads) for
-# a ~1.5x SMM speedup with no other pool active during the SMM phase. Kept at 1
-# until the change is promoted after a server check.
-BUDGET_SMM_CELL_NUMBA_THREADS = 1
+# a ~1.5x SMM speedup with no other pool active during the SMM phase.
+# Promoted 1 -> 6 on 2026-07-24 (researcher approval; see
+# Agents_Readme/Tasks/ESTIMATION_SPEED_ANALYSIS_2026_07_24.md, point 2).
+BUDGET_SMM_CELL_NUMBA_THREADS = 6
 # "dfols" is the benchmarked faster least-squares alternative (see
 # Agents_Readme/Tasks/STUDENT_LOANS_FIT_MASTER_PLAN.md, section 5).
-BUDGET_SMM_OPTIMIZER = "hybrid"
+# Promoted "hybrid" -> "dfols" on 2026-07-24 (researcher approval; see
+# ESTIMATION_SPEED_ANALYSIS_2026_07_24.md, point 1). Requires the DFO-LS
+# package on the server (already in requirements.txt; reinstall deps once).
+# Set back to "hybrid" to recover the previous optimizer exactly.
+BUDGET_SMM_OPTIMIZER = "dfols"
 
 # --- New-borrowing-cost (kappa) estimation switches (2026-07-23) -------------
 # See Agents_Readme/Tasks/STUDENT_LOANS_FIT_MASTER_PLAN.md. Both default to the
@@ -151,8 +156,19 @@ BUDGET_SMM_MOMENT_SPEC = "flow_split_stock"
 # last vector entry; sizes 68/69/71/72): see the master plan.
 ESTIMATE_LOAN_TYPE_DEBT_PENALTY = True
 
+def _timing(stage, start, it=None):
+    """Stage-timing print (added 2026-07-24): grep the run log for [TIMING]."""
+    elapsed = time.perf_counter() - start
+    prefix = f"it {it} | " if it is not None else ""
+    print(
+        f"[TIMING] {time.strftime('%Y-%m-%d %H:%M:%S')} | {prefix}{stage}: "
+        f"{elapsed:,.1f} s",
+        flush=True,
+    )
+
+
 if __name__ == '__main__':
-    
+
     # Simulate all model states
     print("Simulating all model states...")
     ms.simulate_all_states(11)
@@ -267,6 +283,7 @@ if __name__ == '__main__':
     # The Bellman workers load one file for every type, invariant state, and
     # period 1,...,T-1. Verify that complete grid before starting the expensive
     # solve, and retry only incomplete type/state tasks.
+    _stage_started = time.perf_counter()
     mccp.ensure_initial_ccps(
         ms.invariant_states,
         ms.debt_range,
@@ -279,13 +296,16 @@ if __name__ == '__main__':
     )
     
     
+    _timing("ensure_initial_ccps", _stage_started)
+
     # Generate the amount of aguirregabiria_mira iterations.
     iterations = 30
     solution_mode = 0
-    
+
     for it in range(iterations):
-    
+
         print("Iteration number : ", it)
+        _iteration_started = time.perf_counter()
     
         # Check which ccp estimation to use:
         if it != 0:
@@ -312,19 +332,22 @@ if __name__ == '__main__':
             #--------------------------------------#
             # Build the sequence to estimate the budget shock
             print("Building Sequence to Estimate Budget Shock")
-        
+
+            _stage_started = time.perf_counter()
             pool_obj = multiprocessing.Pool(processes=60)
             args = [
                 (i, ms.invariant_states, ms.debt_range, em_type)
                 for em_type in TYPE_IDS
                 for i in range(np.shape(ms.invariant_states)[0])
             ]
-        
+
             results = pool_obj.starmap(mgs.get_ccp_sequence, args, chunksize=1)
             pool_obj.close()
-        
+            _timing("ccp-sequence build", _stage_started, it)
+
             #---------------------------------------#
             print("Estimation of the Budget Shock")
+            _stage_started = time.perf_counter()
 
             mfd.ESTIMATE_NEW_BORROWING_COST = ESTIMATE_NEW_BORROWING_COST
             mfd.ESTIMATE_LOAN_TYPE_DEBT_PENALTY = ESTIMATE_LOAN_TYPE_DEBT_PENALTY
@@ -345,10 +368,12 @@ if __name__ == '__main__':
                 ccp_cache_mode="off",
             )
             ms.reload_budgetshock_params()
-            
+            _timing("budget SMM", _stage_started, it)
+
         #--------------------------------------#
         # Solve the model with ccps
         print("Solve the model and the ccps")
+        _stage_started = time.perf_counter()
         models = 0
         conter = 0
         maxdebt = True
@@ -364,20 +389,26 @@ if __name__ == '__main__':
     
         results = pool_obj.starmap(bellman_solver, args, chunksize=1)
         pool_obj.close()
+        _timing("Bellman solve", _stage_started, it)
 
         #--------------------------------------#
         # Now prepare the data and evaluate the likelihood
         print("Preparing the data for the estimation")
-    
+
+        _stage_started = time.perf_counter()
         pool_obj = multiprocessing.Pool(T - 1)
         args = [period for period in range(1, T, 1)]
         results = pool_obj.map(me.prepare_vjt_feasible, args)
         pool_obj.close()
-    
+        _timing("prepare_vjt_feasible", _stage_started, it)
+
+        _stage_started = time.perf_counter()
         choices_all, vjt_all_types, x1_new, choices_array_all, x_change, x_educ, x_first2, x_first4, x_firstgrad, x_exp = me.load_all_arrays_feasible()
-    
+        _timing("load_all_arrays_feasible", _stage_started, it)
+
         # Now optimize the likelihood
         print("Evaluating the likelihood")
+        _stage_started = time.perf_counter()
         res = minimize(
             me.likelihood,
             x0,
@@ -387,7 +418,8 @@ if __name__ == '__main__':
             options={'disp': True},
             callback=me.store
         )
-    
+        _timing("likelihood optimization", _stage_started, it)
+
         # Get the updated parameters
         param_g = res.x
     
@@ -404,6 +436,8 @@ if __name__ == '__main__':
     
         # Store likelihood evaluation
         np.save(f"{path_estimates}/likelihood_it{it}_sigma_est.npy", np.array(res.fun))
+
+        _timing("FULL NPL ITERATION", _iteration_started, it)
             
         
         
