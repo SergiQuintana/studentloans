@@ -133,11 +133,13 @@ USE_FAST_SOLVER = True
 #     solve does not update CCPs, so the legacy pipeline would rebuild
 #     byte-identical sequences from the unchanged initial CCPs);
 #   * the budget SMM reads the dense files.
-# Continuation values are byte-identical to the legacy pipeline; gate
-# before flipping: test_ccp_sequence_fast_equivalence.py (incl. --fused)
-# must PASS on the server. Requires USE_FAST_SOLVER. Default False =
-# exactly the previous pipeline.
-USE_FAST_CCP_SEQUENCE = False
+# Continuation values are byte-identical to the legacy pipeline; the
+# no-fused server gate PASSED 2026-07-24 (20 tasks x 16 types, byte
+# identical); the --fused section of test_ccp_sequence_fast_equivalence
+# has NOT yet run on the server. Flipped to True on Sergi's instruction
+# 2026-07-24 for the first fast production run; set False to recover the
+# legacy sequence pipeline exactly. Requires USE_FAST_SOLVER.
+USE_FAST_CCP_SEQUENCE = True
 
 # Production loan-SMM controls. The auxiliary EM results are loaded above and
 # remain fixed. A deliberately small annealing budget keeps each NPL iteration
@@ -186,7 +188,76 @@ def _timing(stage, start, it=None):
     )
 
 
+class _Tee:
+    """Mirror a stream into the run-log file (added 2026-07-24).
+
+    Installed on sys.stdout/sys.stderr before any pool is created, so
+    forked workers inherit it and their prints land in the log too.
+    """
+
+    def __init__(self, stream, logfile):
+        self._stream = stream
+        self._logfile = logfile
+
+    def write(self, text):
+        self._stream.write(text)
+        self._logfile.write(text)
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+        self._logfile.flush()
+
+
+def _setup_run_log():
+    """Write every line of this run to Model/Estimates/logs/ as well."""
+    log_dir = Path(path_estimates) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / (
+        f"estimation_all_em_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    handle = open(log_path, "a", buffering=1, encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, handle)
+    sys.stderr = _Tee(sys.stderr, handle)
+    print(f"[RUN LOG] mirroring all output to {log_path}", flush=True)
+    return log_path
+
+
+def _print_run_header():
+    """One block at the top of every log with the full run configuration."""
+    import platform
+    try:
+        import subprocess
+        git_hash = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(THIS_DIR),
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001
+        git_hash = "unknown"
+    print("=" * 70)
+    print(f"[RUN CONFIG] {time.strftime('%Y-%m-%d %H:%M:%S')} | "
+          f"git {git_hash} | python {platform.python_version()} | "
+          f"numpy {np.__version__}")
+    print(f"  USE_FAST_SOLVER               = {USE_FAST_SOLVER}")
+    print(f"  USE_FAST_CCP_SEQUENCE         = {USE_FAST_CCP_SEQUENCE}")
+    print(f"  BUDGET_SMM_OPTIMIZER          = {BUDGET_SMM_OPTIMIZER}")
+    print(f"  BUDGET_SMM_MOMENT_SPEC        = {BUDGET_SMM_MOMENT_SPEC}")
+    print(f"  BUDGET_SMM_DRAWS              = {BUDGET_SMM_DRAWS}")
+    print(f"  BUDGET_SMM_CELL_NUMBA_THREADS = {BUDGET_SMM_CELL_NUMBA_THREADS}")
+    print(f"  ESTIMATE_NEW_BORROWING_COST   = {ESTIMATE_NEW_BORROWING_COST}")
+    print(f"  ESTIMATE_LOAN_TYPE_DEBT_PENALTY = "
+          f"{ESTIMATE_LOAN_TYPE_DEBT_PENALTY}")
+    print(f"  debt-penalty bounds           = {mfd.DEBT_PENALTY_BOUNDS}")
+    print(f"  loan-type shift bounds        = "
+          f"{mfd.LOAN_TYPE_DEBT_PENALTY_BOUNDS}")
+    print(f"  kappa bounds                  = {mfd.NEW_BORROWING_COST_BOUNDS}")
+    print("=" * 70, flush=True)
+
+
 if __name__ == '__main__':
+
+    _setup_run_log()
+    _print_run_header()
 
     # Simulate all model states
     print("Simulating all model states...")
@@ -408,6 +479,25 @@ if __name__ == '__main__':
             )
             ms.reload_budgetshock_params()
             _timing("budget SMM", _stage_started, it)
+            # One-line estimate summary per iteration (added 2026-07-24):
+            # watch the debt penalties against their (-100, 0) bounds and
+            # the risk aversions against their 3 cap directly in the log.
+            try:
+                _bundle = np.load(
+                    f"{path_estimates}/budgetshock_params.npy",
+                    allow_pickle=True,
+                ).item()
+                print(
+                    f"[ESTIMATES it {it}] debt_pen_parinc="
+                    f"{np.round(np.asarray(_bundle['debt_pen_parinc']), 3)}"
+                    f" | risk_aversion="
+                    f"{np.round(np.asarray(_bundle['risk_aversion']), 4)}"
+                    f" | loan_type_shift="
+                    f"{float(_bundle.get('debt_penalty_loan_type_shift', 0.0)):.4f}",
+                    flush=True,
+                )
+            except Exception as _exc:  # noqa: BLE001
+                print(f"[ESTIMATES it {it}] bundle summary failed: {_exc}")
 
         #--------------------------------------#
         # Solve the model with ccps

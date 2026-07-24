@@ -126,6 +126,14 @@ NEW_BORROWING_COST_BOUNDS = (-2.0, 0.0)
 # to the pre-shift code.
 ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
 LOAN_TYPE_DEBT_PENALTY_BOUNDS = (-3.0, 0.0)
+# Bounds of the four parental-income debt penalties (per-period flow-utility
+# units). Tightened (-1.0e6, 0.0) -> (-100.0, 0.0) on 2026-07-24 (researcher
+# decision): the previous estimation parked the penalties at -0.92e6..-1.0e6,
+# six orders of magnitude above the model's O(0.1-2) flow-utility scale,
+# which saturated the CCPs to exact 0/1 and injected infinities into the
+# ccp sequence (Agents_Readme/ZERO_CCP_PROBLEM.md). A saved restart vector
+# outside the bounds is clipped by the optimizer wrappers.
+DEBT_PENALTY_BOUNDS = (-100.0, 0.0)
 EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
 DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
@@ -1868,7 +1876,7 @@ def fit_budget_shock_multi(
     for _ in range(P):
         bounds.append((SIGE_MIN, SIGE_MAX))
     bounds += [(0.1001, 2.9999)] * 4
-    bounds += [(-1e6, 0.0)] * 4  # dp0,dp2,dp3,dp4 <= 0
+    bounds += [DEBT_PENALTY_BOUNDS] * 4  # dp0,dp2,dp3,dp4 <= 0
     if shock_heterogeneity in ("mean", "both"):
         bounds += [(MU_MIN, MU_MAX)] * P
     if shock_heterogeneity in ("variance", "both"):
@@ -3480,7 +3488,7 @@ def fit_education_cell(
             )
         bounds = (
             [(-50000.0, 50000.0)] * 4 + [(1.0, 50000.0)]
-            + [(0.1001, 2.9999)] * 4 + [(-1.0e6, 0.0)] * 4
+            + [(0.1001, 2.9999)] * 4 + [DEBT_PENALTY_BOUNDS] * 4
             + [(-50000.0, 50000.0)]
         )
         if specification == "parental_income_loan_type":
@@ -3533,7 +3541,7 @@ def fit_education_cell(
     )
     bounds = (
         [(-50000.0, 50000.0)] * 7 + [(1.0, 50000.0)]
-        + [(0.1001, 2.9999)] * 4 + [(-1.0e6, 0.0)] * 4
+        + [(0.1001, 2.9999)] * 4 + [DEBT_PENALTY_BOUNDS] * 4
     )
     if shock_heterogeneity in ("mean", "both"):
         bounds += [(-50000.0, 50000.0)]
@@ -3881,7 +3889,7 @@ def fit_education_cells(
             + [(-50000.0, 50000.0)]
         )
     bounds.extend([(0.1001, 2.9999)] * 4)
-    bounds.extend([(-1.0e6, 0.0)] * 4)
+    bounds.extend([DEBT_PENALTY_BOUNDS] * 4)
     if ESTIMATE_NEW_BORROWING_COST:
         # kappas are flow-utility units; the CRRA flow utility here is
         # O(0.1-2), so a few utils already dominate the choice.
