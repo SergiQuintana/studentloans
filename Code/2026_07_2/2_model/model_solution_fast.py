@@ -39,6 +39,7 @@ import scipy.special
 
 import budget_shock as bs
 import model_solution_em as ms
+import model_getccp_sequence_fast as mgf
 from numba import njit
 from debt_limits import CONSUMPTION_FLOOR, get_debt_region_bounds
 from fused_debt_search import _flow_utility
@@ -78,6 +79,21 @@ ENABLE_FLOW_CACHE = True
 # identical, cumulative speedup 5.6-6.1x (~395s -> ~66s per task). Set False
 # to fall back to the per-choice search path.
 ENABLE_GROUPED_KERNEL = True
+
+# Fused CCP-sequence emission (2026-07-24, researcher-approved, flag-off).
+# When True and this task runs with updated CCPs (ccp_real == 1,
+# solution_mode == 0), each period also computes the TERMINAL-FREE
+# home-production continuation sequence used by the budget SMM,
+#     seq_9 = -log(ccp_home_9)          (zero continuation, NO terminal)
+#     seq_p = -log(ccp_home_p) + beta * seq_{p+1}(home successor),
+# and writes it in the dense format of model_getccp_sequence_fast. The
+# solver walks periods backward, so the home CCPs are reused in memory the
+# moment they are computed — the standalone sequence stage then becomes
+# unnecessary for NPL iterations >= 1 (estimation_all_em wires this via
+# USE_FAST_CCP_SEQUENCE). The solver's own EVT (which does contain the
+# terminal) is never used here; the SMM keeps adding the sigma-dependent
+# terminal itself. Default False: solver output byte-identical to before.
+EMIT_CCP_SEQUENCE = False
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +578,30 @@ def build_all_period_statics():
         get_period_statics(period)
 
 
+_HOME_SUCC = {}
+
+
+def _home_successors(period):
+    """Home-production successor row of every state, in the row order of
+    ``states_t{period+1}.npy`` — read off the period statics, whose
+    successors were built with the same ``move_state_grad`` call the
+    sequence recursion uses."""
+    if period in _HOME_SUCC:
+        return _HOME_SUCC[period]
+    st = get_period_statics(period)
+    succ = np.empty(st.n_states, dtype=np.int64)
+    for s in range(st.n_states):
+        home = np.flatnonzero((st.Jx[s] == 0).all(axis=1))
+        if home.size != 1:
+            raise RuntimeError(
+                f"period {period}, state {s}: expected exactly one "
+                f"home-production choice, found {home.size}"
+            )
+        succ[s] = st.succ_nograd[s][home[0]]
+    _HOME_SUCC[period] = succ
+    return succ
+
+
 # ---------------------------------------------------------------------------
 # Deterministic utility g(), with the per-state designs precomputed
 # ---------------------------------------------------------------------------
@@ -901,6 +941,12 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
     nb = b.shape[0]
     evt_next = None  # dense (n_states_{period+1}, nb) EVT of the next period
 
+    # Fused terminal-free sequence (see the EMIT_CCP_SEQUENCE flag note).
+    emit_sequence = (
+        EMIT_CCP_SEQUENCE and ccp_real == 1 and solution_mode == 0
+    )
+    seq_next = None
+
     if conterfactual == 1:
         terminal_conter = np.load(
             f"{ms.pathcontfinal}/continuation_conter_s{inv[0, 2]}_eth{inv[0, 3]}_sigma{sigma_u}.npz"
@@ -914,6 +960,10 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
         evt_arr = np.empty((st.n_states, nb))
         names_vjt, names_exp, names_ccp = [], [], []
         result_vjt, result_exp, results_ccp = [], [], []
+        ccp_home_arr = (
+            np.empty((st.n_states, nb))
+            if (emit_sequence and period < T) else None
+        )
 
         if period < T:
             # Same load (and failure mode) as the original solver; consumed
@@ -957,6 +1007,8 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
                 result_vjt.append(all_vjt)
                 results_ccp.append(ccp)
                 evt_arr[s] = evt_vec
+                if ccp_home_arr is not None:
+                    ccp_home_arr[s] = ccp
 
         ms.persist_outputs_for_period(
             period=period,
@@ -979,6 +1031,20 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
                 results_ccp,
                 compressed=True,
             )
+
+        if ccp_home_arr is not None:
+            # Terminal-free sequence recursion on the home CCPs just
+            # computed — the same arithmetic as the standalone builder,
+            # so the emitted files are byte-identical to its output.
+            if period == T - 1:
+                seq = -np.log(ccp_home_arr) + mgf.beta * 0.0
+            else:
+                seq = (
+                    -np.log(ccp_home_arr)
+                    + mgf.beta * seq_next[_home_successors(period)]
+                )
+            seq_next = seq
+            mgf.write_dense_sequence(period, x1[i, :], em_type, seq, st.x2_int)
 
         evt_next = evt_arr
         print(

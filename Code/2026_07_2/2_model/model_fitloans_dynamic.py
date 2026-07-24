@@ -252,6 +252,15 @@ def get_interp_dict_cached(force_rebuild=False):
 # ==============================================================================
 # Continuation / CCP path
 
+# "legacy" reads the per-state evt_ccp bundles written by
+# model_getccp_sequence (the historical pipeline, unchanged). "dense" reads
+# the one-matrix-per-period files written by model_getccp_sequence_fast and
+# the fused solver emission (byte-identical continuation values; gated by
+# test_ccp_sequence_fast_equivalence.py). Set by estimation_all_em via
+# USE_FAST_CCP_SEQUENCE; the default keeps the historical behavior.
+CCP_SEQUENCE_FORMAT = "legacy"
+
+
 def _ccp_bundle_path(period, x1i, em_type):
     return Path(OUT(
         "evt_ccp", str(period + 1),
@@ -303,6 +312,27 @@ def load_ccp_path(x1, state, choices, period, em_type):
 
     x1_integer = x1.astype(np.int64)
     unique_x1, group_index = np.unique(x1_integer, axis=0, return_inverse=True)
+
+    if CCP_SEQUENCE_FORMAT == "dense":
+        import model_getccp_sequence_fast as mgf
+        for group, x1i in enumerate(unique_x1):
+            rows = np.flatnonzero(group_index == group)
+            continuation_cache = {}
+            reader = mgf.DenseSequenceReader(period, x1i, em_type)
+            for row in rows:
+                x2i = state[row].astype(np.int64)
+                ji = choices[row]
+                request = (
+                    tuple(x2i.tolist()),
+                    tuple(np.asarray(ji).tolist()),
+                )
+                value = continuation_cache.get(request)
+                if value is None:
+                    value = reader.continuation(x2i, ji)
+                    continuation_cache[request] = value
+                sequence[row] = value
+        return sequence
+
     for group, x1i in enumerate(unique_x1):
         rows = np.flatnonzero(group_index == group)
         continuation_cache = {}

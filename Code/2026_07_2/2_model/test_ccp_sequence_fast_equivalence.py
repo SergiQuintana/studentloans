@@ -32,10 +32,17 @@ C. Storage round-trip on real artifacts (point 4). Real ccp / evt / vjt
    against every original key (bytes), written as a dense npz, re-read,
    and verified again. Read/write timings and file sizes are reported.
 
+D. Fused solver emission (--fused; server only, needs full solver inputs).
+   Runs the fast solver with EMIT_CCP_SEQUENCE on (all writes redirected
+   into the temp tree), then rebuilds the sequence from the CCP files that
+   same solve wrote — with the standalone fast builder AND the original
+   production builder — and requires all three to be byte-identical.
+   This is the gate for USE_FAST_CCP_SEQUENCE in estimation_all_em.py.
+
 Run locally (uses whichever em types exist under Model/Output/ccp):
     python test_ccp_sequence_fast_equivalence.py --tasks 2
-Full server sweep:
-    python test_ccp_sequence_fast_equivalence.py --tasks all --types all
+Full server gate for the fast CCP-sequence pipeline:
+    python test_ccp_sequence_fast_equivalence.py --tasks 20 --types all --fused
 """
 
 import argparse
@@ -227,41 +234,89 @@ def run_part_b(tasks, orig_root, fast_root, states_per_period, seed):
     rng = np.random.default_rng(seed)
     comparisons = 0
     grad_branch = 0
+    matrix_rows = 0
     dense_root = os.path.join(fast_root, "evt_ccp_dense")
 
-    for i, em in tasks:
-        inv = ms.invariant_states[i, :].astype(np.int64)
-        for period in range(1, T - 1):
-            sp = statics["states"][period]
-            n = sp.shape[0]
-            take = min(states_per_period, n)
-            rows = rng.choice(n, size=take, replace=False)
-            reader = mgf.DenseSequenceReader(period, inv, em, root=dense_root)
-            rel = (f"evt_ccp/{period + 1}/"
-                   f"evt_ccp_sequence_t{period + 1}_{inv}_em{em}.npz")
-            with np.load(os.path.join(orig_root, *rel.split("/"))) as bundle:
-                for k in rows:
-                    x2i = sp[k]
-                    for ji in ms.get_possible_choices(x2i):
-                        old = mfd._continuation_from_bundle(
-                            inv, x2i, ji, period, bundle
-                        )
-                        new = reader.continuation(x2i, ji)
-                        if not bitwise_equal(old, new):
-                            report_mismatch(
-                                f"consumer task(i={i},em={em}) p{period} "
-                                f"state{k} choice{np.asarray(ji).tolist()}",
-                                old, new,
+    # Redirect BOTH production paths at the temp trees for the duration:
+    # the legacy bundle path and the dense root.
+    bundle_path_before = mfd._ccp_bundle_path
+    dense_root_before = mgf.DENSE_ROOT
+    format_before = mfd.CCP_SEQUENCE_FORMAT
+
+    def temp_bundle_path(period, x1i, em_type):
+        return Path(os.path.join(
+            orig_root, "evt_ccp", str(period + 1),
+            f"evt_ccp_sequence_t{period + 1}_{x1i}_em{em_type}.npz",
+        ))
+
+    try:
+        mfd._ccp_bundle_path = temp_bundle_path
+        mgf.DENSE_ROOT = dense_root
+
+        for i, em in tasks:
+            inv = ms.invariant_states[i, :].astype(np.int64)
+            for period in range(1, T - 1):
+                sp = statics["states"][period]
+                n = sp.shape[0]
+                take = min(states_per_period, n)
+                rows = rng.choice(n, size=take, replace=False)
+                reader = mgf.DenseSequenceReader(
+                    period, inv, em, root=dense_root
+                )
+                sampled_states, sampled_choices = [], []
+                rel = (f"evt_ccp/{period + 1}/"
+                       f"evt_ccp_sequence_t{period + 1}_{inv}_em{em}.npz")
+                with np.load(os.path.join(orig_root, *rel.split("/"))) as bundle:
+                    for k in rows:
+                        x2i = sp[k]
+                        for ji in ms.get_possible_choices(x2i):
+                            old = mfd._continuation_from_bundle(
+                                inv, x2i, ji, period, bundle
                             )
-                        comparisons += 1
-                        if (
-                            ((x2i[1] >= 1) & (ji[1] == 1) & (x2i[4] == 0))
-                            | ((x2i[2] >= 3) & (ji[1] == 2) & (x2i[5] == 0))
-                            | (ji[1] == 3)
-                        ):
-                            grad_branch += 1
+                            new = reader.continuation(x2i, ji)
+                            if not bitwise_equal(old, new):
+                                report_mismatch(
+                                    f"consumer task(i={i},em={em}) p{period} "
+                                    f"state{k} choice{np.asarray(ji).tolist()}",
+                                    old, new,
+                                )
+                            comparisons += 1
+                            sampled_states.append(x2i)
+                            sampled_choices.append(np.asarray(ji))
+                            if (
+                                ((x2i[1] >= 1) & (ji[1] == 1) & (x2i[4] == 0))
+                                | ((x2i[2] >= 3) & (ji[1] == 2) & (x2i[5] == 0))
+                                | (ji[1] == 3)
+                            ):
+                                grad_branch += 1
+
+                # Same lookups through the PRODUCTION loader, both formats.
+                x1_mat = np.tile(inv, (len(sampled_states), 1))
+                state_mat = np.asarray(sampled_states)
+                choice_mat = np.asarray(sampled_choices)
+                mfd.CCP_SEQUENCE_FORMAT = "legacy"
+                legacy_path_matrix = mfd.load_ccp_path(
+                    x1_mat, state_mat, choice_mat, period, em
+                )
+                mfd.CCP_SEQUENCE_FORMAT = "dense"
+                dense_path_matrix = mfd.load_ccp_path(
+                    x1_mat, state_mat, choice_mat, period, em
+                )
+                if not bitwise_equal(legacy_path_matrix, dense_path_matrix):
+                    report_mismatch(
+                        f"load_ccp_path task(i={i},em={em}) p{period}",
+                        legacy_path_matrix, dense_path_matrix,
+                    )
+                matrix_rows += state_mat.shape[0]
+    finally:
+        mfd._ccp_bundle_path = bundle_path_before
+        mgf.DENSE_ROOT = dense_root_before
+        mfd.CCP_SEQUENCE_FORMAT = format_before
+
     print(f"PART B: {comparisons:,} continuation lookups compared "
-          f"({grad_branch:,} exercised the graduation-mixing branch)")
+          f"({grad_branch:,} exercised the graduation-mixing branch); "
+          f"production load_ccp_path legacy-vs-dense verified on "
+          f"{matrix_rows:,} rows")
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +434,118 @@ def run_part_c(tmp, families, n_files):
 
 
 # ---------------------------------------------------------------------------
+# Part D: fused solver emission (server job — needs full solver inputs)
+# ---------------------------------------------------------------------------
+
+def run_part_d(tasks, tmp):
+    """Fused-vs-standalone-vs-original sequence equivalence.
+
+    For each task: run the FAST SOLVER with EMIT_CCP_SEQUENCE on (ccp_real=1,
+    every write redirected into the temp tree), then rebuild the sequence
+    from the CCP files that very solve wrote — once with the standalone fast
+    builder and once with the ORIGINAL production builder — and require all
+    three sequence sets to be byte-identical. Requires param_g, budget
+    estimates, and the terminal cache, so this part runs on the server;
+    it is skipped with a message when those inputs are missing.
+    """
+    print("\n=== PART D: fused solver emission "
+          "(solver-emitted vs standalone vs original) ===")
+    import model_solution_fast as msf
+    import contextlib as _ctx
+
+    solver_out = os.path.join(tmp, "fused_solver_writes")
+    emitted_root = os.path.join(tmp, "fused_emitted")
+    statics = mgf.build_sequence_statics()
+
+    save_before = ms.save_npz_here
+    mgs_save_before = mgs.save_npz_here
+    mgs_path_before = mgs.path_out
+    dense_root_before = mgf.DENSE_ROOT
+    emit_before = msf.EMIT_CCP_SEQUENCE
+    arrays_compared = 0
+    try:
+        ms.reload_budgetshock_params()
+        x0 = np.load(f"{ms.path_estimates}/param_g.npy")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  SKIPPED: solver inputs unavailable here ({exc}).")
+        print("  Run this part on the server.")
+        return
+    try:
+        for i, em in tasks:
+            inv = ms.invariant_states[i, :]
+            utility_parameters = ms.build_param_g(em, x0)
+            args = (i, ms.invariant_states, ms.debt_range, ms.debt_range,
+                    1, utility_parameters, 0, 0, 0, em, True)
+
+            ms.save_npz_here = redirected_writer(solver_out)
+            mgf.DENSE_ROOT = emitted_root
+            msf.EMIT_CCP_SEQUENCE = True
+            started = time.perf_counter()
+            with _ctx.redirect_stdout(io.StringIO()):
+                msf.get_all_evt_fast(*args)
+            t_solve = time.perf_counter() - started
+            msf.EMIT_CCP_SEQUENCE = emit_before
+            ms.save_npz_here = save_before
+
+            # Standalone fast builder on the CCPs this solve just wrote.
+            with _ctx.redirect_stdout(io.StringIO()):
+                standalone = mgf.get_ccp_sequence_fast(
+                    i, ms.invariant_states, ms.debt_range, em,
+                    write_mode="none", ccp_root=solver_out,
+                    return_dense=True,
+                )
+
+            # Original production builder on the same CCPs.
+            mgs.save_npz_here = redirected_writer(
+                os.path.join(tmp, "fused_original")
+            )
+            mgs.path_out = solver_out
+            with _ctx.redirect_stdout(io.StringIO()):
+                mgs.get_ccp_sequence(
+                    i, ms.invariant_states, ms.debt_range, em
+                )
+            mgs.save_npz_here = mgs_save_before
+            mgs.path_out = mgs_path_before
+
+            for p in range(1, T):
+                with np.load(mgf.dense_sequence_path(
+                    p, inv, em, root=emitted_root
+                )) as bundle:
+                    emitted = bundle["evt"][:]
+                if not bitwise_equal(emitted, standalone[p]):
+                    report_mismatch(
+                        f"fused task(i={i},em={em}) p{p} "
+                        "(emitted vs standalone)",
+                        emitted, standalone[p],
+                    )
+                arrays_compared += 1
+                rel = (f"evt_ccp/{p}/"
+                       f"evt_ccp_sequence_t{p}_{inv}_em{em}.npz")
+                with np.load(os.path.join(
+                    tmp, "fused_original", *rel.split("/")
+                )) as fo:
+                    for k, s in enumerate(statics["x2_strings"][p]):
+                        key = f"evt_ccp_sequence_t{p}_{inv}_{s}"
+                        if not bitwise_equal(fo[key], emitted[k]):
+                            report_mismatch(
+                                f"fused task(i={i},em={em}) p{p} row {k} "
+                                "(emitted vs original)",
+                                fo[key], emitted[k],
+                            )
+                        arrays_compared += 1
+            print(f"  task(i={i}, em={em}): fused solve {t_solve:6.1f} s; "
+                  "emitted == standalone == original checked")
+    finally:
+        ms.save_npz_here = save_before
+        mgs.save_npz_here = mgs_save_before
+        mgs.path_out = mgs_path_before
+        mgf.DENSE_ROOT = dense_root_before
+        msf.EMIT_CCP_SEQUENCE = emit_before
+    print(f"PART D: {arrays_compared:,} sequence arrays compared "
+          f"({len(tasks)} fused solver tasks)")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -395,6 +562,10 @@ def main():
     parser.add_argument("--seed", type=int, default=20260724)
     parser.add_argument("--skip-consumer", action="store_true")
     parser.add_argument("--skip-storage", action="store_true")
+    parser.add_argument("--fused", action="store_true",
+                        help="run part D: fused solver emission (server; "
+                             "runs full solver tasks, ~1 min each)")
+    parser.add_argument("--fused-tasks", type=int, default=2)
     parser.add_argument("--keep-temp", action="store_true")
     args = parser.parse_args()
 
@@ -425,6 +596,8 @@ def main():
                        args.consumer_states, args.seed)
         if not args.skip_storage:
             run_part_c(tmp, args.families.split(","), args.storage_files)
+        if args.fused:
+            run_part_d(tasks[: args.fused_tasks], tmp)
     finally:
         if args.keep_temp:
             print(f"temp kept at {tmp}")

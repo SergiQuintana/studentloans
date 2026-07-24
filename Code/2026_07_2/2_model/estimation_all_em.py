@@ -65,6 +65,7 @@ import model_em_algorithm as me
 import solve_many_continuations as mcf
 import model_predict_ccps as mccp
 import model_getccp_sequence as mgs
+import model_getccp_sequence_fast as mgsf
 from model_interpolate_terminal import build_interp_cache 
 import model_fitloans_dynamic as mfd
 from model_fitloans_dynamic import estimate_budget_shock_all_education
@@ -119,6 +120,24 @@ get_budget = True
 # and 1) bitwise-identical, ~2.1x faster. Set False to fall back to the
 # original solver.
 USE_FAST_SOLVER = True
+
+# Fast CCP-sequence pipeline (2026-07-24, researcher-approved, flag-off;
+# see Agents_Readme/Tasks/ESTIMATION_SPEED_ANALYSIS_2026_07_24.md and the
+# EMIT_CCP_SEQUENCE note in model_solution_fast.py). When True:
+#   * iteration 0 builds the terminal-free sequence with the vectorized
+#     builder (model_getccp_sequence_fast), one dense matrix per period;
+#   * every Bellman solve with updated CCPs (iterations >= 1) emits the
+#     next iteration's sequence during its own backward pass, so the
+#     standalone sequence stage is skipped from iteration 1 onward
+#     (iteration 1 correctly reuses iteration 0's files: iteration 0's
+#     solve does not update CCPs, so the legacy pipeline would rebuild
+#     byte-identical sequences from the unchanged initial CCPs);
+#   * the budget SMM reads the dense files.
+# Continuation values are byte-identical to the legacy pipeline; gate
+# before flipping: test_ccp_sequence_fast_equivalence.py (incl. --fused)
+# must PASS on the server. Requires USE_FAST_SOLVER. Default False =
+# exactly the previous pipeline.
+USE_FAST_CCP_SEQUENCE = False
 
 # Production loan-SMM controls. The auxiliary EM results are loaded above and
 # remain fixed. A deliberately small annealing budget keeps each NPL iteration
@@ -184,6 +203,18 @@ if __name__ == '__main__':
         bellman_solver = msf.get_all_evt_fast
     else:
         bellman_solver = ms.get_all_evt
+
+    if USE_FAST_CCP_SEQUENCE:
+        if not USE_FAST_SOLVER:
+            raise RuntimeError(
+                "USE_FAST_CCP_SEQUENCE requires USE_FAST_SOLVER: only the "
+                "fast solver emits the fused CCP sequence."
+            )
+        print("Using FAST CCP-sequence pipeline (dense format, fused solve)")
+        # Module flags are set in the parent BEFORE any pool is created, so
+        # forked workers (Linux, the production platform) inherit them.
+        msf.EMIT_CCP_SEQUENCE = True
+        mfd.CCP_SEQUENCE_FORMAT = "dense"
 
 
     # First check if continuation value should be estimated
@@ -334,15 +365,23 @@ if __name__ == '__main__':
             print("Building Sequence to Estimate Budget Shock")
 
             _stage_started = time.perf_counter()
-            pool_obj = multiprocessing.Pool(processes=60)
-            args = [
-                (i, ms.invariant_states, ms.debt_range, em_type)
-                for em_type in TYPE_IDS
-                for i in range(np.shape(ms.invariant_states)[0])
-            ]
+            if (not USE_FAST_CCP_SEQUENCE) or it == 0:
+                sequence_task = (
+                    mgsf.get_ccp_sequence_task if USE_FAST_CCP_SEQUENCE
+                    else mgs.get_ccp_sequence
+                )
+                pool_obj = multiprocessing.Pool(processes=60)
+                args = [
+                    (i, ms.invariant_states, ms.debt_range, em_type)
+                    for em_type in TYPE_IDS
+                    for i in range(np.shape(ms.invariant_states)[0])
+                ]
 
-            results = pool_obj.starmap(mgs.get_ccp_sequence, args, chunksize=1)
-            pool_obj.close()
+                results = pool_obj.starmap(sequence_task, args, chunksize=1)
+                pool_obj.close()
+            else:
+                print("Reusing dense CCP sequences emitted by the previous "
+                      "Bellman solve")
             _timing("ccp-sequence build", _stage_started, it)
 
             #---------------------------------------#

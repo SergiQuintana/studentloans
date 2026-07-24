@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
 """Fast CCP-sequence builder (dense-matrix rewrite of model_getccp_sequence).
 
-STATUS 2026-07-24: PROTOTYPE, NOT WIRED INTO PRODUCTION. The production
-driver still calls model_getccp_sequence.get_ccp_sequence. This module is
-exercised by test_ccp_sequence_fast_equivalence.py; promotion into
-estimation_all_em.py happens only after that test passes on the server
-(solver-change protocol; see Agents_Readme/Tasks/
-ESTIMATION_SPEED_ANALYSIS_2026_07_24.md, points 3-4).
+STATUS 2026-07-24: wired into production BEHIND FLAGS, all defaulting to
+the legacy pipeline (researcher-approved same day):
+
+  * estimation_all_em.py: ``USE_FAST_CCP_SEQUENCE`` selects
+    ``get_ccp_sequence_task`` (iteration 0) + the fused solver emission
+    (``model_solution_fast.EMIT_CCP_SEQUENCE``) + the dense SMM reader
+    (``model_fitloans_dynamic.CCP_SEQUENCE_FORMAT = "dense"``).
+  * Gate before flipping any flag: test_ccp_sequence_fast_equivalence.py
+    must PASS on the server (solver-change protocol; background in
+    Agents_Readme/Tasks/ESTIMATION_SPEED_ANALYSIS_2026_07_24.md).
+
+The sequence is TERMINAL-FREE by construction (zero continuation at
+period 9, never the terminal value): the budget SMM adds the
+sigma-dependent terminal itself for every candidate risk aversion.
 
 What it computes — the identical recursion as the original:
 
@@ -56,6 +64,43 @@ path_out = DIR["MODEL_OUTPUT"]
 T = 10
 beta = 0.98
 _HOME = np.array([0, 0, 0])
+
+# Root of the dense sequence tree. None -> Model/Output/evt_ccp_dense.
+# The equivalence test overrides this to keep every write inside a
+# temporary directory.
+DENSE_ROOT = None
+
+
+def _dense_root(root=None):
+    if root is not None:
+        return root
+    if DENSE_ROOT is not None:
+        return DENSE_ROOT
+    return os.path.join(path_out, "evt_ccp_dense")
+
+
+def dense_sequence_path(period, inv_row, em_type, root=None):
+    """Canonical dense-file location for one (period, invariant state, type).
+
+    ``inv_row`` may arrive as any 1-D or 2-D integer-valued row (the solver
+    carries the invariant state as a (1, 4) array, the builder as a flat
+    row); normalizing here guarantees every producer and consumer builds
+    the same file name.
+    """
+    inv_txt = str(np.asarray(inv_row, dtype=np.int64).reshape(-1))
+    return os.path.join(
+        _dense_root(root), str(period),
+        f"evt_ccp_dense_t{period}_{inv_txt}_em{em_type}.npz",
+    )
+
+
+def write_dense_sequence(period, inv_row, em_type, evt, states, root=None):
+    """One dense matrix per period: row k of ``evt`` is state k in the row
+    order of ``states_t{period}.npy``; ``states`` is stored alongside for
+    self-description."""
+    full = dense_sequence_path(period, inv_row, em_type, root)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    np.savez_compressed(full, evt=evt, states=states)
 
 # ---------------------------------------------------------------------------
 # One-time per-process statics (shared across all tasks and types)
@@ -162,11 +207,9 @@ def get_ccp_sequence_fast(
         legacy_writer = _default_legacy_writer
     else:
         legacy_writer = _write_to_root(out_root) if out_root else None
-    dense_root = (
-        os.path.join(out_root, "evt_ccp_dense")
-        if out_root
-        else os.path.join(path_out, "evt_ccp_dense")
-    )
+    # None lets write_dense_sequence resolve the production root (or the
+    # module-level DENSE_ROOT override used by the equivalence test).
+    dense_root = os.path.join(out_root, "evt_ccp_dense") if out_root else None
 
     dense_by_period = {}
     evt_next = None
@@ -204,16 +247,21 @@ def get_ccp_sequence_fast(
                 [evt[k] for k in range(n)],
             )
         if write_mode in ("dense", "both"):
-            full = os.path.join(
-                dense_root, str(period),
-                f"evt_ccp_dense_t{period}_{inv}_em{em_type}.npz",
+            write_dense_sequence(
+                period, inv, em_type, evt, states[period], root=dense_root
             )
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-            np.savez_compressed(full, evt=evt, states=states[period])
 
     if return_dense:
         return dense_by_period
     return None
+
+
+def get_ccp_sequence_task(i, x1, b, em_type):
+    """Production pool entry (starmap-compatible with the legacy builder's
+    ``(i, x1, b, em_type)`` argument tuple): dense output only."""
+    return get_ccp_sequence_fast(
+        i, x1, b, em_type, write_mode="dense", verbose=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +281,8 @@ class DenseSequenceReader:
 
     def __init__(self, period, x1i, em_type, root=None):
         self.period = int(period)
-        self.x1i = np.asarray(x1i, dtype=np.int64)
-        base = root if root is not None else os.path.join(path_out, "evt_ccp_dense")
-        path = os.path.join(
-            base, str(self.period + 1),
-            f"evt_ccp_dense_t{self.period + 1}_{self.x1i}_em{em_type}.npz",
-        )
+        self.x1i = np.asarray(x1i, dtype=np.int64).reshape(-1)
+        path = dense_sequence_path(self.period + 1, self.x1i, em_type, root)
         with np.load(path) as bundle:
             self.evt = bundle["evt"]
         statics = build_sequence_statics()
