@@ -7,7 +7,6 @@ matplotlib
 seaborn
 statsmodels
 Jinja2
-dfols
 
 # used in some scripts (e.g., logistic regression)
 scikit-learn
@@ -15,3 +14,8 @@ joblib
 
 # optional: control thread pools programmatically
 threadpoolctl
+
+# opt-in least-squares SMM optimizer for the budget-shock estimation.
+# PyPI package name is DFO-LS; the Python import name is dfols
+# ("pip install DFO-LS" -> "import dfols").
+DFO-LS
