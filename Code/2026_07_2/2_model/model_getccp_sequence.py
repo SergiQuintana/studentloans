@@ -113,26 +113,34 @@ def loop_over_x2(x1,b,period,ccps,evt):
         
     return results_ccp, names_ccp
  
-def get_ccp_sequence(i,x1,b,em_type):
+def get_ccp_sequence(i,x1,b,em_type,ccp_root=None):
     """This function computes CCP for choosing home production for every period and
-    state using the auxiliary model."""
+    state using the auxiliary model.
+
+    ccp_root selects the folder holding the per-period CCP subfolders
+    (default: Model/Output/ccp, the structural CCPs of the current run).
+    Iterations that must use the auxiliary-model predictions pass the
+    permanent ccp_initial folder instead (2026-07-24)."""
     type_index(em_type)
-    
+
     print(f"Individual {x1[i].astype('int')}")
-    
-    evtnext = 0 
-    
+
+    evtnext = 0
+
     # Generate x1
     inv = x1[i,:]
-    
+
+    if ccp_root is None:
+        ccp_root = f"{path_out}/ccp"
+
     results_ccp = []
     names_ccp = []
-    
+
     for period in range(T-1,0,-1):
-        
+
         # Load CCPs
-        
-        ccps = np.load(f"{path_out}/ccp/{period}/ccp_t{period}_[{inv}]_em{em_type}.npz")
+
+        ccps = np.load(f"{ccp_root}/{period}/ccp_t{period}_[{inv}]_em{em_type}.npz")
         
         print(period)
         

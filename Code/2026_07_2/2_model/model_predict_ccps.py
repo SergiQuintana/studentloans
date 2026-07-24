@@ -185,7 +185,7 @@ def get_all_ccps(i, x1, b, model_parameters, type_id):
         # save_npz_here already anchors relative paths below Model/Output.
         # Passing path_out here would duplicate the absolute root on Linux.
         save_npz_here(
-            f"ccp/{period}/ccp_t{period}_{inv}_em{type_id}.npz",
+            f"{INITIAL_CCP_DIRNAME}/{period}/ccp_t{period}_{inv}_em{type_id}.npz",
             names_ccp,
             results_ccp,
             compressed=True,
@@ -318,7 +318,9 @@ def get_all_ccps_debug(i, x1, b, model_parameters, type_id, debug_config):
             results_ccp.append(all_ccps)
             names_ccp.append(f"ccp_t{period}_{inv}_{x2}")
 
-        relative_path = f"ccp/{period}/ccp_t{period}_{inv}_em{type_id}.npz"
+        relative_path = (
+            f"{INITIAL_CCP_DIRNAME}/{period}/ccp_t{period}_{inv}_em{type_id}.npz"
+        )
         save_npz_here(relative_path, names_ccp, results_ccp, compressed=True)
         if debug_config.verify_saved:
             saved_path = Path(path_out) / relative_path
@@ -346,12 +348,22 @@ def get_all_ccps_debug(i, x1, b, model_parameters, type_id, debug_config):
     return recorder.finalize()
 
 
+# The auxiliary-model predictions live in their OWN folder (2026-07-24,
+# researcher decision): the Bellman solver's structural CCPs (ccp_real == 1)
+# are written under ccp/ with the SAME filenames, and before this change
+# they silently overwrote the predictions, so iteration 0 of a rerun used
+# the previous run's structural CCPs instead of the auxiliary model. The
+# separate folder makes the predictions permanent: they are generated once
+# and every later run reuses them.
+INITIAL_CCP_DIRNAME = "ccp_initial"
+
+
 def initial_ccp_bundle_path(period, invariant_state, type_id, output_root=None):
     """Return the exact initial-CCP filename consumed by the Bellman solver."""
     if output_root is None:
         output_root = DIR["MODEL_OUTPUT"]
     invariant_state = np.asarray(invariant_state)
-    return Path(output_root) / "ccp" / str(period) / (
+    return Path(output_root) / INITIAL_CCP_DIRNAME / str(period) / (
         f"ccp_t{period}_[{invariant_state}]_em{type_id}.npz"
     )
 

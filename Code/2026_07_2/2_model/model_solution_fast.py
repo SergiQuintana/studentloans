@@ -967,9 +967,14 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
 
         if period < T:
             # Same load (and failure mode) as the original solver; consumed
-            # only when ccp_real == 0.
+            # only when ccp_real == 0. The auxiliary-model predictions live
+            # in their own permanent folder (2026-07-24, see
+            # model_predict_ccps.INITIAL_CCP_DIRNAME); structural CCPs from
+            # earlier NPL iterations stay under ccp/.
+            ccp_dirname = "ccp_initial" if ccp_real == 0 else "ccp"
             models_npz = np.load(
-                f"{ms.pathout}/ccp/{period}/ccp_t{period}_[{x1[i, :]}]_em{em_type}.npz"
+                f"{ms.pathout}/{ccp_dirname}/{period}/"
+                f"ccp_t{period}_[{x1[i, :]}]_em{em_type}.npz"
             )
         else:
             models_npz = None
@@ -1044,7 +1049,12 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
                     + mgf.beta * seq_next[_home_successors(period)]
                 )
             seq_next = seq
-            mgf.write_dense_sequence(period, x1[i, :], em_type, seq, st.x2_int)
+            # Explicit structural tree: the initial (auxiliary-model) tree
+            # is permanent and must never be touched by the solver.
+            mgf.write_dense_sequence(
+                period, x1[i, :], em_type, seq, st.x2_int,
+                root=mgf.structural_dense_root(),
+            )
 
         evt_next = evt_arr
         print(

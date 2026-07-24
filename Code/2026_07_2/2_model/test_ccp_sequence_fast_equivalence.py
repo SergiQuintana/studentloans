@@ -460,7 +460,7 @@ def run_part_d(tasks, tmp):
     save_before = ms.save_npz_here
     mgs_save_before = mgs.save_npz_here
     mgs_path_before = mgs.path_out
-    dense_root_before = mgf.DENSE_ROOT
+    structural_root_before = mgf.structural_dense_root
     emit_before = msf.EMIT_CCP_SEQUENCE
     arrays_compared = 0
     try:
@@ -478,20 +478,24 @@ def run_part_d(tasks, tmp):
                     1, utility_parameters, 0, 0, 0, em, True)
 
             ms.save_npz_here = redirected_writer(solver_out)
-            mgf.DENSE_ROOT = emitted_root
+            # The fused emission writes via mgf.structural_dense_root();
+            # point it at the temp tree for the duration of the solve.
+            mgf.structural_dense_root = lambda: emitted_root
             msf.EMIT_CCP_SEQUENCE = True
             started = time.perf_counter()
             with _ctx.redirect_stdout(io.StringIO()):
                 msf.get_all_evt_fast(*args)
             t_solve = time.perf_counter() - started
             msf.EMIT_CCP_SEQUENCE = emit_before
+            mgf.structural_dense_root = structural_root_before
             ms.save_npz_here = save_before
 
             # Standalone fast builder on the CCPs this solve just wrote.
             with _ctx.redirect_stdout(io.StringIO()):
                 standalone = mgf.get_ccp_sequence_fast(
                     i, ms.invariant_states, ms.debt_range, em,
-                    write_mode="none", ccp_root=solver_out,
+                    write_mode="none",
+                    ccp_root=os.path.join(solver_out, "ccp"),
                     return_dense=True,
                 )
 
@@ -539,7 +543,7 @@ def run_part_d(tasks, tmp):
         ms.save_npz_here = save_before
         mgs.save_npz_here = mgs_save_before
         mgs.path_out = mgs_path_before
-        mgf.DENSE_ROOT = dense_root_before
+        mgf.structural_dense_root = structural_root_before
         msf.EMIT_CCP_SEQUENCE = emit_before
     print(f"PART D: {arrays_compared:,} sequence arrays compared "
           f"({len(tasks)} fused solver tasks)")

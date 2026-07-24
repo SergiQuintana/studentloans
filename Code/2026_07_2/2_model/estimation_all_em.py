@@ -436,23 +436,58 @@ if __name__ == '__main__':
             print("Building Sequence to Estimate Budget Shock")
 
             _stage_started = time.perf_counter()
-            if (not USE_FAST_CCP_SEQUENCE) or it == 0:
-                sequence_task = (
-                    mgsf.get_ccp_sequence_task if USE_FAST_CCP_SEQUENCE
-                    else mgs.get_ccp_sequence
+            # Iterations 0 and 1 use the AUXILIARY-MODEL sequences (iteration
+            # 0's solve does not update CCPs, so iteration 1's sequences are
+            # the same object); iterations >= 2 use the structural sequences
+            # of the previous iteration's solve. The auxiliary sequences
+            # depend only on the auxiliary EM, so they are built once,
+            # stored in their own tree, and reused by every later run
+            # (2026-07-24, researcher decision).
+            if USE_FAST_CCP_SEQUENCE:
+                if it == 0:
+                    if solve_initial_ccps or not mgsf.initial_sequences_complete(
+                        ms.invariant_states, TYPE_IDS
+                    ):
+                        print("Building auxiliary-model CCP sequences "
+                              "(stored for reuse by later runs)")
+                        pool_obj = multiprocessing.Pool(processes=60)
+                        args = [
+                            (i, ms.invariant_states, ms.debt_range, em_type)
+                            for em_type in TYPE_IDS
+                            for i in range(np.shape(ms.invariant_states)[0])
+                        ]
+                        results = pool_obj.starmap(
+                            mgsf.get_ccp_sequence_task, args, chunksize=1
+                        )
+                        pool_obj.close()
+                    else:
+                        print("Reusing stored auxiliary-model CCP sequences")
+                else:
+                    print("Using CCP sequences emitted by the previous "
+                          "Bellman solve" if it >= 2 else
+                          "Reusing auxiliary-model CCP sequences "
+                          "(iteration 0's solve does not update CCPs)")
+                # Select the tree the budget SMM reads this iteration; set
+                # before the SMM creates its worker pool so forked workers
+                # inherit it.
+                mgsf.DENSE_ROOT = (
+                    mgsf.initial_dense_root() if it <= 1
+                    else mgsf.structural_dense_root()
+                )
+            else:
+                ccp_root = (
+                    mgsf.initial_ccp_root() if it <= 1 else None
                 )
                 pool_obj = multiprocessing.Pool(processes=60)
                 args = [
-                    (i, ms.invariant_states, ms.debt_range, em_type)
+                    (i, ms.invariant_states, ms.debt_range, em_type, ccp_root)
                     for em_type in TYPE_IDS
                     for i in range(np.shape(ms.invariant_states)[0])
                 ]
-
-                results = pool_obj.starmap(sequence_task, args, chunksize=1)
+                results = pool_obj.starmap(
+                    mgs.get_ccp_sequence, args, chunksize=1
+                )
                 pool_obj.close()
-            else:
-                print("Reusing dense CCP sequences emitted by the previous "
-                      "Bellman solve")
             _timing("ccp-sequence build", _stage_started, it)
 
             #---------------------------------------#

@@ -67,8 +67,44 @@ _HOME = np.array([0, 0, 0])
 
 # Root of the dense sequence tree. None -> Model/Output/evt_ccp_dense.
 # The equivalence test overrides this to keep every write inside a
-# temporary directory.
+# temporary directory; estimation_all_em points it at the INITIAL tree
+# for the iterations whose SMM must read the auxiliary-model sequences.
 DENSE_ROOT = None
+
+# Separation of provenance (2026-07-24, researcher decision): sequences
+# built from the AUXILIARY-MODEL predictions depend only on the auxiliary
+# EM, so they are computed once, stored in their own tree, and reused by
+# every later run (iterations 0 and 1 of each run read them). Sequences
+# emitted by the Bellman solve (structural CCPs, iterations >= 1) live in
+# the standard tree and are rewritten every run.
+
+
+def initial_ccp_root():
+    """Folder of the auxiliary-model CCP predictions (never overwritten)."""
+    return os.path.join(path_out, "ccp_initial")
+
+
+def initial_dense_root():
+    """Dense sequences built from the auxiliary-model predictions."""
+    return os.path.join(path_out, "evt_ccp_dense_initial")
+
+
+def structural_dense_root():
+    """Dense sequences emitted by the Bellman solve during a run."""
+    return os.path.join(path_out, "evt_ccp_dense")
+
+
+def initial_sequences_complete(x1, em_types):
+    """True when the stored auxiliary-model sequences cover every task."""
+    root = initial_dense_root()
+    for em in em_types:
+        for i in range(x1.shape[0]):
+            for p in range(1, T):
+                if not os.path.exists(
+                    dense_sequence_path(p, x1[i, :], em, root=root)
+                ):
+                    return False
+    return True
 
 
 def _dense_root(root=None):
@@ -174,6 +210,7 @@ def get_ccp_sequence_fast(
     write_mode="legacy",
     out_root=None,
     ccp_root=None,
+    dense_root=None,
     return_dense=False,
     verbose=True,
 ):
@@ -188,8 +225,12 @@ def get_ccp_sequence_fast(
     out_root : optional directory root that replaces Model/Output as the
         output anchor (used by the equivalence test so Model/ is never
         touched). None -> production locations.
-    ccp_root : optional directory root for READING the input CCP bundles
-        (default: production Model/Output/ccp).
+    ccp_root : folder holding the per-period CCP subfolders to READ
+        (default: production Model/Output/ccp; iteration 0 passes the
+        permanent ccp_initial folder via get_ccp_sequence_task).
+    dense_root : explicit destination tree for the dense files (default:
+        resolved by write_dense_sequence — production tree or the
+        module-level DENSE_ROOT override used by the equivalence test).
     return_dense : also return {period: dense evt matrix}.
     """
     type_index(em_type)
@@ -202,14 +243,17 @@ def get_ccp_sequence_fast(
     if verbose:
         print(f"Individual {inv.astype('int')} (fast)")
 
-    read_root = ccp_root if ccp_root is not None else path_out
+    read_root = (
+        ccp_root if ccp_root is not None else os.path.join(path_out, "ccp")
+    )
     if write_mode in ("legacy", "both") and out_root is None:
         legacy_writer = _default_legacy_writer
     else:
         legacy_writer = _write_to_root(out_root) if out_root else None
-    # None lets write_dense_sequence resolve the production root (or the
-    # module-level DENSE_ROOT override used by the equivalence test).
-    dense_root = os.path.join(out_root, "evt_ccp_dense") if out_root else None
+    if dense_root is None:
+        dense_root = (
+            os.path.join(out_root, "evt_ccp_dense") if out_root else None
+        )
 
     dense_by_period = {}
     evt_next = None
@@ -218,7 +262,7 @@ def get_ccp_sequence_fast(
         keys = x2_strings[period]
 
         with np.load(
-            f"{read_root}/ccp/{period}/ccp_t{period}_[{inv}]_em{em_type}.npz"
+            f"{read_root}/{period}/ccp_t{period}_[{inv}]_em{em_type}.npz"
         ) as bundle:
             first = bundle[f"ccp_t{period}_[{inv}]_{keys[0]}"]
             ccp = np.empty((n,) + np.shape(first), dtype=np.float64)
@@ -258,9 +302,16 @@ def get_ccp_sequence_fast(
 
 def get_ccp_sequence_task(i, x1, b, em_type):
     """Production pool entry (starmap-compatible with the legacy builder's
-    ``(i, x1, b, em_type)`` argument tuple): dense output only."""
+    ``(i, x1, b, em_type)`` argument tuple).
+
+    Builds the AUXILIARY-MODEL sequence: reads the predictions from
+    ``ccp_initial/`` and stores the dense result in the permanent
+    ``evt_ccp_dense_initial/`` tree, so later runs skip this step
+    entirely (see initial_sequences_complete)."""
     return get_ccp_sequence_fast(
-        i, x1, b, em_type, write_mode="dense", verbose=True
+        i, x1, b, em_type, write_mode="dense",
+        ccp_root=initial_ccp_root(), dense_root=initial_dense_root(),
+        verbose=True,
     )
 
 

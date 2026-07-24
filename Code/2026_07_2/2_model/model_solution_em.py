@@ -2553,7 +2553,10 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
     for period in range(T,0,-1):
         period_started = time.perf_counter()
         if period < T:
-            models = np.load(f"{pathout}/ccp/{period}/ccp_t{period}_[{x1[i,:]}]_em{em_type}.npz")
+            # Auxiliary-model predictions live in ccp_initial/ (2026-07-24,
+            # see model_predict_ccps); consumed only when ccp_real == 0.
+            ccp_dirname = "ccp_initial" if ccp_real == 0 else "ccp"
+            models = np.load(f"{pathout}/{ccp_dirname}/{period}/ccp_t{period}_[{x1[i,:]}]_em{em_type}.npz")
         
         # Get set of states
         
@@ -3019,7 +3022,8 @@ def get_all_evt_debug(
         period_started = time.perf_counter()
         archive = None
         if period < T:
-            archive_path = f"{pathout}/ccp/{period}/ccp_t{period}_[{x1[i,:]}]_em{em_type}.npz"
+            ccp_dirname = "ccp_initial" if ccp_real == 0 else "ccp"
+            archive_path = f"{pathout}/{ccp_dirname}/{period}/ccp_t{period}_[{x1[i,:]}]_em{em_type}.npz"
             try:
                 archive = np.load(archive_path, allow_pickle=False)
                 models_period = archive
