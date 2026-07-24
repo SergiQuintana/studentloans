@@ -330,6 +330,16 @@ def run_part_c(tmp, families, n_files):
                 if not bitwise_equal(a, sl):
                     report_mismatch(f"{label} key {keys[k]} (pack)", a, sl)
 
+            # Time re-writing the SAME data in the current per-state format
+            # (to the temp folder), so old-write vs dense-write is measured
+            # on this machine rather than assumed.
+            legacy_path = os.path.join(tmp, f"legacy_{family}_{src.stem}.npz")
+            started = time.perf_counter()
+            np.savez_compressed(
+                legacy_path, **{k: a for k, a in zip(keys, arrays)}
+            )
+            t_write_old = time.perf_counter() - started
+
             dense_path = os.path.join(tmp, f"dense_{family}_{src.stem}.npz")
             payload = {"data": dense, "keys": np.array(keys)}
             if rows is not None:
@@ -361,7 +371,8 @@ def run_part_c(tmp, families, n_files):
             print(
                 f"  {label}: {len(keys):,} keys | read old "
                 f"{t_read_old * 1000:7.0f} ms -> dense {t_read_new * 1000:6.0f} ms "
-                f"| dense write {t_write * 1000:6.0f} ms | size "
+                f"| write old {t_write_old * 1000:6.0f} ms -> dense "
+                f"{t_write * 1000:6.0f} ms | size "
                 f"{src.stat().st_size / 1e6:6.1f} MB -> "
                 f"{os.path.getsize(dense_path) / 1e6:6.1f} MB"
             )
