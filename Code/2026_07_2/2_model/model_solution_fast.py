@@ -159,7 +159,8 @@ def snap_debt_indices(debt_grid, values):
 @njit
 def _grouped_education_search(sigma_u, next_debt_grid, resources,
                               continuations, lo_idx, hi_idx, cap_start,
-                              payoffs):
+                              payoffs, debt_grid=None, kappa0=0.0,
+                              kappa1=0.0):
     """Multi-field twin of ``get_maximum_loop_modified_resources_maxdebt``.
 
     ``continuations`` is (n_fields, n_debt); ``payoffs`` (n_fields, n_rows) is
@@ -171,6 +172,15 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
     follows the original kernel's control flow branch for branch, so the
     selected debt choices and payoffs are bitwise identical to running the
     single-field kernel once per field.
+
+    ``debt_grid`` (current-debt grid) with ``kappa0``/``kappa1`` adds the
+    one-shot new-borrowing event cost with exactly the fused kernel's
+    conventions: entry cost when ``debt_grid[it] == 0``, continuation cost
+    otherwise; a candidate ``k`` is charged iff ``k > lo_idx[it]`` (the
+    snapped-up rollover candidate is never charged); every adjustment is
+    guarded by ``kappa_row != 0.0`` so the default zero-kappa path performs
+    the same floating-point operations as before. The cost is added to the
+    per-field ``value`` only, never to the shared ``u_val`` cache.
     """
     nf = continuations.shape[0]
     ncont = continuations.shape[1]
@@ -191,6 +201,16 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                 u_ok[k] = False
             row_feasible = -1  # shared lazily across fields (same bounds)
 
+            # One-shot event cost for this current-debt row (entry at zero
+            # current debt, continuation otherwise).
+            if debt_grid is None:
+                kappa_row = 0.0
+            elif debt_grid[it] == 0.0:
+                kappa_row = kappa0
+            else:
+                kappa_row = kappa1
+
+            # (lo_idx == hi_idx in the cap region: pure rollover, no kappa.)
             if it >= cap_start:
                 idx_use = lo_idx[it]
                 if not u_ok[idx_use]:
@@ -223,9 +243,10 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                                 sigma_u, resource + next_debt_grid[idx_use]
                             )
                             u_ok[idx_use] = True
-                        payoffs[f, row_idx] = (
-                            u_val[idx_use] + continuations[f, idx_use]
-                        )
+                        value = u_val[idx_use] + continuations[f, idx_use]
+                        if kappa_row != 0.0 and idx_use > lo:
+                            value += kappa_row
+                        payoffs[f, row_idx] = value
                         amax[f] = idx_use
                         continue
 
@@ -239,6 +260,8 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                     best_value = (
                         u_val[firstbound] + continuations[f, firstbound]
                     )
+                    if kappa_row != 0.0 and firstbound > lo:
+                        best_value += kappa_row
                     for candidate in range(firstbound + 1, hi + 1):
                         if not u_ok[candidate]:
                             u_val[candidate] = _flow_utility(
@@ -246,6 +269,8 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                             )
                             u_ok[candidate] = True
                         value = u_val[candidate] + continuations[f, candidate]
+                        if kappa_row != 0.0 and candidate > lo:
+                            value += kappa_row
                         if value > best_value:
                             best_value = value
                             best_index = candidate
@@ -279,9 +304,10 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                                 sigma_u, resource + next_debt_grid[idx_use]
                             )
                             u_ok[idx_use] = True
-                        payoffs[f, row_idx] = (
-                            u_val[idx_use] + continuations[f, idx_use]
-                        )
+                        value = u_val[idx_use] + continuations[f, idx_use]
+                        if kappa_row != 0.0 and idx_use > lo:
+                            value += kappa_row
+                        payoffs[f, row_idx] = value
                         amax[f] = idx_use
                         continue
 
@@ -290,6 +316,10 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                     bound_left = max(bound_left, it)
                     bound_right = hi + 1
 
+                # Left edge of the candidate set actually evaluated; used
+                # below to detect a window that excluded the uncharged
+                # rollover candidate.
+                final_left = bound_left
                 best_index = bound_left
                 if not u_ok[bound_left]:
                     u_val[bound_left] = _flow_utility(
@@ -297,6 +327,8 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                     )
                     u_ok[bound_left] = True
                 best_value = u_val[bound_left] + continuations[f, bound_left]
+                if kappa_row != 0.0 and bound_left > lo:
+                    best_value += kappa_row
                 for candidate in range(bound_left + 1, bound_right):
                     if not u_ok[candidate]:
                         u_val[candidate] = _flow_utility(
@@ -304,6 +336,8 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                         )
                         u_ok[candidate] = True
                     value = u_val[candidate] + continuations[f, candidate]
+                    if kappa_row != 0.0 and candidate > lo:
+                        value += kappa_row
                     if value > best_value:
                         best_value = value
                         best_index = candidate
@@ -330,9 +364,12 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                                     resource + next_debt_grid[idx_use],
                                 )
                                 u_ok[idx_use] = True
-                            payoffs[f, row_idx] = (
+                            value = (
                                 u_val[idx_use] + continuations[f, idx_use]
                             )
+                            if kappa_row != 0.0 and idx_use > lo:
+                                value += kappa_row
+                            payoffs[f, row_idx] = value
                             amax[f] = idx_use
                             continue
 
@@ -340,6 +377,7 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                         firstbound = max(firstbound, lo)
                         firstbound = max(firstbound, it)
 
+                        final_left = firstbound
                         best_index = firstbound
                         if not u_ok[firstbound]:
                             u_val[firstbound] = _flow_utility(
@@ -349,6 +387,8 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                         best_value = (
                             u_val[firstbound] + continuations[f, firstbound]
                         )
+                        if kappa_row != 0.0 and firstbound > lo:
+                            best_value += kappa_row
                         for candidate in range(firstbound + 1, hi + 1):
                             if not u_ok[candidate]:
                                 u_val[candidate] = _flow_utility(
@@ -359,10 +399,29 @@ def _grouped_education_search(sigma_u, next_debt_grid, resources,
                             value = (
                                 u_val[candidate] + continuations[f, candidate]
                             )
+                            if kappa_row != 0.0 and candidate > lo:
+                                value += kappa_row
                             if value > best_value:
                                 best_value = value
                                 best_index = candidate
                         amax[f] = best_index
+
+                # WINDOW AUDIT: a nonzero event cost makes the payoff
+                # discontinuous exactly at the rollover candidate ``lo`` (the
+                # only candidate that is never charged). The warm-started
+                # window can exclude it, so force-evaluate it whenever it was
+                # skipped and meets the consumption floor. Payoff only: the
+                # window center (amax) keeps tracking the interior search.
+                # Guarded so the zero-kappa path is untouched.
+                if kappa_row != 0.0 and final_left > lo:
+                    c_lo = resource + next_debt_grid[lo]
+                    if c_lo >= CONSUMPTION_FLOOR:
+                        if not u_ok[lo]:
+                            u_val[lo] = _flow_utility(sigma_u, c_lo)
+                            u_ok[lo] = True
+                        rollover_value = u_val[lo] + continuations[f, lo]
+                        if rollover_value > best_value:
+                            best_value = rollover_value
 
                 payoffs[f, row_idx] = best_value
 
@@ -591,11 +650,13 @@ def _noneduc_value(j, s, c, st, period, x1_new, x2, x2_new, sigma_u, debt_pen,
 
 
 def _edu_payload(j, s, st, period, inv, x1_new, x2, x2_new, b,
-                 financial_parameters, task_cache, e_joint, z_standard_joint):
+                 financial_parameters, task_cache, e_joint, z_standard_joint,
+                 loan_type):
     """(z_joint, resources) for one (education, labor) group at one state.
 
     Field-independent: within a state, all fields of one group share it, and
     across states it depends only on x2[0:9] (see cache-key rule above).
+    ``loan_type`` is constant within a task, so it never enters a cache key.
     """
     group = (int(j[1]), int(j[2]))
     entry = task_cache["edu_flow"].get(group) if ENABLE_FLOW_CACHE else None
@@ -629,6 +690,7 @@ def _edu_payload(j, s, st, period, inv, x1_new, x2, x2_new, b,
         inv,
         period,
         z_standard_joint[:, None],
+        loan_type=loan_type,
         education=int(j[1]),
         state=x2,
         pre_choice_resources=pre_choice_resources,
@@ -645,7 +707,12 @@ def _edu_payload(j, s, st, period, inv, x1_new, x2, x2_new, b,
 def _edu_continuation(j, s, c, st, x1_new, x2, evt_next, debt_pen,
                       mask_candidate_debt, task_cache):
     """(nb, 1) continuation of one schooling alternative: graduation-risk
-    mixing plus the candidate-debt penalty, verbatim from get_conditional."""
+    mixing plus the candidate-debt penalty, verbatim from get_conditional.
+
+    The one-shot new-borrowing event cost (kappa) is NOT folded in here: it
+    depends on the row's current debt (entry vs continuation, and the accrued
+    rollover threshold), not only on the candidate column, so the search
+    kernels apply it per candidate."""
     if st.grad_flag[s][c]:
         pg_key = (j.tobytes(), st.edu_key[s])
         if pg_key not in task_cache["pgrad"]:
@@ -665,7 +732,8 @@ def _edu_continuation(j, s, c, st, x1_new, x2, evt_next, debt_pen,
 
 
 def _solve_state(
-    s, st, period, inv, x1_key, x1_new, sigma_u, debt_pen, b, b1, evt_next,
+    s, st, period, inv, x1_key, x1_new, sigma_u, debt_pen, kappa0, kappa1,
+    loan_type, b, b1, evt_next,
     ccp_real, models_npz, solution_mode, conterfactual, maxdebt,
     financial_parameters, utility_parameters, task_cache,
 ):
@@ -696,6 +764,7 @@ def _solve_state(
             z_joint, resources = _edu_payload(
                 j0, s, st, period, inv, x1_new, x2, x2_new, b,
                 financial_parameters, task_cache, e_joint, z_standard_joint,
+                loan_type,
             )
             nf = idxs.shape[0]
             continuations = np.empty((nf, nb))
@@ -711,6 +780,7 @@ def _solve_state(
             _grouped_education_search(
                 sigma_u, b1, resources, continuations,
                 lo_idx, hi_idx, cap_start, payoffs,
+                b, kappa0, kappa1,
             )
             for fi in range(nf):
                 v = (payoffs[fi] * w_vis).reshape((len(w_joint), nb)).T
@@ -730,7 +800,7 @@ def _solve_state(
                 z_joint, resources = _edu_payload(
                     j, s, st, period, inv, x1_new, x2, x2_new, b,
                     financial_parameters, task_cache, e_joint,
-                    z_standard_joint,
+                    z_standard_joint, loan_type,
                 )
                 continuation = _edu_continuation(
                     j, s, c, st, x1_new, x2, evt_next, debt_pen,
@@ -738,12 +808,14 @@ def _solve_state(
                 )
                 if ms.USE_FUSED_CONSUMPTION_SEARCH and maxdebt:
                     max_vjt = ms.get_maximum_loop_modified_resources_maxdebt(
-                        sigma_u, b, b1, resources, continuation, j, x2
+                        sigma_u, b, b1, resources, continuation, j, x2,
+                        kappa0, kappa1,
                     )
                 else:
                     c_mat = resources[..., np.newaxis] + b1
                     max_vjt = ms.get_maximum(
-                        sigma_u, c_mat, continuation, inv, b, j, x2, maxdebt
+                        sigma_u, c_mat, continuation, inv, b, j, x2, maxdebt,
+                        kappa0, kappa1,
                     )
                 v = (max_vjt * w_vis).reshape((len(w_joint), nb)).T
                 all_vjt[:, c] = np.sum(v, axis=1)
@@ -783,7 +855,19 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
                      solution_mode, conterfactual, em_type, maxdebt):
     """Drop-in fast twin of ``ms.get_all_evt`` (same signature, artifacts)."""
     financial_parameters = ms.get_type_financial_parameters(em_type)
-    sigma_u = float(bs.risk_aversion(ms.budget_params, x1[i, :]))
+    # Latent loan component of this joint task: selects the new-borrowing
+    # entry cost and is threaded through every budget-shock call, mirroring
+    # the reference solver (a no-op while the production specification is
+    # loan-homogeneous).
+    loan_type = int(ms.type_components(em_type)[3])
+    sigma_u = float(
+        bs.risk_aversion(ms.budget_params, x1[i, :], loan_type=loan_type)
+    )
+    kappa_entry_by_type, kappa_continuation = (
+        bs.new_borrowing_cost_parameters(ms.budget_params)
+    )
+    kappa0 = float(kappa_entry_by_type[loan_type])
+    kappa1 = float(kappa_continuation)
 
     inv = x1[i, :][..., None].T
     x1_key = f"{inv}"
@@ -852,6 +936,7 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
             else:
                 all_vjt, evt_vec, ccp = _solve_state(
                     s, st, period, inv, x1_key, x1_new, sigma_u, debt_pen,
+                    kappa0, kappa1, loan_type,
                     b, b1, evt_next, ccp_real, models_npz, solution_mode,
                     conterfactual, maxdebt, financial_parameters,
                     utility_parameters, task_cache,

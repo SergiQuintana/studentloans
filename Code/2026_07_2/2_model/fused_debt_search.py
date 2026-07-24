@@ -50,7 +50,8 @@ def _flow_utility(sigma_u, consumption):
 
 @njit
 def get_maximum_loop_modified_resources_maxdebt(
-    sigma_u, debt_grid, next_debt_grid, resources, continuation, choice, x2
+    sigma_u, debt_grid, next_debt_grid, resources, continuation, choice, x2,
+    kappa0=0.0, kappa1=0.0,
 ):
     """Run the existing ``maxdebt=True`` search without building its matrix.
 
@@ -59,6 +60,15 @@ def get_maximum_loop_modified_resources_maxdebt(
     ``resources[row] + next_debt_grid[k]``.  The search windows, floor handling,
     cap-region rule, and previous-argmax heuristic intentionally match the
     legacy kernel.
+
+    ``kappa0``/``kappa1`` are the one-shot new-borrowing event costs: entry
+    when the row's current debt is exactly zero, continuation when it is
+    positive.  ``lo_idx[it]`` is the first grid index at or above accrued debt
+    (snap-up), so the ``lo_idx`` candidate is pure rollover and is never
+    charged; a candidate ``k`` is a borrowing event exactly when
+    ``k > lo_idx[it]``.  Every kappa adjustment is guarded by
+    ``kappa_row != 0.0`` so the default zero-kappa path performs the same
+    floating-point operations as before (bitwise-equivalence discipline).
     """
     ncont = continuation.shape[0]
     quadrature = int(resources.shape[0] / ncont)
@@ -72,8 +82,16 @@ def get_maximum_loop_modified_resources_maxdebt(
         for it in range(ncont):
             row_idx = it + ncont * shock_index
             resource = resources[row_idx]
+            # One-shot event cost for this current-debt row (entry at zero
+            # current debt, continuation otherwise). Zero for both when the
+            # cost block is off, keeping every guard below inactive.
+            if debt_grid[it] == 0.0:
+                kappa_row = kappa0
+            else:
+                kappa_row = kappa1
 
             # Once the lifetime cap binds, debt evolves mechanically.
+            # (lo_idx == hi_idx here: pure rollover, never a new loan.)
             if it >= cap_start:
                 idx_use = lo_idx[it]
                 payoff[row_idx] = (
@@ -95,12 +113,15 @@ def get_maximum_loop_modified_resources_maxdebt(
 
                 if feasible_count == 0:
                     idx_use = hi
-                    payoff[row_idx] = (
+                    value = (
                         _flow_utility(
                             sigma_u, resource + next_debt_grid[idx_use]
                         )
                         + continuation[idx_use, 0]
                     )
+                    if kappa_row != 0.0 and idx_use > lo:
+                        value += kappa_row
+                    payoff[row_idx] = value
                     amax_new = idx_use
                     continue
 
@@ -112,6 +133,8 @@ def get_maximum_loop_modified_resources_maxdebt(
                     )
                     + continuation[firstbound, 0]
                 )
+                if kappa_row != 0.0 and firstbound > lo:
+                    best_value += kappa_row
                 for candidate in range(firstbound + 1, hi + 1):
                     value = (
                         _flow_utility(
@@ -119,6 +142,8 @@ def get_maximum_loop_modified_resources_maxdebt(
                         )
                         + continuation[candidate, 0]
                     )
+                    if kappa_row != 0.0 and candidate > lo:
+                        value += kappa_row
                     if value > best_value:
                         best_value = value
                         best_index = candidate
@@ -144,12 +169,15 @@ def get_maximum_loop_modified_resources_maxdebt(
 
                 if feasible_count == 0:
                     idx_use = hi
-                    payoff[row_idx] = (
+                    value = (
                         _flow_utility(
                             sigma_u, resource + next_debt_grid[idx_use]
                         )
                         + continuation[idx_use, 0]
                     )
+                    if kappa_row != 0.0 and idx_use > lo:
+                        value += kappa_row
+                    payoff[row_idx] = value
                     amax_new = idx_use
                     continue
 
@@ -158,6 +186,9 @@ def get_maximum_loop_modified_resources_maxdebt(
                 bound_left = max(bound_left, it)
                 bound_right = hi + 1
 
+            # Left edge of the candidate set actually evaluated; used below to
+            # detect a window that excluded the uncharged rollover candidate.
+            final_left = bound_left
             best_index = bound_left
             best_value = (
                 _flow_utility(
@@ -165,6 +196,8 @@ def get_maximum_loop_modified_resources_maxdebt(
                 )
                 + continuation[bound_left, 0]
             )
+            if kappa_row != 0.0 and bound_left > lo:
+                best_value += kappa_row
             for candidate in range(bound_left + 1, bound_right):
                 value = (
                     _flow_utility(
@@ -172,6 +205,8 @@ def get_maximum_loop_modified_resources_maxdebt(
                     )
                     + continuation[candidate, 0]
                 )
+                if kappa_row != 0.0 and candidate > lo:
+                    value += kappa_row
                 if value > best_value:
                     best_value = value
                     best_index = candidate
@@ -193,12 +228,15 @@ def get_maximum_loop_modified_resources_maxdebt(
 
                     if feasible_count == 0:
                         idx_use = hi
-                        payoff[row_idx] = (
+                        value = (
                             _flow_utility(
                                 sigma_u, resource + next_debt_grid[idx_use]
                             )
                             + continuation[idx_use, 0]
                         )
+                        if kappa_row != 0.0 and idx_use > lo:
+                            value += kappa_row
+                        payoff[row_idx] = value
                         amax_new = idx_use
                         continue
 
@@ -206,6 +244,7 @@ def get_maximum_loop_modified_resources_maxdebt(
                     firstbound = max(firstbound, lo)
                     firstbound = max(firstbound, it)
 
+                    final_left = firstbound
                     best_index = firstbound
                     best_value = (
                         _flow_utility(
@@ -213,6 +252,8 @@ def get_maximum_loop_modified_resources_maxdebt(
                         )
                         + continuation[firstbound, 0]
                     )
+                    if kappa_row != 0.0 and firstbound > lo:
+                        best_value += kappa_row
                     for candidate in range(firstbound + 1, hi + 1):
                         value = (
                             _flow_utility(
@@ -220,10 +261,28 @@ def get_maximum_loop_modified_resources_maxdebt(
                             )
                             + continuation[candidate, 0]
                         )
+                        if kappa_row != 0.0 and candidate > lo:
+                            value += kappa_row
                         if value > best_value:
                             best_value = value
                             best_index = candidate
                     amax_new = best_index
+
+            # WINDOW AUDIT: a nonzero event cost makes the payoff
+            # discontinuous exactly at the rollover candidate ``lo`` (the only
+            # candidate that is never charged). The warm-started window can
+            # exclude it, so force-evaluate it whenever it was skipped and
+            # meets the consumption floor. Payoff only: the window center
+            # (amax_new) keeps tracking the interior search. Guarded so the
+            # zero-kappa path is untouched.
+            if kappa_row != 0.0 and final_left > lo:
+                c_lo = resource + next_debt_grid[lo]
+                if c_lo >= CONSUMPTION_FLOOR:
+                    rollover_value = (
+                        _flow_utility(sigma_u, c_lo) + continuation[lo, 0]
+                    )
+                    if rollover_value > best_value:
+                        best_value = rollover_value
 
             payoff[row_idx] = best_value
 

@@ -142,7 +142,14 @@ def load_all_parameters():
 
 def reload_budgetshock_params(raise_if_missing=True):
     global sigma_u_parinc, budget_params, debt_pen_vec
-    sigma_u_parinc, budget_params, debt_pen_vec = load_params_frombudget()
+    global new_borrow_entry_by_type, new_borrow_continuation
+    global new_borrow_kappa0, new_borrow_kappa1
+    (sigma_u_parinc, budget_params, debt_pen_vec,
+     new_borrow_entry_by_type, new_borrow_continuation) = load_params_frombudget()
+    # Reset the per-task scalars to the loan-type-0 defaults; ``get_all_evt``
+    # re-selects them for the joint type it solves.
+    new_borrow_kappa0 = float(new_borrow_entry_by_type[0])
+    new_borrow_kappa1 = float(new_borrow_continuation)
     if raise_if_missing and (budget_params is None):
         raise FileNotFoundError(f"Missing {EST('budgetshock_params.npy')}")
     return sigma_u_parinc, budget_params, debt_pen_vec
@@ -173,10 +180,17 @@ def build_debt_pen_vec(budget_params):
 def load_params_frombudget():
     budget_params = bs.load(raise_if_missing=False)
     if budget_params is None:
-        return None, None, None
+        return None, None, None, np.zeros(2, dtype=np.float64), 0.0
     sigma_u_parinc = budget_params.get("risk_aversion")
     debt_pen_vec = build_debt_pen_vec(budget_params)
-    return sigma_u_parinc, budget_params, debt_pen_vec
+    # One-shot new-borrowing event costs: entry by latent loan type plus the
+    # shared continuation cost. Bundles estimated without the block unpack to
+    # exact zeros, which keeps every kappa guard in the maximizers inactive.
+    new_borrow_entry_by_type, new_borrow_continuation = (
+        bs.new_borrowing_cost_parameters(budget_params)
+    )
+    return (sigma_u_parinc, budget_params, debt_pen_vec,
+            new_borrow_entry_by_type, new_borrow_continuation)
     
 
 
@@ -789,7 +803,12 @@ def move_state_grad(x,j,period,grad=0):
 def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
     """This function loops over states. The only reason it is an external function is
      to perform the loop using numba. To save computation time this function uses some
-     features of the objective function to just search over reasonable maximum candidates"""
+     features of the objective function to just search over reasonable maximum candidates
+
+    WARNING (new-borrowing cost): this legacy ``maxdebt=False`` maximizer does
+    NOT implement the one-shot new-borrowing event cost (kappa). The
+    ``get_maximum`` dispatcher raises before reaching it when a nonzero kappa
+    is supplied; never call it directly in a nonzero-kappa solve."""
     
     payoff = np.zeros(np.shape(c)[0])
                 
@@ -935,7 +954,8 @@ def get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2):
     return payoff
 
 @njit
-def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
+def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2,
+                                        kappa0=0.0, kappa1=0.0):
     """
     Two-region version:
 
@@ -945,6 +965,15 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
 
     Region 2: accrued debt >= lifetime cap
         -> no search, debt evolves mechanically
+
+    ``kappa0``/``kappa1`` are the one-shot new-borrowing event costs: entry
+    when the row's current debt is exactly zero, continuation when it is
+    positive. ``lo_idx[it]`` is the first grid index at or above accrued debt
+    (snap-up), so the ``lo_idx`` candidate is pure rollover and is never
+    charged; a candidate ``k`` is a borrowing event exactly when
+    ``k > lo_idx[it]``. Every kappa adjustment is guarded by
+    ``kappa_row != 0.0`` so the default zero-kappa path performs the same
+    floating-point operations as before (bitwise-equivalence discipline).
     """
     payoff = np.zeros(np.shape(c)[0])
     consumption_floor = CONSUMPTION_FLOOR
@@ -965,11 +994,20 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
             c2 = c[row_idx]
             alert = 0
 
+            # One-shot event cost for this current-debt row (entry at zero
+            # current debt, continuation otherwise). Zero for both when the
+            # cost block is off, keeping every guard below inactive.
+            if b[it] == 0.0:
+                kappa_row = kappa0
+            else:
+                kappa_row = kappa1
+
             # --------------------------------------------------------
             # Region 2: no borrowing choice left
             # --------------------------------------------------------
             if it >= cap_start:
                 idx_use = lo_idx[it]   # here lo_idx[it] == hi_idx[it]
+                # Pure rollover: never a new loan, so no kappa here.
                 payoff[row_idx] = (
                     get_power_utility(
                         sigma_u, np.maximum(c2[idx_use], consumption_floor)
@@ -999,11 +1037,21 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                         )
                         + continuation[idx_use]
                     )
+                    if kappa_row != 0.0 and idx_use > lo:
+                        payoff[row_idx] += kappa_row
                     amax_new = idx_use
                 else:
                     firstbound = hi + 1 - len(c2new)
                     u = get_power_utility(sigma_u, c2new)
                     final = u + continuation[firstbound:hi+1]
+                    if kappa_row != 0.0:
+                        # Charge candidates strictly above the rollover index
+                        # lo (firstbound >= lo, so the offset is 1 when the
+                        # rollover candidate is in the feasible slice).
+                        kstart = lo + 1 - firstbound
+                        if kstart < 0:
+                            kstart = 0
+                        final[kstart:] += kappa_row
                     amax = np.argmax(final)
                     amax_new = amax + firstbound
                     payoff[row_idx] = final[amax]
@@ -1032,6 +1080,8 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                             )
                             + continuation[idx_use]
                         )
+                        if kappa_row != 0.0 and idx_use > lo:
+                            payoff[row_idx] += kappa_row
                         amax_new = idx_use
                         it += 1
                         if it == ncont:
@@ -1045,9 +1095,18 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                             bound_left = it
                         bound_right = hi + 1
 
+                # Left edge of the candidate set actually evaluated; used
+                # below to detect a window that excluded the uncharged
+                # rollover candidate.
+                final_left = bound_left
                 c_new = c2[bound_left:bound_right]
                 u = get_power_utility(sigma_u, c_new)
                 final = u + continuation[bound_left:bound_right]
+                if kappa_row != 0.0:
+                    kstart = lo + 1 - bound_left
+                    if kstart < 0:
+                        kstart = 0
+                    final[kstart:] += kappa_row
                 amax = np.argmax(final)
 
                 if amax != (np.shape(final)[0] - 1):
@@ -1067,6 +1126,8 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                                 )
                                 + continuation[idx_use]
                             )
+                            if kappa_row != 0.0 and idx_use > lo:
+                                payoff[row_idx] += kappa_row
                             amax_new = idx_use
                             it += 1
                             if it == ncont:
@@ -1079,13 +1140,38 @@ def get_maximum_loop_modified_c_maxdebt(sigma_u, b, c, continuation, j, x2):
                             if firstbound < it:
                                 firstbound = it
 
+                            final_left = firstbound
                             clast = c2[firstbound:hi+1]
                             u = get_power_utility(sigma_u, clast)
                             final = u + continuation[firstbound:hi+1]
+                            if kappa_row != 0.0:
+                                kstart = lo + 1 - firstbound
+                                if kstart < 0:
+                                    kstart = 0
+                                final[kstart:] += kappa_row
                             amax = np.argmax(final)
                             amax_new = amax + firstbound
 
                 payoff[row_idx] = final[amax]
+
+                # WINDOW AUDIT: a nonzero event cost makes the payoff
+                # discontinuous exactly at the rollover candidate ``lo`` (the
+                # only candidate that is never charged). The warm-started
+                # window can exclude it, so force-evaluate it whenever it was
+                # skipped and meets the consumption floor. Payoff only: the
+                # window center (amax_new) keeps tracking the interior search.
+                # Guarded so the zero-kappa path is untouched.
+                if kappa_row != 0.0 and final_left > lo:
+                    if c2[lo] >= consumption_floor:
+                        rollover_value = (
+                            get_power_utility(
+                                sigma_u,
+                                np.maximum(c2[lo], consumption_floor),
+                            )
+                            + continuation[lo]
+                        )
+                        if rollover_value > payoff[row_idx]:
+                            payoff[row_idx] = rollover_value
 
             it += 1
             if it == ncont:
@@ -1243,24 +1329,31 @@ def get_maximum_loop_modified_c_maxdebt_debug(sigma_u, b, c, continuation, j, x2
     return payoff
 
 #@njit()
-def get_maximum(sigma_u,c,continuation,x1,b,j,x2,maxdebt):
-    
+def get_maximum(sigma_u,c,continuation,x1,b,j,x2,maxdebt,kappa0=0.0,kappa1=0.0):
+
     """This function computes the maximum of the conditional value function, minimizing
     the amount of times that c**(1-sigma)/1-sigma needs to be computed, since it is
     very time consuming to compute.
-    
+
     There are always three candidates for maximum:
         1. the point most to the left.
         2. the point most to the right.
         3. the maximum in the overlap notflat regions or wathever point in the
             overlap flat regions"""
-    
+
     if maxdebt == False:
-            
+        # The legacy maxdebt=False maximizer predates the one-shot
+        # new-borrowing event cost and must never run with a nonzero kappa.
+        if kappa0 != 0.0 or kappa1 != 0.0:
+            raise NotImplementedError(
+                "get_maximum_loop_modified_c (maxdebt=False) does not "
+                "implement the new-borrowing event cost; solve with "
+                "maxdebt=True or zero kappas."
+            )
         payoff = get_maximum_loop_modified_c(sigma_u,b,c,continuation,j,x2)
     else:
-        payoff = get_maximum_loop_modified_c_maxdebt(sigma_u,b,c,continuation,j,x2)
-        
+        payoff = get_maximum_loop_modified_c_maxdebt(sigma_u,b,c,continuation,j,x2,kappa0,kappa1)
+
     return payoff
     
 
@@ -1443,6 +1536,7 @@ def get_conditional(
 ):
 
     global debt_pen_vec
+    global new_borrow_kappa0, new_borrow_kappa1
 
     # scalar penalty for this individual (depends only on x1_new)
     debt_pen = float(x1_new @ debt_pen_vec)   # typically negative
@@ -1487,15 +1581,21 @@ def get_conditional(
         candidate_debt_mask = (b1 > 0).astype(np.float64)
         continuation[:,0] += debt_pen * candidate_debt_mask
 
+        # The one-shot new-borrowing event cost is NOT folded into
+        # ``continuation[:, 0]``: it depends on the row's current debt (entry
+        # vs continuation, and the accrued rollover threshold), not only on
+        # the candidate column b1, so the maximizers apply it per candidate.
         if USE_FUSED_CONSUMPTION_SEARCH and maxdebt:
             max_vjt = get_maximum_loop_modified_resources_maxdebt(
-                sigma_u, b, b1, resources, continuation, j, x2
+                sigma_u, b, b1, resources, continuation, j, x2,
+                new_borrow_kappa0, new_borrow_kappa1,
             )
         else:
             # Retained fallback for comparisons, debugging, and maxdebt=False.
             c = resources[..., np.newaxis] + b1
             max_vjt = get_maximum(
-                sigma_u, c, continuation, x1, b, j, x2, maxdebt
+                sigma_u, c, continuation, x1, b, j, x2, maxdebt,
+                new_borrow_kappa0, new_borrow_kappa1,
             )
         return max_vjt
 
@@ -1523,16 +1623,20 @@ def get_sigma(j,sigmas):
 def get_quadrature_budget(deg, x1, x2, j, period):
     return bs.quadrature(
         budget_params, x1, period, degree=deg,
-        education=int(j[1]), state=x2,
+        loan_type=task_loan_type, education=int(j[1]), state=x2,
     )
 
 
 def budget_mu_sigma_from_params(x1, x2, j, period):
     keywords = {"education": int(j[1]), "state": x2}
     mean = float(np.asarray(
-        bs.conditional_mean(budget_params, x1, period, **keywords)
+        bs.conditional_mean(
+            budget_params, x1, period, loan_type=task_loan_type, **keywords
+        )
     ).reshape(-1)[0])
-    return mean, bs.conditional_sigma(budget_params, period, **keywords)
+    return mean, bs.conditional_sigma(
+        budget_params, period, loan_type=task_loan_type, **keywords
+    )
 
 
 def get_quadrature(deg,mu,sigma):
@@ -1611,6 +1715,7 @@ def get_expected_conditional(
         x1,
         period,
         z_standard_joint[:, None],
+        loan_type=task_loan_type,
         education=int(j[1]),
         state=x2,
         pre_choice_resources=pre_choice_resources,
@@ -2383,15 +2488,27 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
     Grant and transfer components are mapped once here and passed downward as
     a preselected tuple of numeric arrays.
     """
+    global task_loan_type, new_borrow_kappa0, new_borrow_kappa1
     time.sleep(0)
 
     financial_parameters = get_type_financial_parameters(em_type)
-        
-    evtnext = 0 
-    
+
+    evtnext = 0
+
     models = 0
-    
-    sigma_u = float(bs.risk_aversion(budget_params, x1[i, :]))
+
+    # Latent loan component of this joint task. It selects the new-borrowing
+    # entry cost and is threaded through every budget-shock call via the
+    # per-task module globals (a no-op while the production specification is
+    # loan-homogeneous, same pattern as ``debt_pen_vec``).
+    _, _, _, loan_type = type_components(em_type)
+    task_loan_type = int(loan_type)
+    new_borrow_kappa0 = float(new_borrow_entry_by_type[task_loan_type])
+    new_borrow_kappa1 = float(new_borrow_continuation)
+
+    sigma_u = float(
+        bs.risk_aversion(budget_params, x1[i, :], loan_type=task_loan_type)
+    )
     task_started = time.perf_counter()
     total_states = len(x1)
     total_tasks = N_TYPES * total_states
@@ -2435,7 +2552,18 @@ def _trace_expected_conditional_debug(
     sigma_u, x1, x1_new, x2, x2_new, b, b1, j, period, evt,
     conterfactual, maxdebt, financial_parameters, deg=5, deg_budget=5
 ):
-    """Replay one choice without aggregation and retain quadrature identities."""
+    """Replay one choice without aggregation and retain quadrature identities.
+
+    WARNING (new-borrowing cost): this debug tracer does NOT implement the
+    one-shot new-borrowing event cost (kappa); it folds only the stock debt
+    penalty into the continuation. It refuses to run with nonzero task kappas
+    so it can never silently disagree with the production maximizers.
+    """
+    if new_borrow_kappa0 != 0.0 or new_borrow_kappa1 != 0.0:
+        raise NotImplementedError(
+            "_trace_expected_conditional_debug does not implement the "
+            "new-borrowing event cost; rerun with zero kappas."
+        )
     nb = np.shape(b)[0]
     e_nodes, we = get_quadrature_wage(deg, mu, j)
 
@@ -3808,7 +3936,14 @@ def get_debt_range():
 
 
 (wage_0, params_wage, sigmas, param_prob_grad) = load_all_parameters()
-sigma_u_parinc, budget_params, debt_pen_vec = load_params_frombudget()
+(sigma_u_parinc, budget_params, debt_pen_vec,
+ new_borrow_entry_by_type, new_borrow_continuation) = load_params_frombudget()
+# Per-task new-borrowing scalars and latent loan type, selected once per joint
+# type by ``get_all_evt`` (same module-global pattern as ``debt_pen_vec``).
+# The defaults keep every non-task caller on the zero-cost, loan-type-0 path.
+task_loan_type = 0
+new_borrow_kappa0 = float(new_borrow_entry_by_type[0])
+new_borrow_kappa1 = float(new_borrow_continuation)
 
 #simulate_all_states(11)
 #a = np.load("states/states_t8.npy")

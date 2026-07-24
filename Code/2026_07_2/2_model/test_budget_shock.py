@@ -1,8 +1,22 @@
+import os
+import tempfile
 import unittest
 
 import numpy as np
 
 import budget_shock as bs
+
+
+def _multicell_cells():
+    return [bs.budget_education_cell_code(education, year)
+            for education, year in bs.BUDGET_EDUCATION_CELLS]
+
+
+def _multicell_vector(cells):
+    blocks = []
+    for index in range(len(cells)):
+        blocks.extend([1000.0 + index] * 4 + [50.0 + index, 0.0])
+    return np.asarray(blocks + [1.0] * 4 + [-2.0] * 4)
 
 
 class BudgetShockSupportTests(unittest.TestCase):
@@ -78,6 +92,134 @@ class BudgetShockSupportTests(unittest.TestCase):
         )
         four_year_top_index = cells.index(205)
         self.assertEqual(float(mean), 1000.0 + four_year_top_index)
+
+
+class NewBorrowingCostTests(unittest.TestCase):
+    KAPPA = np.array([-500.0, -250.0, -75.0])
+
+    def _spec(self, extended):
+        cells = _multicell_cells()
+        vector = _multicell_vector(cells)
+        if extended:
+            vector = np.concatenate((vector, self.KAPPA))
+        return bs.unpack_parental_income_multicell_estimation_vector(
+            vector, cells, index_kind="education_cell"
+        )
+
+    def test_vector_sizes(self):
+        self.assertEqual(bs.N_NEW_BORROWING_PARAMETERS, 3)
+        self.assertEqual(bs.estimation_vector_size_multicell(10), 68)
+        self.assertEqual(
+            bs.estimation_vector_size_multicell(10, include_new_borrowing=True), 71
+        )
+
+    def test_legacy_68_vector_unpacks_to_zero_kappas(self):
+        spec = self._spec(extended=False)
+        np.testing.assert_array_equal(
+            spec["new_borrow_cost_entry_by_loan_type"], np.zeros(2)
+        )
+        self.assertEqual(spec["new_borrow_cost_continuation"], 0.0)
+        self.assertEqual(
+            spec["new_borrowing_cost_timing"], bs.NEW_BORROWING_COST_TIMING
+        )
+
+    def test_extended_71_vector_maps_trailing_kappas(self):
+        spec = self._spec(extended=True)
+        np.testing.assert_array_equal(
+            spec["new_borrow_cost_entry_by_loan_type"], self.KAPPA[:2]
+        )
+        self.assertEqual(spec["new_borrow_cost_continuation"], self.KAPPA[2])
+        # The kappa block must not disturb the existing parameter mapping.
+        legacy = self._spec(extended=False)
+        np.testing.assert_array_equal(spec["mu_blocks"], legacy["mu_blocks"])
+        np.testing.assert_array_equal(spec["sigma_e"], legacy["sigma_e"])
+        np.testing.assert_array_equal(spec["risk_aversion"], legacy["risk_aversion"])
+        np.testing.assert_array_equal(
+            spec["debt_pen_parinc"], legacy["debt_pen_parinc"]
+        )
+        np.testing.assert_array_equal(
+            spec["budget_resource_slope"], legacy["budget_resource_slope"]
+        )
+
+    def test_accessor_scalar_and_vectorized(self):
+        spec = self._spec(extended=True)
+        self.assertEqual(bs.new_borrowing_cost(spec, True), -75.0)
+        self.assertEqual(bs.new_borrowing_cost(spec, False, loan_type=0), -500.0)
+        self.assertEqual(bs.new_borrowing_cost(spec, False, loan_type=1), -250.0)
+        # loan_type=None uses the loan-type-0 entry cost.
+        self.assertEqual(bs.new_borrowing_cost(spec, False), -500.0)
+        np.testing.assert_array_equal(
+            bs.new_borrowing_cost(
+                spec,
+                np.array([True, False, False, True]),
+                loan_type=np.array([0, 0, 1, 1]),
+            ),
+            np.array([-75.0, -500.0, -250.0, -75.0]),
+        )
+        with self.assertRaises(ValueError):
+            bs.new_borrowing_cost(spec, False, loan_type=2)
+
+    def test_accessor_raw_parameters_are_copies(self):
+        spec = self._spec(extended=True)
+        entry, continuation = bs.new_borrowing_cost_parameters(spec)
+        np.testing.assert_array_equal(entry, self.KAPPA[:2])
+        self.assertEqual(continuation, self.KAPPA[2])
+        entry[0] = 0.0
+        np.testing.assert_array_equal(
+            spec["new_borrow_cost_entry_by_loan_type"], self.KAPPA[:2]
+        )
+
+    def test_validate_defaults_missing_keys_on_legacy_dict(self):
+        spec = self._spec(extended=False)
+        for key in (
+            "new_borrow_cost_entry_by_loan_type",
+            "new_borrow_cost_continuation",
+            "new_borrowing_cost_timing",
+        ):
+            del spec[key]
+        validated = bs.validate(spec)
+        np.testing.assert_array_equal(
+            validated["new_borrow_cost_entry_by_loan_type"], np.zeros(2)
+        )
+        self.assertEqual(validated["new_borrow_cost_continuation"], 0.0)
+        self.assertEqual(
+            validated["new_borrowing_cost_timing"], bs.NEW_BORROWING_COST_TIMING
+        )
+        self.assertEqual(bs.new_borrowing_cost(validated, True), 0.0)
+        self.assertEqual(bs.new_borrowing_cost(validated, False, loan_type=1), 0.0)
+
+    def test_save_load_round_trip_preserves_kappa_keys(self):
+        spec = self._spec(extended=True)
+        original_est = bs.EST
+        with tempfile.TemporaryDirectory() as directory:
+            bs.EST = lambda *parts: os.path.join(directory, *map(str, parts))
+            try:
+                bs.save(spec, raw_vector=np.zeros(71))
+                loaded = bs.load()
+            finally:
+                bs.EST = original_est
+        np.testing.assert_array_equal(
+            loaded["new_borrow_cost_entry_by_loan_type"], self.KAPPA[:2]
+        )
+        self.assertEqual(loaded["new_borrow_cost_continuation"], self.KAPPA[2])
+        self.assertEqual(
+            loaded["new_borrowing_cost_timing"], bs.NEW_BORROWING_COST_TIMING
+        )
+        np.testing.assert_array_equal(loaded["mu_blocks"], spec["mu_blocks"])
+
+    def test_extended_vector_keeps_grouped_state_lookup(self):
+        cells = _multicell_cells()
+        vector = np.concatenate((_multicell_vector(cells), self.KAPPA))
+        spec = bs.unpack_parental_income_multicell_estimation_vector(
+            vector, cells, index_kind="education_cell"
+        )
+        state = np.zeros(10, dtype=np.int64)
+        state[2] = 8
+        mean = bs.conditional_mean(
+            spec, np.array([1, 1, 0, 0]), education=2, state=state,
+            pre_choice_resources=0.0,
+        )
+        self.assertEqual(float(mean), 1000.0 + cells.index(205))
 
 
 if __name__ == "__main__":

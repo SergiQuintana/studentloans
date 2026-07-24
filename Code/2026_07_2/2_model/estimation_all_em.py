@@ -66,6 +66,7 @@ import solve_many_continuations as mcf
 import model_predict_ccps as mccp
 import model_getccp_sequence as mgs
 from model_interpolate_terminal import build_interp_cache 
+import model_fitloans_dynamic as mfd
 from model_fitloans_dynamic import estimate_budget_shock_all_education
 from latent_types import TYPE_IDS, load_em_posteriors, validate_q
 #-----------------------------------------------------------------------------------------------#
@@ -127,7 +128,25 @@ BUDGET_SMM_ANNEALING_MAXFUN = 500
 BUDGET_SMM_MAXITER = 1000
 BUDGET_SMM_CCP_WORKERS = 60
 BUDGET_SMM_CELL_WORKERS = None  # automatically one worker per cell, CPU permitting
+# Profiling 2026-07-23: the pooled kernel is bitwise thread-count-invariant, so
+# raising this to 6 uses all 60 server cores (10 cell workers x 6 threads) for
+# a ~1.5x SMM speedup with no other pool active during the SMM phase. Kept at 1
+# until the change is promoted after a server check.
 BUDGET_SMM_CELL_NUMBA_THREADS = 1
+# "dfols" is the benchmarked faster least-squares alternative (see
+# Agents_Readme/Tasks/STUDENT_LOANS_FIT_MASTER_PLAN.md, section 5).
+BUDGET_SMM_OPTIMIZER = "hybrid"
+
+# --- New-borrowing-cost (kappa) estimation switches (2026-07-23) -------------
+# See Agents_Readme/Tasks/STUDENT_LOANS_FIT_MASTER_PLAN.md. Both default to the
+# pre-kappa production behavior; flip BOTH to run the new specification:
+#   ESTIMATE_NEW_BORROWING_COST = True  -> 71-parameter vector (kappa0_low,
+#       kappa0_high, kappa1 appended; a saved 68-vector restart is upgraded
+#       with zero kappas automatically).
+#   BUDGET_SMM_MOMENT_SPEC = "flow_split_stock" -> entry/continuation moments
+#       split by observed beginning-of-period debt + at-cap share.
+ESTIMATE_NEW_BORROWING_COST = False
+BUDGET_SMM_MOMENT_SPEC = "flow_plus_stock"
 
 if __name__ == '__main__':
     
@@ -303,13 +322,14 @@ if __name__ == '__main__':
         
             #---------------------------------------#
             print("Estimation of the Budget Shock")
-            
+
+            mfd.ESTIMATE_NEW_BORROWING_COST = ESTIMATE_NEW_BORROWING_COST
             estimate_budget_shock_all_education(
                 draws=BUDGET_SMM_DRAWS,
                 maxiter=BUDGET_SMM_MAXITER,
-                optimizer="hybrid",
+                optimizer=BUDGET_SMM_OPTIMIZER,
                 annealing_maxfun=BUDGET_SMM_ANNEALING_MAXFUN,
-                moment_spec="flow_plus_stock",
+                moment_spec=BUDGET_SMM_MOMENT_SPEC,
                 resource_mode="simulated",
                 restart=True,
                 ccp_workers=BUDGET_SMM_CCP_WORKERS,

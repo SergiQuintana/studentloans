@@ -31,6 +31,15 @@ from debt_limits import (
 )
 r = INTEREST_RATE
 
+# Forward-simulation debt-penalty convention used in ``get_utility_agents``.
+# "legacy_multiplier" (default) keeps the current behavior: the SMM-shortcut
+# discounted multiplier applied in flow utility. "single_flow" charges the
+# per-period flow penalty exactly once, matching the Bellman convention in
+# ``model_solution_em.get_conditional``. Read the comment block inside
+# ``get_utility_agents`` before switching; "single_flow" awaits researcher
+# confirmation and must not become the default without sign-off.
+SIM_DEBT_PENALTY_CONVENTION = "legacy_multiplier"
+
 # Parameters for the wage equations:
 from pathlib import Path
 from config import DIR, OUT, INP, FUN, RDATA, CONT, EST, LIK
@@ -963,9 +972,14 @@ def get_conditional_agents(sigma_u,x1,x2,b,financial_help,budget_psi,wage_psi,j,
     
     j = total_choices[j,:]
             
+    # Forward the permanent latent loan type so the utility can charge the
+    # loan-type-specific new-borrowing event cost (kappa).
+    loan_types = TYPE_LOAN[np.asarray(types, dtype=np.int64) - 1]
+
     u = get_utility_agents(
         sigma_u, x1, x2, b, b1, financial_help, budget_psi,
-        wage_psi, j, period, conterfactual, maxdebt
+        wage_psi, j, period, conterfactual, maxdebt,
+        loan_types=loan_types,
     )
 
     continuation = beta*VT_agents(x1,x2,b1,period,j,conterfactual,types,maxdebt)
@@ -1618,7 +1632,7 @@ def wage(x1_new,x2_new,j,param_wage):
 
 
 #@njit()
-def get_utility_agents(sigma_u,x1,x2,b,b1,financial_help,budget_psi,wage_psi,j,period,conterfactual,maxdebt):
+def get_utility_agents(sigma_u,x1,x2,b,b1,financial_help,budget_psi,wage_psi,j,period,conterfactual,maxdebt,loan_types=None):
     
     " this function returns the utility associated with a particular alternative"
     
@@ -1663,16 +1677,66 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,financial_help,budget_psi,wage_psi,j,p
             0.1 * scaled_c ** (1.0 - sigma_matrix) / (1.0 - sigma_matrix),
         )
 
-    # Match the SMM shortcut: debt persists along the home-reference path, so
-    # one estimated flow penalty is accumulated through explicit period T-1.
-    penalty_multiplier = bs.explicit_debt_penalty_multiplier(
-        period, beta=beta, terminal_period=T
-    )
+    # ------------------------------------------------------------------
+    # Debt-penalty convention (module switch SIM_DEBT_PENALTY_CONVENTION).
+    #
+    # "legacy_multiplier" (default, current behavior): match the SMM
+    # shortcut, in which debt persists along the home-reference path, so
+    # the full discounted stream of future flow penalties through explicit
+    # period T-1 is charged here in flow utility via
+    # ``explicit_debt_penalty_multiplier``. In the SMM shortcut that
+    # multiplier is paired with a penalty-free continuation, so the
+    # accounting is internally consistent THERE. THIS simulator, however,
+    # adds ``beta * VT_agents(...)``, which loads the solved Bellman EVT —
+    # and the Bellman recursion already charges one flow penalty in every
+    # future explicit period (see ``model_solution_em.get_conditional``:
+    # candidate ``b1 > 0`` on school paths, current debt stock on
+    # non-school paths). Combining the multiplier with the Bellman
+    # continuation therefore double-counts every future period's penalty
+    # in the forward debt choice.
+    #
+    # "single_flow": charge the per-period flow penalty exactly once
+    # (multiplier = 1), attached to the candidate next-period debt
+    # ``b1 > 0`` — the same object ``model_solution_em.get_conditional``
+    # penalizes on this education/debt-choice path. This matches the
+    # Bellman convention and removes the double count. It awaits
+    # researcher confirmation and is NOT the default; the default remains
+    # numerically identical to the pre-switch code.
+    # ------------------------------------------------------------------
+    if SIM_DEBT_PENALTY_CONVENTION == "legacy_multiplier":
+        penalty_multiplier = bs.explicit_debt_penalty_multiplier(
+            period, beta=beta, terminal_period=T
+        )
+    elif SIM_DEBT_PENALTY_CONVENTION == "single_flow":
+        penalty_multiplier = 1.0
+    else:
+        raise ValueError(
+            "SIM_DEBT_PENALTY_CONVENTION must be 'legacy_multiplier' or "
+            f"'single_flow'; received {SIM_DEBT_PENALTY_CONVENTION!r}"
+        )
     penalty = (
         bs.debt_penalty(budget_params, x1) * penalty_multiplier
     )[:, None]
     u = u + penalty * (b1[None, :] > 0.0)
-    
+
+    # One-shot new-borrowing event cost (kappa). Charged only in the period
+    # in which the chosen next-period debt exceeds the accrued current debt,
+    # i.e. the individual takes out a new loan: entry cost kappa0[loan_type]
+    # when current debt is zero, continuation cost kappa1 when it is
+    # positive. No discounting multiplier — one event, one charge (see
+    # budget_shock.NEW_BORROWING_COST_TIMING). Skipped entirely when both
+    # kappas are zero so default behavior is numerically unchanged.
+    kappa_entry, kappa_continuation = bs.new_borrowing_cost_parameters(
+        budget_params
+    )
+    if np.any(kappa_entry != 0.0) or kappa_continuation != 0.0:
+        current_debt = debt_range[np.array(b, dtype="int")]
+        new_borrowing = b1[None, :] > (1 + r) * current_debt[:, None]
+        event_cost = bs.new_borrowing_cost(
+            budget_params, current_debt > 0.0, loan_type=loan_types
+        )
+        u = u + np.asarray(event_cost, dtype=np.float64)[:, None] * new_borrowing
+
     # Incorporate debt  rules! 
     
     u = get_debt_rules(c, u, b, x2, j, maxdebt)

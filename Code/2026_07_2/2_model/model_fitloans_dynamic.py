@@ -100,10 +100,35 @@ TYPE_INTEGRATION_MODES = ("sampled", "exact")
 PARENTAL_INCOME_MOMENT_SPECS = (
     "fast_stock", "flow_stock", "fast_flow", "flow_plus_stock",
 )
+# Additional debt-status-split moment specification (see
+# ``parental_income_split_moments``). It is deliberately NOT added to
+# PARENTAL_INCOME_MOMENT_SPECS so every existing moment function keeps its
+# exact current validation; the multicell objective branches on it instead.
+SPLIT_MOMENT_SPEC = "flow_split_stock"
+EXTENDED_PARENTAL_INCOME_MOMENT_SPECS = (
+    PARENTAL_INCOME_MOMENT_SPECS + (SPLIT_MOMENT_SPEC,)
+)
+SPLIT_MOMENT_MINIMUM_GROUP_N = 30
 STOCK_MOMENT_WEIGHT = 2.0
+# Estimate the one-shot new-borrowing event cost (kappa) block. When False,
+# the production SMM keeps its exact current behavior: a 68-entry multicell
+# vector, unchanged moments, and kernels whose zero-kappa path is numerically
+# identical to the pre-kappa code.
+ESTIMATE_NEW_BORROWING_COST = False
+NEW_BORROWING_COST_BOUNDS = (-2.0, 0.0)
 EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
 DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
+# Opt-in DFO-LS least-squares optimizer defaults (optimizer="dfols"; see
+# Agents_Readme/Tasks/STUDENT_LOANS_FIT_MASTER_PLAN.md, section 5). All of
+# these are inert on the default "hybrid"/"nelder-mead"/"dual-annealing"
+# paths, whose behavior is unchanged.
+DFOLS_WARM_START_MAXFUN = 300
+DFOLS_COLD_MAXFUN_PER_PARAMETER = 35
+DFOLS_MAXFUN_CAP = 3000
+DFOLS_COLD_RHOBEG = 0.2
+DFOLS_WARM_RHOBEG = 0.05
+DFOLS_RESTART_PERTURBATION_SHARE = 0.1
 UNCAPPED_EDUCATION_CELL_MAXITER = np.iinfo(np.int32).max
 
 
@@ -579,6 +604,15 @@ def load_education_cell(
     debtchoice = debt_range[np.asarray(debtchoice_index[cell], dtype=np.int64)]
     q = validate_q(q[cell], n_individuals=int(cell.sum()))
     loan_flow = np.ascontiguousarray(loan_flow[cell], dtype=np.float64)
+    # Per-observation annual borrowing cap for the chosen stage, used by the
+    # optional flow_split_stock at-cap moment. The stage arguments follow the
+    # shared debt_limits convention: education choice plus pre-choice two-year
+    # and four-year experience.
+    annual_cap = np.empty(len(state), dtype=np.float64)
+    for row in range(len(state)):
+        annual_cap[row] = get_annual_cap_by_stage(
+            int(education), int(state[row, 1]), int(state[row, 2])
+        )
     ccp = load_education_cell_ccp(
         x1, state, choices, period, education, program_year,
         workers=ccp_workers, cache_mode=ccp_cache_mode,
@@ -595,6 +629,7 @@ def load_education_cell(
         "debt": np.ascontiguousarray(debt, dtype=np.float64),
         "debtchoice": np.ascontiguousarray(debtchoice, dtype=np.float64),
         "loan_flow": loan_flow,
+        "annual_cap": np.ascontiguousarray(annual_cap, dtype=np.float64),
         "parinc": np.ascontiguousarray(x1[:, 0], dtype=np.int64),
         "choice": choices,
         "ccp_by_type": ccp,
@@ -791,6 +826,109 @@ def parental_income_distribution_moments(
         np.asarray(output), np.asarray(flow_share),
         np.asarray(effective_weight), tuple(labels),
     )
+
+
+def parental_income_split_moments(
+    parinc, flow, begin_debt, annual_cap, eps=0.01, at_cap_fraction=0.99,
+):
+    """Five debt-status-split moments for each model parinc group.
+
+    This is the ``flow_split_stock`` moment specification. For every
+    parental-income group the target ordering is:
+
+      1. share with a positive new-loan flow given beginning-of-period
+         debt == 0 (entry rate);
+      2. share with a positive new-loan flow given beginning debt > 0
+         (continuation rate);
+      3. mean positive flow given beginning debt == 0;
+      4. mean positive flow given beginning debt > 0;
+      5. share of positive flows at >= ``at_cap_fraction`` of the applicable
+         annual borrowing cap (at-cap share, pooling both debt statuses).
+
+    Beginning-of-period debt is an OBSERVED state, so the debt-status split is
+    identical in data and simulation: the simulated flow is conditioned on the
+    same observed beginning debt, and group membership never moves with the
+    parameters. The flow itself must already remove interest accrual
+    (``b_next - (1+r)*b_current`` in simulation; the cleaned disbursement
+    measure ``loan_flow`` in the data). Empty groups receive the same ``eps``
+    numerical floor as the existing distribution moments.
+    """
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    flow = np.asarray(flow, dtype=np.float64).reshape(-1)
+    begin_debt = np.asarray(begin_debt, dtype=np.float64).reshape(-1)
+    annual_cap = np.asarray(annual_cap, dtype=np.float64).reshape(-1)
+    if not (flow.size == begin_debt.size == annual_cap.size == parinc.size):
+        raise ValueError(
+            "flow, begin_debt, and annual_cap must align with parinc."
+        )
+    if np.any(annual_cap <= 0.0):
+        raise ValueError("annual_cap must be positive for every observation.")
+
+    has_debt = begin_debt > 0.0
+    positive_flow = flow > 0.0
+    at_cap = positive_flow & (flow >= at_cap_fraction * annual_cap)
+    output, flow_share, effective_weight, labels = [], [], [], []
+    for level in range(1, 5):
+        selected = parinc == level
+        entry_group = selected & ~has_debt
+        continuation_group = selected & has_debt
+        entry_n = int(entry_group.sum())
+        continuation_n = int(continuation_group.sum())
+        entry_rate = (
+            float(np.mean(positive_flow[entry_group])) if entry_n else eps
+        )
+        continuation_rate = (
+            float(np.mean(positive_flow[continuation_group]))
+            if continuation_n else eps
+        )
+        entry_positive = entry_group & positive_flow
+        continuation_positive = continuation_group & positive_flow
+        mean_entry_flow = (
+            float(np.mean(flow[entry_positive]))
+            if np.any(entry_positive) else eps
+        )
+        mean_continuation_flow = (
+            float(np.mean(flow[continuation_positive]))
+            if np.any(continuation_positive) else eps
+        )
+        group_positive = selected & positive_flow
+        at_cap_share = (
+            float(np.mean(at_cap[group_positive]))
+            if np.any(group_positive) else eps
+        )
+        output.extend((
+            entry_rate, continuation_rate, mean_entry_flow,
+            mean_continuation_flow, at_cap_share,
+        ))
+        total = float(selected.sum())
+        flow_share.append(
+            float(np.mean(positive_flow[selected])) if total > 0.0 else np.nan
+        )
+        effective_weight.append(total)
+        labels.append(level)
+    return (
+        np.asarray(output), np.asarray(flow_share),
+        np.asarray(effective_weight), tuple(labels),
+    )
+
+
+def _warn_thin_split_groups(parinc, begin_debt, cell_label):
+    """Warn once at data-load when a parinc-by-debt-status group is thin."""
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    has_debt = np.asarray(begin_debt, dtype=np.float64).reshape(-1) > 0.0
+    for level in range(1, 5):
+        selected = parinc == level
+        for status_mask, status_name in (
+            (~has_debt, "beginning debt == 0"),
+            (has_debt, "beginning debt > 0"),
+        ):
+            group_n = int(np.sum(selected & status_mask))
+            if group_n < SPLIT_MOMENT_MINIMUM_GROUP_N:
+                print(
+                    f"WARNING [{cell_label}] {SPLIT_MOMENT_SPEC} group "
+                    f"parinc={level}, {status_name}: N={group_n} < "
+                    f"{SPLIT_MOMENT_MINIMUM_GROUP_N} observations."
+                )
 
 
 def parental_income_loan_type_distribution_moments(
@@ -1262,12 +1400,20 @@ def solve_one_draw_debt_idx_terminal_only(
     ccp_path_row, terminal_row,
     b_idx, max_idx,
     beta_term,
+    kappa_entry_i, kappa_cont_i, prev_debt_i,
     c_floor=CONSUMPTION_FLOOR,
     fallback_idx=99,
 ):
     """
     v = u(c) + ccp_path + beta_term * terminal
     debtpen applies when debt_grid[j] > 0
+
+    kappa is the one-shot new-borrowing event cost. It is charged when the
+    candidate exceeds the accrued current debt, debt_grid[j] > (1+r)*prev_debt
+    (the explicit SMM convention; the SMM lower bound is nearest-grid, not
+    snap-up): kappa_entry_i[i] if prev_debt_i[i] <= 0, else kappa_cont_i[i].
+    No discounting multiplier is ever applied (one-shot event timing). With
+    zero kappa arrays the utility is unchanged.
     """
     n = budget.shape[0]
     B = debt_grid.size
@@ -1286,6 +1432,10 @@ def solve_one_draw_debt_idx_terminal_only(
 
         sig = sigma_i[i]
         pen = debtpen_i[i]
+        kappa = kappa_cont_i[i]
+        if prev_debt_i[i] <= 0.0:
+            kappa = kappa_entry_i[i]
+        accrued_debt = (1.0 + r) * prev_debt_i[i]
 
         best_v = -1e30
         best_j = lo
@@ -1305,6 +1455,9 @@ def solve_one_draw_debt_idx_terminal_only(
             if debt_grid[j] > 0.0:
                 u += pen
 
+            if kappa != 0.0 and debt_grid[j] > accrued_debt:
+                u += kappa
+
             v = u + ccp_path_row[i, j] + beta_term * terminal_row[i, j]
             if v > best_v:
                 best_v = v
@@ -1313,6 +1466,36 @@ def solve_one_draw_debt_idx_terminal_only(
         out[i] = hi if not found_feasible else best_j
 
     return out
+
+
+def _zero_new_borrowing_kernel_arrays(n):
+    """Zero kappa/previous-debt kernel inputs for paths without the new cost.
+
+    The three returned views share one read-only buffer; with every kappa at
+    zero the kernels are numerically identical to the pre-kappa code, so the
+    previous-debt entries are irrelevant and may also be zero.
+    """
+    zeros = np.zeros(int(n), dtype=np.float64)
+    return zeros, zeros, zeros
+
+
+def _new_borrowing_kernel_arrays(spec, loan_type, prev_debt):
+    """Per-individual kappa kernel inputs from the canonical specification.
+
+    Entry costs are resolved by latent loan type; the continuation cost is
+    shared. Both come back as float64 arrays aligned with ``prev_debt``.
+    Specifications without the kappa block yield zero arrays.
+    """
+    entry_by_type, continuation = bs.new_borrowing_cost_parameters(spec)
+    loan_type = np.asarray(loan_type, dtype=np.int64).reshape(-1)
+    prev_debt = np.ascontiguousarray(prev_debt, dtype=np.float64).reshape(-1)
+    if loan_type.size != prev_debt.size:
+        raise ValueError("loan_type and prev_debt must align.")
+    kappa_entry_i = np.ascontiguousarray(
+        entry_by_type[loan_type], dtype=np.float64
+    )
+    kappa_cont_i = np.full(prev_debt.size, continuation, dtype=np.float64)
+    return kappa_entry_i, kappa_cont_i, prev_debt
 
 # ==============================================================================
 # Precompute bounds indices (speed)
@@ -1389,6 +1572,9 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
                 terminal[idx, :] = get_relevant_terminal_subset_cached(terminal_data, ra_levels[k], idx, cache)
 
         beta_term = float(beta ** (T - p))
+        kappa_entry_i, kappa_cont_i, prev_debt_i = (
+            _zero_new_borrowing_kernel_arrays(n)
+        )
 
         s = Z.shape[0]
         sim_draws = np.zeros((24, s), dtype=np.float64)
@@ -1407,6 +1593,9 @@ def minimize_distance_multi(params, moments_data, sample_by_period, periods):
                 b_idx=b_idx,
                 max_idx=max_idx,
                 beta_term=beta_term,
+                kappa_entry_i=kappa_entry_i,
+                kappa_cont_i=kappa_cont_i,
+                prev_debt_i=prev_debt_i,
                 c_floor=CONSUMPTION_FLOOR,
                 fallback_idx=99,
             )
@@ -1509,6 +1698,9 @@ def minimize_distance_multi_posterior(
                 )
 
         beta_term = float(beta ** (T - p))
+        kappa_entry_i, kappa_cont_i, prev_debt_i = (
+            _zero_new_borrowing_kernel_arrays(x1.shape[0])
+        )
         sim_draws = np.zeros((len(moments_data_by_period[p]), Z.shape[0]))
         for draw_index in range(Z.shape[0]):
             debt_by_type = np.empty((N_TYPES, x1.shape[0]), dtype=np.float64)
@@ -1531,6 +1723,9 @@ def minimize_distance_multi_posterior(
                     b_idx=b_idx,
                     max_idx=max_idx,
                     beta_term=beta_term,
+                    kappa_entry_i=kappa_entry_i,
+                    kappa_cont_i=kappa_cont_i,
+                    prev_debt_i=prev_debt_i,
                     c_floor=CONSUMPTION_FLOOR,
                     fallback_idx=debt_range.size - 1,
                 )
@@ -1811,6 +2006,8 @@ def _subset_cell_pack(pack, indices):
         "parinc", "choice", "observed_budget", "individual_index",
     ):
         out[name] = np.ascontiguousarray(pack[name][indices])
+    if "annual_cap" in pack:
+        out["annual_cap"] = np.ascontiguousarray(pack["annual_cap"][indices])
     if "sampled_type_index" in pack:
         out["sampled_type_index"] = np.ascontiguousarray(
             pack["sampled_type_index"][indices], dtype=np.int64
@@ -1830,12 +2027,20 @@ def solve_all_draws_debt_idx_pooled(
     budget_by_draw, shock_by_draw, debt_grid,
     sigma_i, debtpen_i, ccp_path_row, terminal_row,
     b_idx, max_idx, beta_term_i,
+    kappa_entry_i, kappa_cont_i, prev_debt_i,
     c_floor=CONSUMPTION_FLOOR, fallback_idx=99,
 ):
     """Solve every sampled individual and simulation draw in one parallel call.
 
     Model-period differences are retained through ``beta_term_i`` and through
     each individual's already-selected CCP, terminal, and debt-bound rows.
+
+    kappa is the one-shot new-borrowing event cost, charged when the
+    candidate exceeds accrued current debt, debt_grid[j] > (1+r)*prev_debt
+    (the explicit SMM convention; the SMM lower bound is nearest-grid, not
+    snap-up): kappa_entry_i[i] if prev_debt_i[i] <= 0, else kappa_cont_i[i].
+    No discounting multiplier is ever applied (one-shot event timing). With
+    zero kappa arrays the utility is unchanged.
     """
     draws, n = budget_by_draw.shape
     B = debt_grid.size
@@ -1862,6 +2067,10 @@ def solve_all_draws_debt_idx_pooled(
         sig = sigma_i[i]
         pen = debtpen_i[i]
         beta_i = beta_term_i[i]
+        kappa = kappa_cont_i[i]
+        if prev_debt_i[i] <= 0.0:
+            kappa = kappa_entry_i[i]
+        accrued_debt = (1.0 + r) * prev_debt_i[i]
         best_v = -1e30
         best_j = lo
         found_feasible = False
@@ -1877,6 +2086,8 @@ def solve_all_draws_debt_idx_pooled(
                 u = 0.1 * ((0.00001 * c) ** (1.0 - sig)) / (1.0 - sig)
             if debt_grid[j] > 0.0:
                 u += pen
+            if kappa != 0.0 and debt_grid[j] > accrued_debt:
+                u += kappa
             v = u + ccp_path_row[i, j] + beta_i * terminal_row[i, j]
             if v > best_v:
                 best_v = v
@@ -2074,6 +2285,15 @@ def prepare_education_cell_crns(
                 dtype=np.float64,
             ),
         }
+        # Per-observation annual caps back the optional flow_split_stock
+        # at-cap moment; older synthetic packs without the key remain usable.
+        if all("annual_cap" in pack for pack in packs_in_order):
+            pooled_static["annual_cap"] = np.ascontiguousarray(
+                np.concatenate([
+                    pack["annual_cap"] for pack in packs_in_order
+                ]),
+                dtype=np.float64,
+            )
         next(iter(prepared.values()))["pooled_sampled_static"] = pooled_static
     return prepared
 
@@ -2087,6 +2307,21 @@ def _pooled_observed_cell_moments(
     stock = np.concatenate([pack["debtchoice"] for pack in packs])
     if specification not in EDUCATION_CELL_SPECIFICATIONS:
         raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
+    if moment_spec == SPLIT_MOMENT_SPEC:
+        if specification != "parental_income_basic":
+            raise ValueError(
+                f"The {SPLIT_MOMENT_SPEC} moments require the "
+                "parental_income_basic specification."
+            )
+        begin_debt = np.concatenate([pack["debt"] for pack in packs])
+        annual_cap = np.concatenate([pack["annual_cap"] for pack in packs])
+        _warn_thin_split_groups(
+            parinc, begin_debt,
+            f"cell {int(packs[0]['cell_code'])}",
+        )
+        return parental_income_split_moments(
+            parinc, flow, begin_debt, annual_cap
+        )
     if specification == "parental_income_basic":
         return parental_income_distribution_moments(
             parinc, flow, stock, moment_spec=moment_spec
@@ -2124,10 +2359,62 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
 
 def parental_income_moment_weight_pattern(moment_spec, primary_moment_weight):
     """Within-parinc SMM weights in the exact moment-output ordering."""
+    if moment_spec == SPLIT_MOMENT_SPEC:
+        # [entry rate, continuation rate, mean entry flow,
+        #  mean continuation flow, at-cap share] = [4, 4, 2, 2, 1] at the
+        # defaults (primary=4, stock weight=2).
+        return np.asarray(
+            [
+                primary_moment_weight, primary_moment_weight,
+                STOCK_MOMENT_WEIGHT, STOCK_MOMENT_WEIGHT, 1.0,
+            ],
+            dtype=np.float64,
+        )
     base = [primary_moment_weight, primary_moment_weight, 1.0, 1.0]
     if moment_spec == "flow_plus_stock":
         base.extend((STOCK_MOMENT_WEIGHT, STOCK_MOMENT_WEIGHT))
     return np.asarray(base, dtype=np.float64)
+
+
+def _print_split_fit(
+    data, simulated, data_new_share, sim_new_share, weights, labels, loss,
+    primary_moment_weight,
+):
+    """Fit table for the flow_split_stock moments; used only for that spec."""
+    print("\n" + "=" * 132)
+    print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    print(
+        " loss weights per parinc group: "
+        f"entry rate={primary_moment_weight:g}, continuation "
+        f"rate={primary_moment_weight:g}, mean entry "
+        f"flow={STOCK_MOMENT_WEIGHT:g}, mean continuation "
+        f"flow={STOCK_MOMENT_WEIGHT:g}, at-cap share=1"
+    )
+    print(
+        " parinc | entry rate (debt==0): data/sim/diff | continuation rate "
+        "(debt>0): data/sim/diff | mean flow>0 (debt==0): data/sim/diff | "
+        "mean flow>0 (debt>0): data/sim/diff | at-cap share: data/sim/diff"
+    )
+    for row, parinc in enumerate(labels):
+        m = 5 * row
+        pieces = []
+        for offset, numeric_format in (
+            (0, "6.4f"), (1, "6.4f"), (2, "8.2f"), (3, "8.2f"), (4, "6.4f"),
+        ):
+            pieces.append(
+                f"{data[m+offset]:{numeric_format}}/"
+                f"{simulated[m+offset]:{numeric_format}}/"
+                f"{simulated[m+offset]-data[m+offset]:+8.2f}"
+            )
+        print(f"   {parinc:>2}   | " + " | ".join(pieces))
+    print(" positive-flow share diagnostic (data -> simulation): " + ", ".join(
+        f"parinc {level}: {data_new_share[row]:.4f}->{sim_new_share[row]:.4f}"
+        for row, level in enumerate(labels)
+    ))
+    print(" cell observation weights: " + ", ".join(
+        f"parinc {level}: {weights[row]:.1f}" for row, level in enumerate(labels)
+    ))
+    print("=" * 132 + "\n")
 
 
 def _print_parental_income_fit(
@@ -2312,6 +2599,9 @@ def minimize_distance_education_cell(
             debtpen_i = discounted_explicit_horizon_debt_penalty(
                 spec, x1, period
             )
+            kappa_entry_i, kappa_cont_i, prev_debt_i = (
+                _zero_new_borrowing_kernel_arrays(len(x1))
+            )
             stock_by_type = np.empty((N_TYPES, len(x1)), dtype=np.float64)
             for type_index in range(N_TYPES):
                 shock = bs.realization(
@@ -2326,6 +2616,9 @@ def minimize_distance_education_cell(
                     ccp_path_row=pack["ccp_by_type"][type_index],
                     terminal_row=terminal, b_idx=pack["b_idx"], max_idx=pack["max_idx"],
                     beta_term=float(beta ** (T - period)),
+                    kappa_entry_i=kappa_entry_i,
+                    kappa_cont_i=kappa_cont_i,
+                    prev_debt_i=prev_debt_i,
                     c_floor=CONSUMPTION_FLOOR,
                     fallback_idx=debt_range.size - 1,
                 )
@@ -2408,6 +2701,13 @@ def _pool_sampled_education_cell_evaluation(
     pooled["debtpen_i"] = discounted_explicit_horizon_debt_penalty(
         spec, x1, pooled["model_period"]
     )
+    # One-shot new-borrowing costs, resolved per individual from the sampled
+    # loan type and the observed beginning-of-period debt. Specifications
+    # without the kappa block produce zero arrays, leaving the kernels'
+    # numerical output unchanged.
+    pooled["kappa_entry_i"], pooled["kappa_cont_i"], _ = (
+        _new_borrowing_kernel_arrays(spec, pooled["loan_type"], pooled["debt"])
+    )
     pooled["shock"] = np.ascontiguousarray(
         bs.realization(
             spec, x1, None, pooled["budget_z"],
@@ -2425,14 +2725,67 @@ def _pool_sampled_education_cell_evaluation(
     return pooled
 
 
+def parental_income_cell_loss_and_residuals(
+    simulated, data_moments, moment_spec, primary_moment_weight,
+):
+    """One cell's weighted SMM loss and its exactly consistent residuals.
+
+    The scalar loss is the historical in-line computation, unchanged:
+    ``sum_k w_k * ((sim_k - data_k) / max(|data_k|, 1e-6))**2`` over the
+    finite moments, with ``w_k`` the tiled within-parinc weight pattern.
+    The residual vector stacks
+    ``r_k = sqrt(w_k) * (sim_k - data_k) / max(|data_k|, 1e-6)``
+    with zeros at non-finite moments, so ``sum(r**2) == loss`` exactly (up
+    to floating point). Least-squares optimizers (DFO-LS) consume the
+    residuals; every scalar optimizer keeps consuming the identical loss.
+    """
+    simulated = np.asarray(simulated, dtype=np.float64)
+    data_moments = np.asarray(data_moments, dtype=np.float64)
+    valid = np.isfinite(data_moments) & np.isfinite(simulated)
+    scale = np.maximum(np.abs(data_moments), 1.0e-6)
+    moment_weights = np.tile(
+        parental_income_moment_weight_pattern(
+            moment_spec, primary_moment_weight
+        ),
+        4,
+    )
+    standardized_error = (simulated - data_moments) / scale
+    loss = float(np.sum(moment_weights[valid] * standardized_error[valid] ** 2))
+    residuals = np.zeros(data_moments.size, dtype=np.float64)
+    residuals[valid] = (
+        np.sqrt(moment_weights[valid]) * standardized_error[valid]
+    )
+    return loss, residuals
+
+
 def _evaluate_sampled_parental_income_cell(
     full_params, data_moments, sample_by_period, cell_code, education,
     program_year, moment_spec, primary_moment_weight,
+    new_borrowing_costs=None,
 ):
-    """Evaluate one cell's parental-income moments without a global count."""
+    """Evaluate one cell's parental-income moments without a global count.
+
+    ``new_borrowing_costs`` is the optional shared kappa tail
+    ``[kappa0_low, kappa0_high, kappa1]`` estimated jointly across cells. It
+    is injected into the per-cell specification after unpacking, because the
+    14-entry per-cell vector deliberately does not carry the kappa block.
+    """
     spec = bs.unpack_parental_income_estimation_vector(
         full_params, [cell_code], index_kind="education_cell"
     )
+    if new_borrowing_costs is not None:
+        new_borrowing_costs = np.asarray(
+            new_borrowing_costs, dtype=np.float64
+        ).reshape(-1)
+        if new_borrowing_costs.size != bs.N_NEW_BORROWING_PARAMETERS:
+            raise ValueError(
+                "new_borrowing_costs must contain "
+                f"{bs.N_NEW_BORROWING_PARAMETERS} entries."
+            )
+        spec["new_borrow_cost_entry_by_loan_type"] = (
+            new_borrowing_costs[:2].copy()
+        )
+        spec["new_borrow_cost_continuation"] = float(new_borrowing_costs[2])
     pooled = _pool_sampled_education_cell_evaluation(
         sample_by_period, spec, education, program_year
     )
@@ -2447,6 +2800,9 @@ def _evaluate_sampled_parental_income_cell(
         b_idx=pooled["b_idx"],
         max_idx=pooled["max_idx"],
         beta_term_i=pooled["beta_term"],
+        kappa_entry_i=pooled["kappa_entry_i"],
+        kappa_cont_i=pooled["kappa_cont_i"],
+        prev_debt_i=pooled["debt"],
         c_floor=CONSUMPTION_FLOOR,
         fallback_idx=debt_range.size - 1,
     )
@@ -2455,25 +2811,24 @@ def _evaluate_sampled_parental_income_cell(
     simulated_by_draw = []
     diagnostic_by_draw = []
     for draw_index in range(stock_by_draw.shape[0]):
-        moments, new_share, _, _ = parental_income_distribution_moments(
-            pooled["parinc"], flow_by_draw[draw_index], stock_by_draw[draw_index],
-            moment_spec=moment_spec,
-        )
+        if moment_spec == SPLIT_MOMENT_SPEC:
+            moments, new_share, _, _ = parental_income_split_moments(
+                pooled["parinc"], flow_by_draw[draw_index], pooled["debt"],
+                pooled["annual_cap"],
+            )
+        else:
+            moments, new_share, _, _ = parental_income_distribution_moments(
+                pooled["parinc"], flow_by_draw[draw_index], stock_by_draw[draw_index],
+                moment_spec=moment_spec,
+            )
         simulated_by_draw.append(moments)
         diagnostic_by_draw.append(new_share)
     simulated = np.nanmean(np.asarray(simulated_by_draw), axis=0)
     sim_new_share = np.nanmean(np.asarray(diagnostic_by_draw), axis=0)
-    valid = np.isfinite(data_moments) & np.isfinite(simulated)
-    scale = np.maximum(np.abs(data_moments), 1.0e-6)
-    moment_weights = np.tile(
-        parental_income_moment_weight_pattern(
-            moment_spec, primary_moment_weight
-        ),
-        4,
+    loss, residuals = parental_income_cell_loss_and_residuals(
+        simulated, data_moments, moment_spec, primary_moment_weight
     )
-    standardized_error = (simulated - data_moments) / scale
-    loss = float(np.sum(moment_weights[valid] * standardized_error[valid] ** 2))
-    return loss, simulated, sim_new_share, spec
+    return loss, simulated, sim_new_share, spec, residuals
 
 
 def _initialize_cell_smm_worker(
@@ -2489,50 +2844,97 @@ def _initialize_cell_smm_worker(
     set_num_threads(int(numba_threads))
 
 
+def _split_multicell_shared_tail(params, n_cells, include_new_borrowing):
+    """Slice the flat multicell vector's shared tail after the cell blocks.
+
+    Returns ``(shared_risk, shared_debt, new_borrowing)`` where the last item
+    is the three-entry kappa tail ``[kappa0_low, kappa0_high, kappa1]`` when
+    ``include_new_borrowing`` is set and ``None`` otherwise. The risk and
+    debt-penalty slices are unchanged from the legacy 68-entry layout.
+    """
+    params = np.asarray(params, dtype=np.float64)
+    block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+    tail_start = int(n_cells) * block_size
+    shared_risk = params[tail_start:tail_start + 4]
+    shared_debt = params[tail_start + 4:tail_start + 8]
+    new_borrowing = None
+    if include_new_borrowing:
+        expected = tail_start + 8 + bs.N_NEW_BORROWING_PARAMETERS
+        if params.size != expected:
+            raise ValueError(
+                f"Multicell vector has {params.size} entries; expected "
+                f"{expected} with the new-borrowing cost block."
+            )
+        new_borrowing = params[tail_start + 8:tail_start + 11]
+    return shared_risk, shared_debt, new_borrowing
+
+
 def _evaluate_cell_smm_worker(task):
     """Evaluate one education cell for one common parameter proposal."""
-    cell_index, block, shared_risk, shared_debt = task
+    cell_index, block, shared_risk, shared_debt = task[:4]
+    new_borrowing = task[4] if len(task) > 4 else None
     context = _CELL_WORKER_CONTEXTS[cell_index]
     full_params = np.concatenate(
         (block[0:5], shared_risk, shared_debt, block[5:6])
     )
-    loss, simulated, sim_new_share, _ = _evaluate_sampled_parental_income_cell(
-        full_params,
-        context["data_moments"],
-        context["sample_by_period"],
-        context["cell_code"],
-        int(context["education"]),
-        int(context["program_year"]),
-        _CELL_WORKER_MOMENT_SPEC,
-        _CELL_WORKER_PRIMARY_WEIGHT,
+    loss, simulated, sim_new_share, _, residuals = (
+        _evaluate_sampled_parental_income_cell(
+            full_params,
+            context["data_moments"],
+            context["sample_by_period"],
+            context["cell_code"],
+            int(context["education"]),
+            int(context["program_year"]),
+            _CELL_WORKER_MOMENT_SPEC,
+            _CELL_WORKER_PRIMARY_WEIGHT,
+            new_borrowing_costs=new_borrowing,
+        )
     )
-    return cell_index, loss, simulated, sim_new_share
+    return cell_index, loss, simulated, sim_new_share, residuals
 
 
 def minimize_distance_education_cells_parental_income(
     params, contexts, moment_spec, primary_moment_weight, cell_pool=None,
+    return_residuals=False,
 ):
-    """Joint multi-cell loss with risk aversion shared across cells."""
+    """Joint multi-cell loss with risk aversion shared across cells.
+
+    With ``return_residuals=True`` (used only by the opt-in DFO-LS branch)
+    the return value is the stacked weighted residual vector: for each cell,
+    in the existing cell order, ``sqrt(cell_weight)`` times the cell's
+    residuals from ``parental_income_cell_loss_and_residuals``. Its sum of
+    squares equals the scalar loss returned by the default mode exactly.
+    """
     global EVAL_COUNTER
     EVAL_COUNTER += 1
     params = np.asarray(params, dtype=np.float64)
     n_cells = len(contexts)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
-    shared_risk = params[n_cells * block_size:n_cells * block_size + 4]
-    shared_debt = params[n_cells * block_size + 4:n_cells * block_size + 8]
+    shared_risk, shared_debt, shared_new_borrowing = (
+        _split_multicell_shared_tail(
+            params, n_cells, ESTIMATE_NEW_BORROWING_COST
+        )
+    )
     tasks = []
     for cell_index in range(n_cells):
         block = params[cell_index * block_size:(cell_index + 1) * block_size]
-        tasks.append((cell_index, block, shared_risk, shared_debt))
+        if shared_new_borrowing is None:
+            tasks.append((cell_index, block, shared_risk, shared_debt))
+        else:
+            tasks.append((
+                cell_index, block, shared_risk, shared_debt,
+                shared_new_borrowing,
+            ))
 
     if cell_pool is None:
         results = []
-        for cell_index, block, risk, debt_penalty in tasks:
+        for task in tasks:
+            cell_index, block = task[0], task[1]
             context = contexts[cell_index]
             full_params = np.concatenate(
-                (block[0:5], risk, debt_penalty, block[5:6])
+                (block[0:5], task[2], task[3], block[5:6])
             )
-            loss, simulated, sim_new_share, _ = (
+            loss, simulated, sim_new_share, _, residuals = (
                 _evaluate_sampled_parental_income_cell(
                     full_params,
                     context["data_moments"],
@@ -2542,9 +2944,14 @@ def minimize_distance_education_cells_parental_income(
                     int(context["program_year"]),
                     moment_spec,
                     primary_moment_weight,
+                    new_borrowing_costs=(
+                        task[4] if len(task) > 4 else None
+                    ),
                 )
             )
-            results.append((cell_index, loss, simulated, sim_new_share))
+            results.append(
+                (cell_index, loss, simulated, sim_new_share, residuals)
+            )
     else:
         results = cell_pool.map(_evaluate_cell_smm_worker, tasks, chunksize=1)
 
@@ -2561,11 +2968,17 @@ def minimize_distance_education_cells_parental_income(
             f"{np.round(shared_risk, 4)}"
         )
         print(f"shared debt penalties={np.round(shared_debt, 4)}")
+        if shared_new_borrowing is not None:
+            print(
+                "shared new-borrowing costs (one-shot, no multiplier): "
+                f"kappa0 low/high={np.round(shared_new_borrowing[:2], 4)}; "
+                f"kappa1 continuation={round(float(shared_new_borrowing[2]), 4)}"
+            )
         print("#" * 132)
         for context, evaluation in zip(contexts, results):
             education = int(context["education"])
             program_year = int(context["program_year"])
-            cell_index, loss, simulated, sim_new_share = evaluation
+            cell_index, loss, simulated, sim_new_share = evaluation[:4]
             block = params[
                 cell_index * block_size:(cell_index + 1) * block_size
             ]
@@ -2580,12 +2993,20 @@ def minimize_distance_education_cells_parental_income(
                 f"cell weight={cell_weight:.4f}; raw loss={loss:.6f}; "
                 f"weighted contribution={weighted_loss:.6f}"
             )
-            _print_parental_income_fit(
-                context["data_moments"], simulated,
-                context["data_new_share"], sim_new_share,
-                context["data_weights"], context["labels"], loss,
-                moment_spec, primary_moment_weight,
-            )
+            if moment_spec == SPLIT_MOMENT_SPEC:
+                _print_split_fit(
+                    context["data_moments"], simulated,
+                    context["data_new_share"], sim_new_share,
+                    context["data_weights"], context["labels"], loss,
+                    primary_moment_weight,
+                )
+            else:
+                _print_parental_income_fit(
+                    context["data_moments"], simulated,
+                    context["data_new_share"], sim_new_share,
+                    context["data_weights"], context["labels"], loss,
+                    moment_spec, primary_moment_weight,
+                )
             print("shock means by parinc:", np.round(block[0:4], 3),
                   "cell sigma:", round(float(block[4]), 3))
             print(
@@ -2594,6 +3015,11 @@ def minimize_distance_education_cells_parental_income(
             )
             if float(block[4]) <= 1.000001:
                 print("WARNING: cell budget-shock sigma is at its lower bound (1.0).")
+    if return_residuals:
+        return np.concatenate([
+            np.sqrt(float(contexts[item[0]]["cell_weight"])) * item[4]
+            for item in results
+        ])
     return total_loss
 
 
@@ -2645,6 +3071,9 @@ def minimize_distance_education_cell_parental_income(
             b_idx=pooled["b_idx"],
             max_idx=pooled["max_idx"],
             beta_term_i=pooled["beta_term"],
+            kappa_entry_i=pooled["kappa_entry_i"],
+            kappa_cont_i=pooled["kappa_cont_i"],
+            prev_debt_i=pooled["debt"],
             c_floor=CONSUMPTION_FLOOR,
             fallback_idx=debt_range.size - 1,
         )
@@ -2715,12 +3144,18 @@ def minimize_distance_education_cell_parental_income(
                             spec["risk_aversion"][group_index], idx, cache,
                         )
                 sigma_i = bs.risk_aversion(spec, x1).astype(np.float64)
+            zero_kappa_entry, zero_kappa_cont, zero_prev_debt = (
+                _zero_new_borrowing_kernel_arrays(len(x1))
+            )
             evaluation_by_period[period] = {
                 "terminal": terminal,
                 "sigma_i": sigma_i,
                 "debtpen_i": discounted_explicit_horizon_debt_penalty(
                     spec, x1, period
                 ),
+                "kappa_entry_i": zero_kappa_entry,
+                "kappa_cont_i": zero_kappa_cont,
+                "prev_debt_i": zero_prev_debt,
             }
 
         for draw_index in range(draws):
@@ -2758,6 +3193,9 @@ def minimize_distance_education_cell_parental_income(
                         ),
                         b_idx=pack["b_idx"], max_idx=pack["max_idx"],
                         beta_term=float(beta ** (T - period)),
+                        kappa_entry_i=evaluation["kappa_entry_i"],
+                        kappa_cont_i=evaluation["kappa_cont_i"],
+                        prev_debt_i=evaluation["prev_debt_i"],
                         c_floor=CONSUMPTION_FLOOR,
                         fallback_idx=debt_range.size - 1,
                     )
@@ -3044,6 +3482,94 @@ def fit_education_cell(
     return result, (data_moments, data_new_share, data_weights, labels)
 
 
+class _DfolsShimResult:
+    """SciPy-like result for the DFO-LS branch.
+
+    Downstream code stores extra ``smm_*`` attributes on the result and reads
+    ``.x`` (saved vector) and ``.fun``; this plain object supports both.
+    """
+
+    def __init__(self, x, fun, nfev, success, message):
+        self.x = np.asarray(x, dtype=np.float64).copy()
+        self.fun = float(fun)
+        self.nfev = int(nfev)
+        self.success = bool(success)
+        self.message = str(message)
+
+
+def solve_dfols_least_squares(
+    residual_fun, x0, bounds, maxfun, restarts=0, seed=12345,
+    rhobeg=DFOLS_COLD_RHOBEG, rhoend=1.0e-8,
+):
+    """Bounded DFO-LS solve with optional reproducible perturbation restarts.
+
+    ``residual_fun`` maps a parameter vector to the stacked weighted residual
+    vector whose sum of squares is the SMM loss. Each restart perturbs the
+    best point so far by uniform noise of ``DFOLS_RESTART_PERTURBATION_SHARE``
+    of each bound range (clipped to the bounds), drawn from
+    ``np.random.default_rng(seed)`` so repeated calls are identical. Returns
+    a ``_DfolsShimResult`` for the best solve; ``nfev`` counts evaluations
+    across all solves.
+    """
+    x0 = np.asarray(x0, dtype=np.float64).reshape(-1)
+    lower = np.asarray([pair[0] for pair in bounds], dtype=np.float64)
+    upper = np.asarray([pair[1] for pair in bounds], dtype=np.float64)
+    if lower.size != x0.size or upper.size != x0.size:
+        raise ValueError("bounds must provide one (low, high) pair per parameter.")
+    if int(maxfun) <= 0:
+        raise ValueError("maxfun must be positive.")
+    if int(restarts) < 0:
+        raise ValueError("restarts must be non-negative.")
+    try:
+        import dfols
+    except ImportError as error:
+        raise ImportError(
+            "optimizer='dfols' requires the DFO-LS package (import name "
+            "'dfols'). Install it with: pip install DFO-LS"
+        ) from error
+
+    def run_solve(start, label):
+        start = np.clip(np.asarray(start, dtype=np.float64), lower, upper)
+        solution = dfols.solve(
+            residual_fun,
+            start,
+            bounds=(lower, upper),
+            maxfun=int(maxfun),
+            rhobeg=float(rhobeg),
+            rhoend=float(rhoend),
+            objfun_has_noise=True,
+            scaling_within_bounds=True,
+        )
+        # DFO-LS >= 1.6 exposes the objective as .obj; older versions as .f.
+        objective = float(getattr(solution, "obj", getattr(solution, "f", np.nan)))
+        print(
+            f"[dfols {label} finished] loss={objective:.6f}; "
+            f"evaluations={int(solution.nf)}"
+        )
+        return solution, objective
+
+    best, best_objective = run_solve(x0, "solve")
+    total_evaluations = int(best.nf)
+    rng = np.random.default_rng(seed)
+    for restart_index in range(int(restarts)):
+        perturbed = best.x + rng.uniform(
+            -1.0, 1.0, size=x0.size
+        ) * DFOLS_RESTART_PERTURBATION_SHARE * (upper - lower)
+        candidate, candidate_objective = run_solve(
+            perturbed, f"restart {restart_index + 1}/{int(restarts)}"
+        )
+        total_evaluations += int(candidate.nf)
+        if candidate_objective < best_objective:
+            best, best_objective = candidate, candidate_objective
+    return _DfolsShimResult(
+        x=best.x,
+        fun=best_objective,
+        nfev=total_evaluations,
+        success=(int(best.flag) == int(best.EXIT_SUCCESS)),
+        message=str(best.msg),
+    )
+
+
 def fit_education_cells(
     packs_by_program_year, education=2, program_years=(1, 2, 3, 4),
     draws=20, n_sample=None, maxiter=DEFAULT_EDUCATION_CELL_MAXITER,
@@ -3051,7 +3577,7 @@ def fit_education_cells(
     primary_moment_weight=DEFAULT_PRIMARY_MOMENT_WEIGHT,
     resource_mode="simulated", optimizer="nelder-mead",
     annealing_maxfun=500, education_cells=None, cell_workers=None,
-    cell_numba_threads=1,
+    cell_numba_threads=1, dfols_maxfun=None, dfols_restarts=0,
 ):
     """Jointly estimate several education cells with common risk aversion.
 
@@ -3083,19 +3609,28 @@ def fit_education_cells(
         raise ValueError("Multi-cell estimation requires at least two unique education cells.")
     if any(educ not in (1, 2, 3) or year < 1 for educ, year in cells):
         raise ValueError("Education cells must use education 1, 2, or 3 and a positive year.")
-    if moment_spec not in PARENTAL_INCOME_MOMENT_SPECS:
-        raise ValueError(f"moment_spec must be one of {PARENTAL_INCOME_MOMENT_SPECS}.")
+    if moment_spec not in EXTENDED_PARENTAL_INCOME_MOMENT_SPECS:
+        raise ValueError(
+            f"moment_spec must be one of {EXTENDED_PARENTAL_INCOME_MOMENT_SPECS}."
+        )
     if resource_mode not in EDUCATION_CELL_RESOURCE_MODES:
         raise ValueError(f"resource_mode must be one of {EDUCATION_CELL_RESOURCE_MODES}.")
     if not np.isfinite(primary_moment_weight) or primary_moment_weight <= 0.0:
         raise ValueError("primary_moment_weight must be positive and finite.")
     optimizer = str(optimizer).lower()
-    if optimizer not in ("nelder-mead", "dual-annealing", "hybrid"):
+    if optimizer not in ("nelder-mead", "dual-annealing", "hybrid", "dfols"):
         raise ValueError(
-            "optimizer must be nelder-mead, dual-annealing, or hybrid."
+            "optimizer must be nelder-mead, dual-annealing, hybrid, or dfols."
         )
     if int(annealing_maxfun) <= 0:
         raise ValueError("annealing_maxfun must be positive.")
+    if dfols_maxfun is not None and int(dfols_maxfun) <= 0:
+        raise ValueError("dfols_maxfun must be positive when provided.")
+    if int(dfols_restarts) < 0:
+        raise ValueError("dfols_restarts must be non-negative.")
+    # A caller-provided initial vector (the production restart machinery)
+    # marks a warm start; DFO-LS then defaults to a small refinement budget.
+    dfols_warm_start = initial is not None
     if int(cell_numba_threads) <= 0:
         raise ValueError("cell_numba_threads must be positive.")
     for cell in cells:
@@ -3180,7 +3715,10 @@ def fit_education_cells(
 
     n_cells = len(cells)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
-    expected = n_cells * block_size + 8
+    legacy_expected = bs.estimation_vector_size_multicell(n_cells)
+    expected = bs.estimation_vector_size_multicell(
+        n_cells, include_new_borrowing=ESTIMATE_NEW_BORROWING_COST
+    )
     if initial is None:
         cell_block = np.array(
             [5000.0] * 4 + [100.0] + [0.0], dtype=np.float64
@@ -3207,11 +3745,24 @@ def fit_education_cells(
                 "[initial] Converted the previous multi-cell vector and "
                 "initialized shared debt penalties at their across-year means."
             )
+    if ESTIMATE_NEW_BORROWING_COST and initial.size == legacy_expected:
+        initial = np.concatenate(
+            (initial, np.zeros(bs.N_NEW_BORROWING_PARAMETERS))
+        )
+        print(
+            "[initial] Appending three zero new-borrowing costs "
+            "(kappa0 low/high, kappa1) to the legacy "
+            f"{legacy_expected}-parameter vector."
+        )
     if initial.size != expected:
         raise ValueError(
             f"Multi-cell initial vector has {initial.size} entries; expected {expected} "
             f"({block_size} per cell plus four shared risk-aversion and four "
-            "shared debt-penalty levels)."
+            "shared debt-penalty levels"
+            + (
+                " and three shared new-borrowing costs)."
+                if ESTIMATE_NEW_BORROWING_COST else ")."
+            )
         )
     cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
     bs.unpack_parental_income_multicell_estimation_vector(
@@ -3225,6 +3776,12 @@ def fit_education_cells(
         )
     bounds.extend([(0.1001, 2.9999)] * 4)
     bounds.extend([(-1.0e6, 0.0)] * 4)
+    if ESTIMATE_NEW_BORROWING_COST:
+        # kappas are flow-utility units; the CRRA flow utility here is
+        # O(0.1-2), so a few utils already dominate the choice.
+        bounds.extend(
+            [NEW_BORROWING_COST_BOUNDS] * bs.N_NEW_BORROWING_PARAMETERS
+        )
 
     def make_initial_simplex(center):
         center = np.asarray(center, dtype=np.float64)
@@ -3237,6 +3794,14 @@ def fit_education_cells(
             slope_index = cell_index * block_size + 5
             if center[slope_index] == 0.0:
                 simplex[slope_index + 1, slope_index] = 100.0
+        if ESTIMATE_NEW_BORROWING_COST:
+            # A zero-initialized kappa needs a negative in-bounds step of a
+            # meaningful flow-utility size, not the tiny default 0.00025.
+            for kappa_index in range(
+                center.size - bs.N_NEW_BORROWING_PARAMETERS, center.size
+            ):
+                if center[kappa_index] == 0.0:
+                    simplex[kappa_index + 1, kappa_index] = -0.25
         return simplex
 
     if cell_workers is None:
@@ -3269,6 +3834,43 @@ def fit_education_cells(
     )
     print(f"[multi-cell optimizer] {optimizer}")
     try:
+        if optimizer == "dfols":
+            def dfols_residual_objective(params):
+                return minimize_distance_education_cells_parental_income(
+                    params, contexts, moment_spec, primary_moment_weight,
+                    cell_pool, return_residuals=True,
+                )
+
+            if dfols_maxfun is not None:
+                dfols_budget = int(dfols_maxfun)
+            elif dfols_warm_start:
+                dfols_budget = int(DFOLS_WARM_START_MAXFUN)
+            else:
+                dfols_budget = int(min(
+                    DFOLS_COLD_MAXFUN_PER_PARAMETER * initial.size,
+                    DFOLS_MAXFUN_CAP,
+                ))
+            dfols_rhobeg = (
+                DFOLS_WARM_RHOBEG if dfols_warm_start else DFOLS_COLD_RHOBEG
+            )
+            print(
+                f"[dfols] {'warm' if dfols_warm_start else 'cold'} start; "
+                f"maxfun={dfols_budget} per solve; "
+                f"restarts={int(dfols_restarts)}; rhobeg={dfols_rhobeg:g} "
+                "(scaled bounds); rhoend=1e-08"
+            )
+            result = solve_dfols_least_squares(
+                dfols_residual_objective,
+                initial,
+                bounds,
+                maxfun=dfols_budget,
+                restarts=int(dfols_restarts),
+                seed=int(seed),
+                rhobeg=dfols_rhobeg,
+            )
+            result.dfols_maxfun = int(dfols_budget)
+            result.dfols_restarts = int(dfols_restarts)
+            result.dfols_warm_start = bool(dfols_warm_start)
         annealing_result = None
         if optimizer in ("dual-annealing", "hybrid"):
             annealing_result = dual_annealing(
@@ -3288,7 +3890,7 @@ def fit_education_cells(
 
         if optimizer == "dual-annealing":
             result = annealing_result
-        else:
+        elif optimizer != "dfols":
             local_start = (
                 annealing_result.x if optimizer == "hybrid" else initial
             )
@@ -3447,6 +4049,8 @@ def estimate_budget_shock_education_cells(
     cell_numba_threads=1,
     ccp_workers=DEFAULT_CCP_WORKERS,
     ccp_cache_mode="reuse",
+    dfols_maxfun=None,
+    dfols_restarts=0,
 ):
     """Estimate multiple program-year cells with shared risk aversion."""
     program_years = tuple(dict.fromkeys(
@@ -3482,6 +4086,8 @@ def estimate_budget_shock_education_cells(
         annealing_maxfun=annealing_maxfun,
         cell_workers=cell_workers,
         cell_numba_threads=cell_numba_threads,
+        dfols_maxfun=dfols_maxfun,
+        dfols_restarts=dfols_restarts,
     )
     if save:
         cell_codes = [
@@ -3578,6 +4184,8 @@ def estimate_budget_shock_all_education(
     ccp_cache_mode="off",
     cell_workers=None,
     cell_numba_threads=1,
+    dfols_maxfun=None,
+    dfols_restarts=0,
 ):
     """Production SMM over every observed 2y, 4y, and graduate cell."""
     cells = discover_observed_education_cells()
@@ -3601,8 +4209,9 @@ def estimate_budget_shock_all_education(
                 packs_by_cell[(education, year)].append(pack)
 
     cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
-    expected_size = (
-        len(cells) * bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL + 8
+    legacy_vector_size = bs.estimation_vector_size_multicell(len(cells))
+    expected_size = bs.estimation_vector_size_multicell(
+        len(cells), include_new_borrowing=ESTIMATE_NEW_BORROWING_COST
     )
     if initial is None and restart:
         raw_path = EST("budgetshock_bestx.npy")
@@ -3618,6 +4227,19 @@ def estimate_budget_shock_all_education(
             if candidate.size == expected_size:
                 initial = candidate
                 print(f"[restart] Using production estimate {raw_path}")
+            elif (
+                ESTIMATE_NEW_BORROWING_COST
+                and candidate.size == legacy_vector_size
+            ):
+                # A saved legacy vector restarts the extended specification;
+                # fit_education_cells appends three zero kappas so the first
+                # evaluation reproduces the saved estimate exactly.
+                initial = candidate
+                print(
+                    f"[restart] Using legacy {legacy_vector_size}-parameter "
+                    f"estimate {raw_path}; the three new-borrowing costs "
+                    "start at zero."
+                )
         if initial is None and current is not None:
             print(
                 "[restart] Existing production budget vector is incompatible "
@@ -3641,6 +4263,8 @@ def estimate_budget_shock_all_education(
         annealing_maxfun=annealing_maxfun,
         cell_workers=cell_workers,
         cell_numba_threads=cell_numba_threads,
+        dfols_maxfun=dfols_maxfun,
+        dfols_restarts=dfols_restarts,
     )
     save_budgetshock_estimates(
         result.x,
@@ -3669,6 +4293,8 @@ def estimate_budget_shock_all_education(
             "smm_risk_aversion_shared_across_cells": True,
             "smm_debt_penalties_shared_across_cells": True,
             "smm_debt_penalty_timing": bs.DEBT_PENALTY_TIMING,
+            "smm_estimate_new_borrowing_cost": bool(ESTIMATE_NEW_BORROWING_COST),
+            "smm_new_borrowing_cost_timing": bs.NEW_BORROWING_COST_TIMING,
             "smm_optimizer": optimizer,
             "smm_annealing_maxfun": int(annealing_maxfun),
             "smm_cell_workers": int(result.smm_cell_workers),

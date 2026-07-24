@@ -7,6 +7,12 @@ copying its parameter mappings into those three programs.
 Invariant-state columns used here are:
     x1[..., 0] = parental-income quartile (1,...,4)
     x1[..., 1] = ability quartile (1,...,4)
+
+An optional new-borrowing event cost block (kappa) adds three flow-utility
+parameters charged once per borrowing event (``b_next > (1+r)*b_current``):
+entry costs by latent loan type when current debt is zero, and one shared
+continuation cost when current debt is positive. Legacy 68-entry vectors and
+bundles without the block behave exactly as before (zero costs).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ SCHEMA_VERSION = 5
 N_MEAN_PARAMETERS = 7
 N_RISK_PARAMETERS = 4
 N_DEBT_PENALTY_PARAMETERS = 4
+N_NEW_BORROWING_PARAMETERS = 3
 DEBT_PENALTY_PARAMETERIZATION = "baseline_plus_deviations"
 LOAN_HETEROGENEITY_MODES = ("homogeneous", "mean", "variance", "both")
 INDEX_KINDS = ("model_period", "education_cell")
@@ -30,6 +37,11 @@ EDUCATION_YEAR_STATE_COLUMN = {1: 1, 2: 2, 3: 3}
 EDUCATION_BUDGET_YEAR_CAP = {1: 3, 2: 5, 3: 2}
 BUDGET_EDUCATION_YEAR_GROUPING = "capped_upper_years_v1"
 DEBT_PENALTY_TIMING = "flow_explicit_horizon_periods_1_through_9"
+# Unlike DEBT_PENALTY_TIMING, which applies a per-period flow penalty (with a
+# discounted-horizon multiplier in the SMM shortcut), the new-borrowing cost
+# is charged exactly once in the period of the borrowing event, with no
+# discounting multiplier ever.
+NEW_BORROWING_COST_TIMING = "one_shot_event_no_multiplier"
 BUDGET_EDUCATION_CELLS = tuple(
     (education, year)
     for education, cap in EDUCATION_BUDGET_YEAR_CAP.items()
@@ -131,6 +143,22 @@ def estimation_vector_size(periods, loan_heterogeneity: str = "homogeneous") -> 
     extra = p * int(mode in ("mean", "both"))
     extra += p * int(mode in ("variance", "both"))
     return N_MEAN_PARAMETERS * p + p + N_RISK_PARAMETERS + N_DEBT_PENALTY_PARAMETERS + extra
+
+
+def estimation_vector_size_multicell(
+    n_cells: int, include_new_borrowing: bool = False,
+) -> int:
+    """Number of SMM parameters in the multicell parental-income vector."""
+    n_cells = int(n_cells)
+    if n_cells < 2:
+        raise ValueError("The multicell parameterization requires at least two cells.")
+    size = (
+        PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL * n_cells
+        + N_RISK_PARAMETERS + N_DEBT_PENALTY_PARAMETERS
+    )
+    if include_new_borrowing:
+        size += N_NEW_BORROWING_PARAMETERS
+    return size
 
 
 def unpack_estimation_vector(
@@ -270,22 +298,35 @@ def unpack_parental_income_multicell_estimation_vector(
     slope.  The final eight entries are four parental-income risk-aversion
     levels followed by four parental-income debt-penalty levels.  Both sets are
     estimated once and shared by all education cells.
+
+    An extended vector appends three new-borrowing event costs after the debt
+    penalties: [kappa0_low, kappa0_high, kappa1], the loan-type entry costs at
+    zero current debt and the shared continuation cost with positive current
+    debt.  Legacy vectors without them unpack to zero costs.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     periods = np.asarray(periods, dtype=np.int64).reshape(-1)
     block_size = PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL * periods.size
     expected = block_size + N_RISK_PARAMETERS + N_DEBT_PENALTY_PARAMETERS
+    expected_extended = expected + N_NEW_BORROWING_PARAMETERS
     if periods.size < 2:
         raise ValueError("The multicell parameterization requires at least two cells.")
     if np.unique(periods).size != periods.size:
         raise ValueError("Multicell education-cell codes must be unique.")
-    if vector.size != expected:
+    if vector.size not in (expected, expected_extended):
         raise ValueError(
             f"Multicell parental-income vector has {vector.size} entries; "
-            f"expected {expected}."
+            f"expected {expected} (legacy) or {expected_extended} "
+            f"(with new-borrowing costs)."
         )
     shared_risk_aversion = vector[block_size:block_size + N_RISK_PARAMETERS]
-    debt_levels = vector[block_size + N_RISK_PARAMETERS:]
+    debt_levels = vector[block_size + N_RISK_PARAMETERS:expected]
+    if vector.size == expected_extended:
+        new_borrow_entry = vector[expected:expected + 2].copy()
+        new_borrow_continuation = float(vector[expected + 2])
+    else:
+        new_borrow_entry = np.zeros(2, dtype=np.float64)
+        new_borrow_continuation = 0.0
     index_kind = str(index_kind)
     if index_kind not in INDEX_KINDS:
         raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
@@ -320,6 +361,9 @@ def unpack_parental_income_multicell_estimation_vector(
         "loan_mean_shift": np.zeros(periods.size, dtype=np.float64),
         "loan_log_sigma_ratio": np.zeros(periods.size, dtype=np.float64),
         "budget_resource_slope": blocks[:, 5].copy(),
+        "new_borrow_cost_entry_by_loan_type": new_borrow_entry,
+        "new_borrow_cost_continuation": new_borrow_continuation,
+        "new_borrowing_cost_timing": NEW_BORROWING_COST_TIMING,
         "estimation_parameterization": "parental_income_basic_multicell_shared_risk_debt",
     }
     if index_kind == "education_cell":
@@ -376,6 +420,9 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     timing = out.get("debt_penalty_timing")
     if timing is not None and timing != DEBT_PENALTY_TIMING:
         raise ValueError(f"Unsupported debt_penalty_timing: {timing!r}")
+    borrow_timing = out.get("new_borrowing_cost_timing")
+    if borrow_timing is not None and borrow_timing != NEW_BORROWING_COST_TIMING:
+        raise ValueError(f"Unsupported new_borrowing_cost_timing: {borrow_timing!r}")
     out["mu_blocks"] = np.asarray(out["mu_blocks"], dtype=np.float64)
     out["sigma_e"] = np.asarray(out["sigma_e"], dtype=np.float64)
     out["debt_pen_parinc"] = np.asarray(out["debt_pen_parinc"], dtype=np.float64)
@@ -399,6 +446,13 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     out["budget_resource_slope"] = np.asarray(
         out.get("budget_resource_slope", np.zeros(p)), dtype=np.float64
     )
+    out["new_borrow_cost_entry_by_loan_type"] = np.asarray(
+        out.get("new_borrow_cost_entry_by_loan_type", np.zeros(2)), dtype=np.float64
+    )
+    out["new_borrow_cost_continuation"] = float(
+        out.get("new_borrow_cost_continuation", 0.0)
+    )
+    out["new_borrowing_cost_timing"] = NEW_BORROWING_COST_TIMING
     if out["mu_blocks"].shape != (p, N_MEAN_PARAMETERS):
         raise ValueError("mu_blocks must have shape (number of periods, 7)")
     if out["sigma_e"].shape != (p,) or np.any(out["sigma_e"] <= 0):
@@ -429,6 +483,14 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("loan_log_sigma_ratio contains non-finite values")
     if not np.all(np.isfinite(out["budget_resource_slope"])):
         raise ValueError("budget_resource_slope contains non-finite values")
+    if out["new_borrow_cost_entry_by_loan_type"].shape != (2,):
+        raise ValueError(
+            "new_borrow_cost_entry_by_loan_type must have one entry per loan type"
+        )
+    if not np.all(np.isfinite(out["new_borrow_cost_entry_by_loan_type"])):
+        raise ValueError("new_borrow_cost_entry_by_loan_type contains non-finite values")
+    if not np.isfinite(out["new_borrow_cost_continuation"]):
+        raise ValueError("new_borrow_cost_continuation must be finite")
     if (
         "risk_aversion_by_loan_type" in out
         and not np.all(np.isfinite(out["risk_aversion_by_loan_type"]))
@@ -629,6 +691,38 @@ def debt_penalty_design_vector(spec: dict[str, Any]) -> np.ndarray:
     vector[0] = group_penalties[0]
     vector[1:4] = group_penalties[1:] - group_penalties[0]
     return vector
+
+
+def new_borrowing_cost_parameters(spec: dict[str, Any]) -> tuple[np.ndarray, float]:
+    """Raw (entry costs by loan type, continuation cost) for Numba kernels."""
+    entry = np.asarray(
+        spec.get("new_borrow_cost_entry_by_loan_type", np.zeros(2)),
+        dtype=np.float64,
+    ).copy()
+    continuation = float(spec.get("new_borrow_cost_continuation", 0.0))
+    return entry, continuation
+
+
+def new_borrowing_cost(spec: dict[str, Any], has_debt, loan_type=None):
+    """One-shot flow-utility cost of a new-borrowing event.
+
+    Returns the shared continuation cost kappa1 where ``has_debt`` is True and
+    the loan-type entry cost kappa0 where it is False. With ``loan_type=None``
+    the loan-type-0 entry cost is used for every no-debt element; pass 0/1
+    values whenever the two entry costs differ. Charged once per event, with
+    no discounting multiplier (see NEW_BORROWING_COST_TIMING).
+    """
+    entry, continuation = new_borrowing_cost_parameters(spec)
+    has_debt = np.asarray(has_debt, dtype=bool)
+    if loan_type is None:
+        entry_cost = entry[0]
+    else:
+        loan = np.asarray(loan_type, dtype=np.int64)
+        if not np.all(np.isin(loan, (0, 1))):
+            raise ValueError("loan_type must contain only 0 and 1")
+        entry_cost = entry[loan]
+    cost = np.where(has_debt, continuation, entry_cost)
+    return float(cost) if cost.ndim == 0 else cost
 
 
 def realization(spec: dict[str, Any], x1: np.ndarray, period: int,
