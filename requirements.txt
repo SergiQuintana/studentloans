@@ -7,6 +7,7 @@ matplotlib
 seaborn
 statsmodels
 Jinja2
+dfols
 
 # used in some scripts (e.g., logistic regression)
 scikit-learn
