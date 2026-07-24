@@ -873,6 +873,15 @@ def get_all_evt_fast(i, x1, b, b1, ccp_real, utility_parameters, models,
     x1_key = f"{inv}"
     x1_new = ms.get_x1_new(inv[0])
     debt_pen = float(x1_new @ ms.debt_pen_vec)
+    # Loan-type debt-penalty shift (Spec B), resolved per task exactly as in
+    # the reference solver: nonzero only for the debt-averse loan type of a
+    # specification carrying a nonzero shift, so the zero-shift
+    # floating-point stream is unchanged.
+    task_debt_pen_shift = ms.resolve_task_debt_penalty_shift(
+        ms.budget_params, loan_type
+    )
+    if task_debt_pen_shift != 0.0:
+        debt_pen += task_debt_pen_shift
     task_cache = {
         "fin_help": {}, "wage0": {}, "pgrad": {},   # task-wide
         "work_flow": {}, "edu_flow": {},            # cleared every period

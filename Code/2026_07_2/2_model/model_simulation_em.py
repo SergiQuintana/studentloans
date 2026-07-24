@@ -1714,9 +1714,23 @@ def get_utility_agents(sigma_u,x1,x2,b,b1,financial_help,budget_psi,wage_psi,j,p
             "SIM_DEBT_PENALTY_CONVENTION must be 'legacy_multiplier' or "
             f"'single_flow'; received {SIM_DEBT_PENALTY_CONVENTION!r}"
         )
-    penalty = (
-        bs.debt_penalty(budget_params, x1) * penalty_multiplier
-    )[:, None]
+    # Loan-type debt-penalty shift (Spec B, heterogeneous debt aversion):
+    # added per agent to the parental-income penalty for the debt-averse
+    # latent loan type (loan type 0, the low-borrowing type; see
+    # budget_shock.DEBT_PENALTY_SHIFT_LOAN_TYPE). Guarded so that with a
+    # zero (or absent) shift, or without loan types, the penalty is exactly
+    # the current ``bs.debt_penalty`` output.
+    if (
+        loan_types is not None
+        and float(budget_params.get("debt_penalty_loan_type_shift", 0.0))
+        != 0.0
+    ):
+        base_penalty = bs.debt_penalty_by_loan_type(
+            budget_params, x1, loan_types
+        )
+    else:
+        base_penalty = bs.debt_penalty(budget_params, x1)
+    penalty = (base_penalty * penalty_multiplier)[:, None]
     u = u + penalty * (b1[None, :] > 0.0)
 
     # One-shot new-borrowing event cost (kappa). Charged only in the period

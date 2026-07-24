@@ -222,5 +222,137 @@ class NewBorrowingCostTests(unittest.TestCase):
         self.assertEqual(float(mean), 1000.0 + cells.index(205))
 
 
+class LoanTypeDebtPenaltyShiftTests(unittest.TestCase):
+    KAPPA = np.array([-500.0, -250.0, -75.0])
+    SHIFT = -0.8
+
+    def _spec(self, with_kappa=False, with_shift=False):
+        cells = _multicell_cells()
+        vector = _multicell_vector(cells)
+        if with_kappa:
+            vector = np.concatenate((vector, self.KAPPA))
+        if with_shift:
+            vector = np.concatenate((vector, [self.SHIFT]))
+        return bs.unpack_parental_income_multicell_estimation_vector(
+            vector, cells, index_kind="education_cell"
+        )
+
+    def test_vector_sizes(self):
+        self.assertEqual(bs.N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS, 1)
+        self.assertEqual(bs.DEBT_PENALTY_SHIFT_LOAN_TYPE, 0)
+        self.assertEqual(bs.estimation_vector_size_multicell(10), 68)
+        self.assertEqual(
+            bs.estimation_vector_size_multicell(
+                10, include_loan_type_debt_penalty=True
+            ),
+            69,
+        )
+        self.assertEqual(
+            bs.estimation_vector_size_multicell(10, include_new_borrowing=True),
+            71,
+        )
+        self.assertEqual(
+            bs.estimation_vector_size_multicell(
+                10, include_new_borrowing=True,
+                include_loan_type_debt_penalty=True,
+            ),
+            72,
+        )
+
+    def test_all_four_layouts_unpack(self):
+        legacy = self._spec()
+        self.assertEqual(legacy["debt_penalty_loan_type_shift"], 0.0)
+        shift_only = self._spec(with_shift=True)
+        self.assertEqual(shift_only["debt_penalty_loan_type_shift"], self.SHIFT)
+        np.testing.assert_array_equal(
+            shift_only["new_borrow_cost_entry_by_loan_type"], np.zeros(2)
+        )
+        self.assertEqual(shift_only["new_borrow_cost_continuation"], 0.0)
+        kappa_only = self._spec(with_kappa=True)
+        self.assertEqual(kappa_only["debt_penalty_loan_type_shift"], 0.0)
+        np.testing.assert_array_equal(
+            kappa_only["new_borrow_cost_entry_by_loan_type"], self.KAPPA[:2]
+        )
+        both = self._spec(with_kappa=True, with_shift=True)
+        self.assertEqual(both["debt_penalty_loan_type_shift"], self.SHIFT)
+        np.testing.assert_array_equal(
+            both["new_borrow_cost_entry_by_loan_type"], self.KAPPA[:2]
+        )
+        self.assertEqual(both["new_borrow_cost_continuation"], self.KAPPA[2])
+        # The shift tail must not disturb the existing parameter mapping.
+        for spec in (shift_only, kappa_only, both):
+            np.testing.assert_array_equal(spec["mu_blocks"], legacy["mu_blocks"])
+            np.testing.assert_array_equal(spec["sigma_e"], legacy["sigma_e"])
+            np.testing.assert_array_equal(
+                spec["risk_aversion"], legacy["risk_aversion"]
+            )
+            np.testing.assert_array_equal(
+                spec["debt_pen_parinc"], legacy["debt_pen_parinc"]
+            )
+            np.testing.assert_array_equal(
+                spec["budget_resource_slope"], legacy["budget_resource_slope"]
+            )
+
+    def test_invalid_sizes_rejected(self):
+        cells = _multicell_cells()
+        vector = _multicell_vector(cells)
+        for bad_extra in (2, 5):
+            with self.assertRaises(ValueError):
+                bs.unpack_parental_income_multicell_estimation_vector(
+                    np.concatenate((vector, np.zeros(bad_extra))),
+                    cells, index_kind="education_cell",
+                )
+
+    def test_accessor_applies_shift_to_low_type_only(self):
+        spec = self._spec(with_shift=True)
+        x1 = np.column_stack((np.arange(1, 5), np.ones(4)))
+        base = bs.debt_penalty(spec, x1)
+        # loan_type=None applies no shift and reproduces debt_penalty exactly.
+        np.testing.assert_array_equal(
+            bs.debt_penalty_by_loan_type(spec, x1), base
+        )
+        loan_type = np.array([0, 1, 0, 1])
+        effective = bs.debt_penalty_by_loan_type(spec, x1, loan_type)
+        np.testing.assert_array_equal(
+            effective, base + self.SHIFT * (loan_type == 0)
+        )
+        with self.assertRaises(ValueError):
+            bs.debt_penalty_by_loan_type(spec, x1, np.array([0, 2, 0, 1]))
+
+    def test_accessor_zero_shift_is_identity(self):
+        spec = self._spec()
+        x1 = np.column_stack((np.arange(1, 5), np.ones(4)))
+        base = bs.debt_penalty(spec, x1)
+        np.testing.assert_array_equal(
+            bs.debt_penalty_by_loan_type(spec, x1, np.array([0, 1, 0, 1])),
+            base,
+        )
+
+    def test_validate_defaults_missing_key_on_legacy_dict(self):
+        spec = self._spec()
+        del spec["debt_penalty_loan_type_shift"]
+        validated = bs.validate(spec)
+        self.assertEqual(validated["debt_penalty_loan_type_shift"], 0.0)
+        spec["debt_penalty_loan_type_shift"] = np.nan
+        with self.assertRaises(ValueError):
+            bs.validate(spec)
+
+    def test_save_load_round_trip_preserves_shift(self):
+        spec = self._spec(with_kappa=True, with_shift=True)
+        original_est = bs.EST
+        with tempfile.TemporaryDirectory() as directory:
+            bs.EST = lambda *parts: os.path.join(directory, *map(str, parts))
+            try:
+                bs.save(spec, raw_vector=np.zeros(72))
+                loaded = bs.load()
+            finally:
+                bs.EST = original_est
+        self.assertEqual(loaded["debt_penalty_loan_type_shift"], self.SHIFT)
+        np.testing.assert_array_equal(
+            loaded["new_borrow_cost_entry_by_loan_type"], self.KAPPA[:2]
+        )
+        np.testing.assert_array_equal(loaded["mu_blocks"], spec["mu_blocks"])
+
+
 if __name__ == "__main__":
     unittest.main()

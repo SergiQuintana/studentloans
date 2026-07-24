@@ -146,7 +146,10 @@ BUDGET_SMM_OPTIMIZER = "hybrid"
 #   BUDGET_SMM_MOMENT_SPEC = "flow_split_stock" -> entry/continuation moments
 #       split by observed beginning-of-period debt + at-cap share.
 ESTIMATE_NEW_BORROWING_COST = False
-BUDGET_SMM_MOMENT_SPEC = "flow_plus_stock"
+BUDGET_SMM_MOMENT_SPEC = "flow_split_stock"
+# Spec B, heterogeneous debt aversion (loan-type debt-penalty shift, always the
+# last vector entry; sizes 68/69/71/72): see the master plan.
+ESTIMATE_LOAN_TYPE_DEBT_PENALTY = True
 
 if __name__ == '__main__':
     
@@ -324,6 +327,7 @@ if __name__ == '__main__':
             print("Estimation of the Budget Shock")
 
             mfd.ESTIMATE_NEW_BORROWING_COST = ESTIMATE_NEW_BORROWING_COST
+            mfd.ESTIMATE_LOAN_TYPE_DEBT_PENALTY = ESTIMATE_LOAN_TYPE_DEBT_PENALTY
             estimate_budget_shock_all_education(
                 draws=BUDGET_SMM_DRAWS,
                 maxiter=BUDGET_SMM_MAXITER,

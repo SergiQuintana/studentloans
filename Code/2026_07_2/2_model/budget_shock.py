@@ -13,6 +13,14 @@ parameters charged once per borrowing event (``b_next > (1+r)*b_current``):
 entry costs by latent loan type when current debt is zero, and one shared
 continuation cost when current debt is positive. Legacy 68-entry vectors and
 bundles without the block behave exactly as before (zero costs).
+
+An optional loan-type debt-penalty shift (``debt_penalty_loan_type_shift``,
+Spec B: heterogeneous debt aversion) adds one flow-utility parameter to the
+per-period debt penalty of the debt-averse latent loan type
+(``DEBT_PENALTY_SHIFT_LOAN_TYPE``): effective penalty for individual ``i`` is
+``debt_pen_parinc[g_i] + shift * 1{loan_type_i == DEBT_PENALTY_SHIFT_LOAN_TYPE}``.
+It is always the LAST vector entry, after whatever kappa tail is active.
+Legacy vectors and bundles without it behave exactly as before (zero shift).
 """
 
 from __future__ import annotations
@@ -30,6 +38,14 @@ N_MEAN_PARAMETERS = 7
 N_RISK_PARAMETERS = 4
 N_DEBT_PENALTY_PARAMETERS = 4
 N_NEW_BORROWING_PARAMETERS = 3
+N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS = 1
+# Latent loan type that receives the additive debt-penalty shift. The
+# loan-type moments order type 0 as the "low"-borrowing type and type 1 as
+# the "high"-borrowing type (see model_fitloans_dynamic
+# ``parental_income_loan_type_distribution_moments``); the LOW-borrowing type
+# is the debt-averse one, so the shift (more negative = more averse)
+# attaches to loan type 0.
+DEBT_PENALTY_SHIFT_LOAN_TYPE = 0
 DEBT_PENALTY_PARAMETERIZATION = "baseline_plus_deviations"
 LOAN_HETEROGENEITY_MODES = ("homogeneous", "mean", "variance", "both")
 INDEX_KINDS = ("model_period", "education_cell")
@@ -147,8 +163,15 @@ def estimation_vector_size(periods, loan_heterogeneity: str = "homogeneous") -> 
 
 def estimation_vector_size_multicell(
     n_cells: int, include_new_borrowing: bool = False,
+    include_loan_type_debt_penalty: bool = False,
 ) -> int:
-    """Number of SMM parameters in the multicell parental-income vector."""
+    """Number of SMM parameters in the multicell parental-income vector.
+
+    Tail layout (each block optional, in this order): three new-borrowing
+    costs (kappa), then one loan-type debt-penalty shift. With ten cells the
+    accepted sizes are 68 (base), 69 (base + shift), 71 (base + kappa), and
+    72 (base + kappa + shift); the shift is always the last entry.
+    """
     n_cells = int(n_cells)
     if n_cells < 2:
         raise ValueError("The multicell parameterization requires at least two cells.")
@@ -158,6 +181,8 @@ def estimation_vector_size_multicell(
     )
     if include_new_borrowing:
         size += N_NEW_BORROWING_PARAMETERS
+    if include_loan_type_debt_penalty:
+        size += N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS
     return size
 
 
@@ -303,30 +328,49 @@ def unpack_parental_income_multicell_estimation_vector(
     penalties: [kappa0_low, kappa0_high, kappa1], the loan-type entry costs at
     zero current debt and the shared continuation cost with positive current
     debt.  Legacy vectors without them unpack to zero costs.
+
+    A further optional tail entry, ALWAYS the last one after whatever kappa
+    tail is active, is ``debt_penalty_loan_type_shift``: the additive
+    per-period debt-penalty shift of the debt-averse latent loan type
+    (``DEBT_PENALTY_SHIFT_LOAN_TYPE``, the low-borrowing type 0).  Accepted
+    sizes are therefore base (68 with ten cells), base+1 (shift only),
+    base+3 (kappa only), and base+4 (kappa plus shift).  Vectors without it
+    unpack to a zero shift.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     periods = np.asarray(periods, dtype=np.int64).reshape(-1)
     block_size = PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL * periods.size
     expected = block_size + N_RISK_PARAMETERS + N_DEBT_PENALTY_PARAMETERS
+    expected_shift = expected + N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS
     expected_extended = expected + N_NEW_BORROWING_PARAMETERS
+    expected_extended_shift = (
+        expected_extended + N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS
+    )
     if periods.size < 2:
         raise ValueError("The multicell parameterization requires at least two cells.")
     if np.unique(periods).size != periods.size:
         raise ValueError("Multicell education-cell codes must be unique.")
-    if vector.size not in (expected, expected_extended):
+    if vector.size not in (
+        expected, expected_shift, expected_extended, expected_extended_shift,
+    ):
         raise ValueError(
             f"Multicell parental-income vector has {vector.size} entries; "
-            f"expected {expected} (legacy) or {expected_extended} "
-            f"(with new-borrowing costs)."
+            f"expected {expected} (legacy), {expected_shift} (with the "
+            f"loan-type debt-penalty shift), {expected_extended} (with "
+            f"new-borrowing costs), or {expected_extended_shift} (with both)."
         )
     shared_risk_aversion = vector[block_size:block_size + N_RISK_PARAMETERS]
     debt_levels = vector[block_size + N_RISK_PARAMETERS:expected]
-    if vector.size == expected_extended:
+    if vector.size in (expected_extended, expected_extended_shift):
         new_borrow_entry = vector[expected:expected + 2].copy()
         new_borrow_continuation = float(vector[expected + 2])
     else:
         new_borrow_entry = np.zeros(2, dtype=np.float64)
         new_borrow_continuation = 0.0
+    if vector.size in (expected_shift, expected_extended_shift):
+        debt_penalty_loan_type_shift = float(vector[-1])
+    else:
+        debt_penalty_loan_type_shift = 0.0
     index_kind = str(index_kind)
     if index_kind not in INDEX_KINDS:
         raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
@@ -364,6 +408,7 @@ def unpack_parental_income_multicell_estimation_vector(
         "new_borrow_cost_entry_by_loan_type": new_borrow_entry,
         "new_borrow_cost_continuation": new_borrow_continuation,
         "new_borrowing_cost_timing": NEW_BORROWING_COST_TIMING,
+        "debt_penalty_loan_type_shift": debt_penalty_loan_type_shift,
         "estimation_parameterization": "parental_income_basic_multicell_shared_risk_debt",
     }
     if index_kind == "education_cell":
@@ -453,6 +498,12 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         out.get("new_borrow_cost_continuation", 0.0)
     )
     out["new_borrowing_cost_timing"] = NEW_BORROWING_COST_TIMING
+    # Legacy bundles without the loan-type debt-penalty shift (Spec B,
+    # heterogeneous debt aversion) unpack to a zero shift: exact current
+    # behavior.
+    out["debt_penalty_loan_type_shift"] = float(
+        out.get("debt_penalty_loan_type_shift", 0.0)
+    )
     if out["mu_blocks"].shape != (p, N_MEAN_PARAMETERS):
         raise ValueError("mu_blocks must have shape (number of periods, 7)")
     if out["sigma_e"].shape != (p,) or np.any(out["sigma_e"] <= 0):
@@ -491,6 +542,8 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("new_borrow_cost_entry_by_loan_type contains non-finite values")
     if not np.isfinite(out["new_borrow_cost_continuation"]):
         raise ValueError("new_borrow_cost_continuation must be finite")
+    if not np.isfinite(out["debt_penalty_loan_type_shift"]):
+        raise ValueError("debt_penalty_loan_type_shift must be finite")
     if (
         "risk_aversion_by_loan_type" in out
         and not np.all(np.isfinite(out["risk_aversion_by_loan_type"]))
@@ -682,6 +735,33 @@ def debt_penalty(spec: dict[str, Any], x1: np.ndarray) -> np.ndarray:
         return penalty
     # Backward compatibility: old length-four arrays represented group levels.
     return coefficients[par - 1]
+
+
+def debt_penalty_by_loan_type(
+    spec: dict[str, Any], x1: np.ndarray, loan_type=None,
+) -> np.ndarray:
+    """Per-individual effective debt penalty including the loan-type shift.
+
+    Effective penalty for individual ``i`` is
+    ``debt_pen_parinc[g_i] + shift * 1{loan_type_i == DEBT_PENALTY_SHIFT_LOAN_TYPE}``
+    where ``shift = spec["debt_penalty_loan_type_shift"]`` (more negative =
+    more debt-averse) attaches to loan type 0, the low-borrowing type.
+    Vectorized over ``x1`` rows and ``loan_type`` entries. With
+    ``loan_type=None`` no shift is applied and the result is exactly
+    ``debt_penalty(spec, x1)``; the same holds for a zero (or absent) shift,
+    so legacy specifications are numerically unchanged. Note that
+    ``debt_penalty_design_vector`` deliberately excludes the shift: the
+    solvers add the per-task shift separately.
+    """
+    base = debt_penalty(spec, x1)
+    shift = float(spec.get("debt_penalty_loan_type_shift", 0.0))
+    if loan_type is None or shift == 0.0:
+        return base
+    loan = np.asarray(loan_type, dtype=np.int64)
+    if not np.all(np.isin(loan, (0, 1))):
+        raise ValueError("loan_type must contain only 0 and 1")
+    loan, base = np.broadcast_arrays(loan, base)
+    return base + shift * (loan == DEBT_PENALTY_SHIFT_LOAN_TYPE)
 
 
 def debt_penalty_design_vector(spec: dict[str, Any]) -> np.ndarray:

@@ -144,15 +144,34 @@ def reload_budgetshock_params(raise_if_missing=True):
     global sigma_u_parinc, budget_params, debt_pen_vec
     global new_borrow_entry_by_type, new_borrow_continuation
     global new_borrow_kappa0, new_borrow_kappa1
+    global task_debt_pen_shift
     (sigma_u_parinc, budget_params, debt_pen_vec,
      new_borrow_entry_by_type, new_borrow_continuation) = load_params_frombudget()
     # Reset the per-task scalars to the loan-type-0 defaults; ``get_all_evt``
     # re-selects them for the joint type it solves.
     new_borrow_kappa0 = float(new_borrow_entry_by_type[0])
     new_borrow_kappa1 = float(new_borrow_continuation)
+    task_debt_pen_shift = resolve_task_debt_penalty_shift(budget_params, 0)
     if raise_if_missing and (budget_params is None):
         raise FileNotFoundError(f"Missing {EST('budgetshock_params.npy')}")
     return sigma_u_parinc, budget_params, debt_pen_vec
+
+
+def resolve_task_debt_penalty_shift(spec, loan_type):
+    """Scalar loan-type debt-penalty shift for one task's resolved loan type.
+
+    Spec B (heterogeneous debt aversion): the shift attaches only to the
+    debt-averse latent loan type ``bs.DEBT_PENALTY_SHIFT_LOAN_TYPE`` (loan
+    type 0, the low-borrowing type); every other type — and every bundle
+    without the key or with a zero shift — resolves to exactly 0.0, keeping
+    the zero-shift floating-point stream unchanged.
+    """
+    if spec is None:
+        return 0.0
+    shift = float(spec.get("debt_penalty_loan_type_shift", 0.0))
+    if shift == 0.0 or int(loan_type) != bs.DEBT_PENALTY_SHIFT_LOAN_TYPE:
+        return 0.0
+    return shift
 
 def build_debt_pen_vec(budget_params):
     """
@@ -1537,9 +1556,16 @@ def get_conditional(
 
     global debt_pen_vec
     global new_borrow_kappa0, new_borrow_kappa1
+    global task_debt_pen_shift
 
     # scalar penalty for this individual (depends only on x1_new)
     debt_pen = float(x1_new @ debt_pen_vec)   # typically negative
+    # Loan-type debt-penalty shift (Spec B): nonzero only when the task's
+    # latent loan type is the debt-averse one AND the loaded specification
+    # carries a nonzero shift. Guarded so the zero-shift floating-point
+    # stream is unchanged.
+    if task_debt_pen_shift != 0.0:
+        debt_pen += task_debt_pen_shift
 
     nb = b.shape[0]
     Q  = e.shape[0]
@@ -2489,6 +2515,7 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
     a preselected tuple of numeric arrays.
     """
     global task_loan_type, new_borrow_kappa0, new_borrow_kappa1
+    global task_debt_pen_shift
     time.sleep(0)
 
     financial_parameters = get_type_financial_parameters(em_type)
@@ -2498,13 +2525,17 @@ def get_all_evt(i,x1,b,b1,ccp_real,utility_parameters,models,
     models = 0
 
     # Latent loan component of this joint task. It selects the new-borrowing
-    # entry cost and is threaded through every budget-shock call via the
-    # per-task module globals (a no-op while the production specification is
-    # loan-homogeneous, same pattern as ``debt_pen_vec``).
+    # entry cost and the loan-type debt-penalty shift, and is threaded through
+    # every budget-shock call via the per-task module globals (a no-op while
+    # the production specification is loan-homogeneous, same pattern as
+    # ``debt_pen_vec``).
     _, _, _, loan_type = type_components(em_type)
     task_loan_type = int(loan_type)
     new_borrow_kappa0 = float(new_borrow_entry_by_type[task_loan_type])
     new_borrow_kappa1 = float(new_borrow_continuation)
+    task_debt_pen_shift = resolve_task_debt_penalty_shift(
+        budget_params, task_loan_type
+    )
 
     sigma_u = float(
         bs.risk_aversion(budget_params, x1[i, :], loan_type=task_loan_type)
@@ -2563,6 +2594,11 @@ def _trace_expected_conditional_debug(
         raise NotImplementedError(
             "_trace_expected_conditional_debug does not implement the "
             "new-borrowing event cost; rerun with zero kappas."
+        )
+    if task_debt_pen_shift != 0.0:
+        raise NotImplementedError(
+            "_trace_expected_conditional_debug does not implement the "
+            "loan-type debt-penalty shift; rerun with a zero task shift."
         )
     nb = np.shape(b)[0]
     e_nodes, we = get_quadrature_wage(deg, mu, j)
@@ -3944,6 +3980,10 @@ def get_debt_range():
 task_loan_type = 0
 new_borrow_kappa0 = float(new_borrow_entry_by_type[0])
 new_borrow_kappa1 = float(new_borrow_continuation)
+# Per-task loan-type debt-penalty shift (Spec B, heterogeneous debt
+# aversion); the loan-type-0 default mirrors the kappa scalars above and is
+# exactly 0.0 for every bundle without a nonzero shift.
+task_debt_pen_shift = resolve_task_debt_penalty_shift(budget_params, 0)
 
 #simulate_all_states(11)
 #a = np.load("states/states_t8.npy")

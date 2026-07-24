@@ -116,6 +116,16 @@ STOCK_MOMENT_WEIGHT = 2.0
 # identical to the pre-kappa code.
 ESTIMATE_NEW_BORROWING_COST = False
 NEW_BORROWING_COST_BOUNDS = (-2.0, 0.0)
+# Estimate the loan-type debt-penalty shift (Spec B, heterogeneous debt
+# aversion): one shared parameter added to the per-period debt penalty of the
+# debt-averse latent loan type (loan type 0, the low-borrowing type; see
+# budget_shock.DEBT_PENALTY_SHIFT_LOAN_TYPE). Composable with
+# ESTIMATE_NEW_BORROWING_COST; the shift is ALWAYS the last vector entry after
+# whatever kappa tail is active (sizes 68/69/71/72). When False the production
+# SMM keeps its exact current behavior; a zero shift is numerically identical
+# to the pre-shift code.
+ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
+LOAN_TYPE_DEBT_PENALTY_BOUNDS = (-3.0, 0.0)
 EDUCATION_CELL_RESOURCE_MODES = ("simulated", "observed")
 DEFAULT_PRIMARY_MOMENT_WEIGHT = 4.0
 DEFAULT_EDUCATION_CELL_MAXITER = 5000
@@ -1511,13 +1521,18 @@ def precompute_bounds_indices(previousdebt, state, choices):
 EVAL_COUNTER = 0
 
 
-def discounted_explicit_horizon_debt_penalty(spec, x1, model_period):
+def discounted_explicit_horizon_debt_penalty(spec, x1, model_period, loan_type=None):
     """Present value of the common parinc flow penalty through period T-1.
 
     This is the SMM shortcut for the recursively repeated flow penalty in the
     Bellman solver. It deliberately excludes the terminal continuation at T.
+
+    ``loan_type`` resolves the optional loan-type debt-penalty shift (Spec B,
+    heterogeneous debt aversion) per individual. With ``loan_type=None`` or a
+    zero (or absent) shift the flow penalty is exactly ``bs.debt_penalty``,
+    so every existing call path is numerically unchanged.
     """
-    flow_penalty = bs.debt_penalty(spec, x1).astype(np.float64)
+    flow_penalty = bs.debt_penalty_by_loan_type(spec, x1, loan_type).astype(np.float64)
     multiplier = bs.explicit_debt_penalty_multiplier(
         model_period, beta=beta, terminal_period=T
     )
@@ -2698,8 +2713,11 @@ def _pool_sampled_education_cell_evaluation(
             ),
         ), dtype=np.float64
     )
+    # The per-individual penalty resolves the optional loan-type shift from
+    # the pooled sampled loan type; with a zero (or absent) shift the arrays
+    # are exactly the current ``bs.debt_penalty`` output.
     pooled["debtpen_i"] = discounted_explicit_horizon_debt_penalty(
-        spec, x1, pooled["model_period"]
+        spec, x1, pooled["model_period"], loan_type=pooled["loan_type"]
     )
     # One-shot new-borrowing costs, resolved per individual from the sampled
     # loan type and the observed beginning-of-period debt. Specifications
@@ -2761,7 +2779,7 @@ def parental_income_cell_loss_and_residuals(
 def _evaluate_sampled_parental_income_cell(
     full_params, data_moments, sample_by_period, cell_code, education,
     program_year, moment_spec, primary_moment_weight,
-    new_borrowing_costs=None,
+    new_borrowing_costs=None, loan_type_debt_penalty_shift=None,
 ):
     """Evaluate one cell's parental-income moments without a global count.
 
@@ -2769,6 +2787,8 @@ def _evaluate_sampled_parental_income_cell(
     ``[kappa0_low, kappa0_high, kappa1]`` estimated jointly across cells. It
     is injected into the per-cell specification after unpacking, because the
     14-entry per-cell vector deliberately does not carry the kappa block.
+    ``loan_type_debt_penalty_shift`` is the optional shared loan-type
+    debt-penalty shift (Spec B), injected the same way for the same reason.
     """
     spec = bs.unpack_parental_income_estimation_vector(
         full_params, [cell_code], index_kind="education_cell"
@@ -2786,6 +2806,10 @@ def _evaluate_sampled_parental_income_cell(
             new_borrowing_costs[:2].copy()
         )
         spec["new_borrow_cost_continuation"] = float(new_borrowing_costs[2])
+    if loan_type_debt_penalty_shift is not None:
+        spec["debt_penalty_loan_type_shift"] = float(
+            loan_type_debt_penalty_shift
+        )
     pooled = _pool_sampled_education_cell_evaluation(
         sample_by_period, spec, education, program_year
     )
@@ -2844,6 +2868,20 @@ def _initialize_cell_smm_worker(
     set_num_threads(int(numba_threads))
 
 
+def _split_loan_type_debt_penalty_tail(params, include_loan_type_debt_penalty):
+    """Strip the trailing loan-type debt-penalty shift when it is estimated.
+
+    The shift is ALWAYS the last vector entry, after whatever kappa tail is
+    active (layouts 68/69/71/72). Returns ``(core_params, shift)`` where
+    ``shift`` is ``None`` with the flag off, so ``_split_multicell_shared_tail``
+    consumes ``core_params`` exactly as before.
+    """
+    params = np.asarray(params, dtype=np.float64)
+    if not include_loan_type_debt_penalty:
+        return params, None
+    return params[:-1], float(params[-1])
+
+
 def _split_multicell_shared_tail(params, n_cells, include_new_borrowing):
     """Slice the flat multicell vector's shared tail after the cell blocks.
 
@@ -2873,6 +2911,7 @@ def _evaluate_cell_smm_worker(task):
     """Evaluate one education cell for one common parameter proposal."""
     cell_index, block, shared_risk, shared_debt = task[:4]
     new_borrowing = task[4] if len(task) > 4 else None
+    loan_type_shift = task[5] if len(task) > 5 else None
     context = _CELL_WORKER_CONTEXTS[cell_index]
     full_params = np.concatenate(
         (block[0:5], shared_risk, shared_debt, block[5:6])
@@ -2888,6 +2927,7 @@ def _evaluate_cell_smm_worker(task):
             _CELL_WORKER_MOMENT_SPEC,
             _CELL_WORKER_PRIMARY_WEIGHT,
             new_borrowing_costs=new_borrowing,
+            loan_type_debt_penalty_shift=loan_type_shift,
         )
     )
     return cell_index, loss, simulated, sim_new_share, residuals
@@ -2910,15 +2950,25 @@ def minimize_distance_education_cells_parental_income(
     params = np.asarray(params, dtype=np.float64)
     n_cells = len(contexts)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+    # The loan-type debt-penalty shift, when estimated, is always the last
+    # entry; strip it first so the kappa/risk/debt tail slicing is unchanged.
+    core_params, shared_loan_type_shift = _split_loan_type_debt_penalty_tail(
+        params, ESTIMATE_LOAN_TYPE_DEBT_PENALTY
+    )
     shared_risk, shared_debt, shared_new_borrowing = (
         _split_multicell_shared_tail(
-            params, n_cells, ESTIMATE_NEW_BORROWING_COST
+            core_params, n_cells, ESTIMATE_NEW_BORROWING_COST
         )
     )
     tasks = []
     for cell_index in range(n_cells):
         block = params[cell_index * block_size:(cell_index + 1) * block_size]
-        if shared_new_borrowing is None:
+        if shared_loan_type_shift is not None:
+            tasks.append((
+                cell_index, block, shared_risk, shared_debt,
+                shared_new_borrowing, shared_loan_type_shift,
+            ))
+        elif shared_new_borrowing is None:
             tasks.append((cell_index, block, shared_risk, shared_debt))
         else:
             tasks.append((
@@ -2947,6 +2997,9 @@ def minimize_distance_education_cells_parental_income(
                     new_borrowing_costs=(
                         task[4] if len(task) > 4 else None
                     ),
+                    loan_type_debt_penalty_shift=(
+                        task[5] if len(task) > 5 else None
+                    ),
                 )
             )
             results.append(
@@ -2973,6 +3026,12 @@ def minimize_distance_education_cells_parental_income(
                 "shared new-borrowing costs (one-shot, no multiplier): "
                 f"kappa0 low/high={np.round(shared_new_borrowing[:2], 4)}; "
                 f"kappa1 continuation={round(float(shared_new_borrowing[2]), 4)}"
+            )
+        if shared_loan_type_shift is not None:
+            print(
+                "loan-type debt-penalty shift (added to loan type "
+                f"{bs.DEBT_PENALTY_SHIFT_LOAN_TYPE}, the low-borrowing/"
+                f"debt-averse type): {round(shared_loan_type_shift, 4)}"
             )
         print("#" * 132)
         for context, evaluation in zip(contexts, results):
@@ -3716,8 +3775,12 @@ def fit_education_cells(
     n_cells = len(cells)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
     legacy_expected = bs.estimation_vector_size_multicell(n_cells)
-    expected = bs.estimation_vector_size_multicell(
+    pre_shift_expected = bs.estimation_vector_size_multicell(
         n_cells, include_new_borrowing=ESTIMATE_NEW_BORROWING_COST
+    )
+    expected = bs.estimation_vector_size_multicell(
+        n_cells, include_new_borrowing=ESTIMATE_NEW_BORROWING_COST,
+        include_loan_type_debt_penalty=ESTIMATE_LOAN_TYPE_DEBT_PENALTY,
     )
     if initial is None:
         cell_block = np.array(
@@ -3754,14 +3817,27 @@ def fit_education_cells(
             "(kappa0 low/high, kappa1) to the legacy "
             f"{legacy_expected}-parameter vector."
         )
+    if ESTIMATE_LOAN_TYPE_DEBT_PENALTY and initial.size == pre_shift_expected:
+        # Restart upgrade: a saved vector without the shift starts the
+        # extended specification at a zero shift, so the first evaluation
+        # reproduces the saved estimate exactly.
+        initial = np.concatenate((initial, [0.0]))
+        print(
+            "[initial] Appending a zero loan-type debt-penalty shift to the "
+            f"{pre_shift_expected}-parameter vector."
+        )
     if initial.size != expected:
         raise ValueError(
             f"Multi-cell initial vector has {initial.size} entries; expected {expected} "
             f"({block_size} per cell plus four shared risk-aversion and four "
             "shared debt-penalty levels"
             + (
-                " and three shared new-borrowing costs)."
-                if ESTIMATE_NEW_BORROWING_COST else ")."
+                " and three shared new-borrowing costs"
+                if ESTIMATE_NEW_BORROWING_COST else ""
+            )
+            + (
+                " and one shared loan-type debt-penalty shift)."
+                if ESTIMATE_LOAN_TYPE_DEBT_PENALTY else ")."
             )
         )
     cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
@@ -3782,6 +3858,10 @@ def fit_education_cells(
         bounds.extend(
             [NEW_BORROWING_COST_BOUNDS] * bs.N_NEW_BORROWING_PARAMETERS
         )
+    if ESTIMATE_LOAN_TYPE_DEBT_PENALTY:
+        # The shift is a per-period flow-utility penalty like the shared
+        # debt penalties themselves; always the last vector entry.
+        bounds.append(LOAN_TYPE_DEBT_PENALTY_BOUNDS)
 
     def make_initial_simplex(center):
         center = np.asarray(center, dtype=np.float64)
@@ -3794,14 +3874,21 @@ def fit_education_cells(
             slope_index = cell_index * block_size + 5
             if center[slope_index] == 0.0:
                 simplex[slope_index + 1, slope_index] = 100.0
+        # The loan-type debt-penalty shift, when estimated, occupies the last
+        # entry; the kappa block then sits immediately before it.
+        shift_tail = int(ESTIMATE_LOAN_TYPE_DEBT_PENALTY)
         if ESTIMATE_NEW_BORROWING_COST:
             # A zero-initialized kappa needs a negative in-bounds step of a
             # meaningful flow-utility size, not the tiny default 0.00025.
             for kappa_index in range(
-                center.size - bs.N_NEW_BORROWING_PARAMETERS, center.size
+                center.size - bs.N_NEW_BORROWING_PARAMETERS - shift_tail,
+                center.size - shift_tail,
             ):
                 if center[kappa_index] == 0.0:
                     simplex[kappa_index + 1, kappa_index] = -0.25
+        if ESTIMATE_LOAN_TYPE_DEBT_PENALTY and center[-1] == 0.0:
+            # Same reasoning for a zero-initialized shift.
+            simplex[center.size, center.size - 1] = -0.25
         return simplex
 
     if cell_workers is None:
@@ -4210,8 +4297,12 @@ def estimate_budget_shock_all_education(
 
     cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
     legacy_vector_size = bs.estimation_vector_size_multicell(len(cells))
-    expected_size = bs.estimation_vector_size_multicell(
+    pre_shift_vector_size = bs.estimation_vector_size_multicell(
         len(cells), include_new_borrowing=ESTIMATE_NEW_BORROWING_COST
+    )
+    expected_size = bs.estimation_vector_size_multicell(
+        len(cells), include_new_borrowing=ESTIMATE_NEW_BORROWING_COST,
+        include_loan_type_debt_penalty=ESTIMATE_LOAN_TYPE_DEBT_PENALTY,
     )
     if initial is None and restart:
         raw_path = EST("budgetshock_bestx.npy")
@@ -4232,13 +4323,31 @@ def estimate_budget_shock_all_education(
                 and candidate.size == legacy_vector_size
             ):
                 # A saved legacy vector restarts the extended specification;
-                # fit_education_cells appends three zero kappas so the first
-                # evaluation reproduces the saved estimate exactly.
+                # fit_education_cells appends three zero kappas (and, when
+                # ESTIMATE_LOAN_TYPE_DEBT_PENALTY is also set, a zero shift)
+                # so the first evaluation reproduces the saved estimate
+                # exactly.
                 initial = candidate
                 print(
                     f"[restart] Using legacy {legacy_vector_size}-parameter "
                     f"estimate {raw_path}; the three new-borrowing costs "
                     "start at zero."
+                )
+            elif (
+                ESTIMATE_LOAN_TYPE_DEBT_PENALTY
+                and candidate.size in (
+                    legacy_vector_size, pre_shift_vector_size,
+                )
+            ):
+                # A saved vector without the shift tail restarts the
+                # extended specification; fit_education_cells appends a zero
+                # loan-type debt-penalty shift so the first evaluation
+                # reproduces the saved estimate exactly.
+                initial = candidate
+                print(
+                    f"[restart] Using saved {candidate.size}-parameter "
+                    f"estimate {raw_path}; the loan-type debt-penalty "
+                    "shift starts at zero."
                 )
         if initial is None and current is not None:
             print(
@@ -4295,6 +4404,12 @@ def estimate_budget_shock_all_education(
             "smm_debt_penalty_timing": bs.DEBT_PENALTY_TIMING,
             "smm_estimate_new_borrowing_cost": bool(ESTIMATE_NEW_BORROWING_COST),
             "smm_new_borrowing_cost_timing": bs.NEW_BORROWING_COST_TIMING,
+            "smm_estimate_loan_type_debt_penalty": bool(
+                ESTIMATE_LOAN_TYPE_DEBT_PENALTY
+            ),
+            "smm_debt_penalty_shift_loan_type": int(
+                bs.DEBT_PENALTY_SHIFT_LOAN_TYPE
+            ),
             "smm_optimizer": optimizer,
             "smm_annealing_maxfun": int(annealing_maxfun),
             "smm_cell_workers": int(result.smm_cell_workers),
