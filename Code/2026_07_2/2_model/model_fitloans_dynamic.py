@@ -23,6 +23,7 @@ import joblib
 import os
 import hashlib
 import json
+import time
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -108,8 +109,40 @@ SPLIT_MOMENT_SPEC = "flow_split_stock"
 EXTENDED_PARENTAL_INCOME_MOMENT_SPECS = (
     PARENTAL_INCOME_MOMENT_SPECS + (SPLIT_MOMENT_SPEC,)
 )
+# Need-mixture moment specification (see ``parental_income_need_mixture_moments``
+# and the graduation block below). It extends flow_split_stock with three
+# shape moments of the positive-flow distribution, redefines the at-cap share
+# as the top-of-grid choice, and adds one pooled graduation/persistence block.
+# EXTENDED_PARENTAL_INCOME_MOMENT_SPECS is deliberately left untouched so every
+# existing validation keeps its exact current membership; the multicell
+# estimator validates against the tuple below instead.
+NEED_MIXTURE_MOMENT_SPEC = "need_mixture_v1"
+MULTICELL_PARENTAL_INCOME_MOMENT_SPECS = (
+    EXTENDED_PARENTAL_INCOME_MOMENT_SPECS + (NEED_MIXTURE_MOMENT_SPEC,)
+)
 SPLIT_MOMENT_MINIMUM_GROUP_N = 30
 STOCK_MOMENT_WEIGHT = 2.0
+# Dollar threshold of the "small loan" moment: the share of positive flows
+# below it is the sub-$1,000 hole that discriminates the mixture design
+# (3.58% in the data against 6-10% under a fitted lognormal).
+SMALL_FLOW_THRESHOLD = 1000.0
+# Per-moment standardizing floors of need_mixture_v1, in the moment ordering
+# of ``parental_income_need_mixture_moments``. They replace the single
+# max(|data|, 1e-6) denominator, which explodes on a near-zero data moment.
+# Rates and shares are floored at 0.02, dollar amounts at $500.
+NEED_MIXTURE_SCALE_FLOORS = (
+    0.02, 0.02, 500.0, 500.0, 0.02, 500.0, 500.0, 0.02,
+)
+# Graduation block (see ``graduation_block_moments``): four-year completers are
+# persons with at least four enrolled years at education 2, and the pooled
+# persistence moments use persons with at least three enrolled years.
+GRADUATION_EDUCATION = 2
+GRADUATION_MINIMUM_ENROLLED_YEARS = 4
+PERSISTENCE_MINIMUM_ENROLLED_YEARS = 3
+GRADUATION_MOMENT_WEIGHTS = (4.0, 2.0, 1.0, 1.0)
+GRADUATION_SCALE_FLOORS = (0.02, 500.0, 500.0, 500.0)
+PERSISTENCE_MOMENT_WEIGHTS = (3.0, 3.0)
+PERSISTENCE_SCALE_FLOORS = (0.02, 0.05)
 # Estimate the one-shot new-borrowing event cost (kappa) block. When False,
 # the production SMM keeps its exact current behavior: a 68-entry multicell
 # vector, unchanged moments, and kernels whose zero-kappa path is numerically
@@ -126,6 +159,27 @@ NEW_BORROWING_COST_BOUNDS = (-2.0, 0.0)
 # to the pre-shift code.
 ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
 LOAN_TYPE_DEBT_PENALTY_BOUNDS = (-3.0, 0.0)
+# Estimate the two-component need mixture (budget_shock.NEED_MIXTURE_TIMING):
+# five shared parameters [a0, a_type, a_debt, mu_noneed, sigma_noneed] placed
+# after whatever kappa tail is active and before the loan-type debt-penalty
+# shift, which stays the last entry. When False the production SMM keeps its
+# exact current behavior: every shock goes through the single-normal
+# ``bs.realization`` path and the uniform component stream is never read.
+ESTIMATE_NEED_MIXTURE = False
+NEED_MIXTURE_LOGIT_BOUNDS = (-6.0, 6.0)
+NEED_MIXTURE_NONEED_MEAN_BOUNDS = (-20000.0, 20000.0)
+NEED_MIXTURE_NONEED_SIGMA_BOUNDS = (1.0, 20000.0)
+# Restart start values [a0, a_type, a_debt, mu_noneed, sigma_noneed] from the
+# fit-lab race (Agents_Readme/Tasks/2026_07_24_fit_research/
+# IMPLEMENTATION_PLAN.md, section 4): logits reproducing the observed
+# within-type entry rates (.0506/.5633) and continuation (~.84).
+NEED_MIXTURE_START = (-2.93, 3.19, 2.76, 0.0, 2000.0)
+# Freeze the four shared debt penalties at zero. They keep their slots in the
+# vector layout, so nothing is renumbered and every consumer still receives a
+# four-entry ``debt_pen_parinc``; the optimizer simply never varies them (see
+# ``multicell_free_parameter_mask``). With zero levels the unpacked
+# specification carries ``debt_pen_parinc = zeros(4)``.
+FREEZE_DEBT_PENALTY = False
 # Bounds of the four parental-income debt penalties (per-period flow-utility
 # units). Tightened (-1.0e6, 0.0) -> (-100.0, 0.0) on 2026-07-24 (researcher
 # decision): the previous estimation parked the penalties at -0.92e6..-1.0e6,
@@ -228,6 +282,87 @@ def save_budgetshock_estimates(
         print(f"[saved] {EST(f'{filename_prefix}_risk_aversion.npy')}")
         print(f"[saved] {EST(f'{filename_prefix}_params.npy')}")
     print(f"[saved] {EST(f'{filename_prefix}_bestx.npy')}")
+
+# ==============================================================================
+# Machine-readable SMM log
+
+# One JSON object per line, appended beside the human-readable run log the
+# driver writes (estimation_all_em._setup_run_log). The stdout fit tables are
+# unchanged; this file exists so a completed run can be analyzed without
+# parsing them.
+SMM_LOG_DIRECTORY = "logs"
+SMM_LOG_FILENAME = "budget_smm_evaluations.jsonl"
+
+
+def smm_log_path():
+    """Path of the machine-readable SMM log under Model/Estimates/logs/."""
+    return os.path.join(ENSURE_DIR(EST(SMM_LOG_DIRECTORY)), SMM_LOG_FILENAME)
+
+
+def append_smm_log_record(record):
+    """Append one JSON line; a logging failure never interrupts estimation.
+
+    Serialization errors are caught alongside filesystem errors: this log is a
+    convenience and must never be able to abort a multi-hour run.
+    """
+    try:
+        with open(smm_log_path(), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception as error:  # noqa: BLE001 - logging must not stop the run
+        print(f"WARNING: could not append to the SMM log: {error}")
+
+
+def _log_values(values, decimals=6):
+    """Plain rounded floats, so numpy arrays survive json.dumps."""
+    return [
+        round(float(value), decimals)
+        for value in np.asarray(values, dtype=np.float64).reshape(-1)
+    ]
+
+
+def decode_multicell_parameter_blocks(params, n_cells):
+    """Named blocks of the flat multicell vector, for the SMM log.
+
+    The tail is peeled in the vector's own order (kappa, need mixture,
+    loan-type shift) using the same helpers the objective uses, so a logged
+    record always describes the layout that was actually evaluated.
+    """
+    params = np.asarray(params, dtype=np.float64).reshape(-1)
+    block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+    core, loan_type_shift = _split_loan_type_debt_penalty_tail(
+        params, ESTIMATE_LOAN_TYPE_DEBT_PENALTY
+    )
+    core, need_mixture = _split_need_mixture_tail(core, ESTIMATE_NEED_MIXTURE)
+    shared_risk, shared_debt, new_borrowing = _split_multicell_shared_tail(
+        core, n_cells, ESTIMATE_NEW_BORROWING_COST
+    )
+    decoded = {
+        "cells": [
+            {
+                "mean_by_parinc": _log_values(
+                    params[index * block_size:index * block_size + 4], 3
+                ),
+                "sigma": round(float(params[index * block_size + 4]), 3),
+                "resource_slope": round(
+                    float(params[index * block_size + 5]), 4
+                ),
+            }
+            for index in range(int(n_cells))
+        ],
+        "risk_aversion": _log_values(shared_risk, 4),
+        "debt_penalty": _log_values(shared_debt, 4),
+    }
+    if new_borrowing is not None:
+        decoded["new_borrowing_costs"] = _log_values(new_borrowing, 4)
+    if need_mixture is not None:
+        decoded["mixture_logits"] = _log_values(need_mixture[:3], 4)
+        decoded["mixture_noneed_mean"] = round(float(need_mixture[3]), 3)
+        decoded["mixture_noneed_sigma"] = round(float(need_mixture[4]), 3)
+    if loan_type_shift is not None:
+        decoded["loan_type_debt_penalty_shift"] = round(
+            float(loan_type_shift), 4
+        )
+    return decoded
 
 # ==============================================================================
 # Store interp_dict in cache memory
@@ -960,6 +1095,108 @@ def parental_income_split_moments(
     )
 
 
+def parental_income_need_mixture_moments(
+    parinc, flow, begin_debt, stock, grid_cap, eps=0.01,
+    small_flow_threshold=SMALL_FLOW_THRESHOLD,
+):
+    """Eight debt-status-split moments for each model parinc group.
+
+    This is the ``need_mixture_v1`` moment specification: the five
+    ``flow_split_stock`` moments with the at-cap share redefined as the
+    top-of-grid CHOICE, plus three shape moments of the positive-flow
+    distribution. For every parental-income group the target ordering is:
+
+      1. share with a positive new-loan flow given beginning-of-period
+         debt == 0 (entry rate);
+      2. share with a positive new-loan flow given beginning debt > 0
+         (continuation rate);
+      3. mean positive flow given beginning debt == 0;
+      4. mean positive flow given beginning debt > 0;
+      5. share of positive flows whose end-of-period stock sits at the top
+         feasible grid point (``stock >= grid_cap``, the ``hi_idx`` choice);
+      6. standard deviation of positive flow;
+      7. 80th percentile of positive flow;
+      8. share of positive flows below ``small_flow_threshold`` dollars.
+
+    Moments 6--8 identify the shock dispersion, which ``flow_split_stock``
+    leaves to the single at-cap moment, and moment 8 is the sub-$1,000 hole
+    that separates the two mixture components. The at-cap share is the grid
+    choice on BOTH sides, because a dollar threshold understates simulated
+    bunching about threefold; ``grid_cap`` is ``debt_range[max_idx]``, the same
+    upper bound the debt search uses. Beginning-of-period debt is an OBSERVED
+    state, so the debt-status split is identical in data and simulation. Empty
+    groups receive the same ``eps`` numerical floor as the existing moments.
+    """
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    flow = np.asarray(flow, dtype=np.float64).reshape(-1)
+    begin_debt = np.asarray(begin_debt, dtype=np.float64).reshape(-1)
+    stock = np.asarray(stock, dtype=np.float64).reshape(-1)
+    grid_cap = np.asarray(grid_cap, dtype=np.float64).reshape(-1)
+    if not (
+        flow.size == begin_debt.size == stock.size == grid_cap.size
+        == parinc.size
+    ):
+        raise ValueError(
+            "flow, begin_debt, stock, and grid_cap must align with parinc."
+        )
+
+    has_debt = begin_debt > 0.0
+    positive_flow = flow > 0.0
+    at_cap = positive_flow & (stock >= grid_cap)
+    small_flow = positive_flow & (flow < float(small_flow_threshold))
+    output, flow_share, effective_weight, labels = [], [], [], []
+    for level in range(1, 5):
+        selected = parinc == level
+        entry_group = selected & ~has_debt
+        continuation_group = selected & has_debt
+        entry_n = int(entry_group.sum())
+        continuation_n = int(continuation_group.sum())
+        entry_rate = (
+            float(np.mean(positive_flow[entry_group])) if entry_n else eps
+        )
+        continuation_rate = (
+            float(np.mean(positive_flow[continuation_group]))
+            if continuation_n else eps
+        )
+        entry_positive = entry_group & positive_flow
+        continuation_positive = continuation_group & positive_flow
+        mean_entry_flow = (
+            float(np.mean(flow[entry_positive]))
+            if np.any(entry_positive) else eps
+        )
+        mean_continuation_flow = (
+            float(np.mean(flow[continuation_positive]))
+            if np.any(continuation_positive) else eps
+        )
+        group_positive = selected & positive_flow
+        if np.any(group_positive):
+            positive_values = flow[group_positive]
+            at_cap_share = float(np.mean(at_cap[group_positive]))
+            standard_deviation = float(np.std(positive_values))
+            p80 = float(np.percentile(positive_values, 80))
+            small_flow_share = float(np.mean(small_flow[group_positive]))
+        else:
+            at_cap_share = eps
+            standard_deviation = eps
+            p80 = eps
+            small_flow_share = eps
+        output.extend((
+            entry_rate, continuation_rate, mean_entry_flow,
+            mean_continuation_flow, at_cap_share, standard_deviation, p80,
+            small_flow_share,
+        ))
+        total = float(selected.sum())
+        flow_share.append(
+            float(np.mean(positive_flow[selected])) if total > 0.0 else np.nan
+        )
+        effective_weight.append(total)
+        labels.append(level)
+    return (
+        np.asarray(output), np.asarray(flow_share),
+        np.asarray(effective_weight), tuple(labels),
+    )
+
+
 def _warn_thin_split_groups(parinc, begin_debt, cell_label):
     """Warn once at data-load when a parinc-by-debt-status group is thin."""
     parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
@@ -977,6 +1214,245 @@ def _warn_thin_split_groups(parinc, begin_debt, cell_label):
                     f"parinc={level}, {status_name}: N={group_n} < "
                     f"{SPLIT_MOMENT_MINIMUM_GROUP_N} observations."
                 )
+
+
+# Simulated thin groups are reported at most once per process and group, the
+# way the data side is reported once at load. The mixture makes them possible:
+# with a small need probability a parinc-by-debt-status group can contain very
+# few simulated borrowers, and its conditional mean is then noise.
+_WARNED_THIN_SIMULATED_GROUPS = set()
+
+
+def _warn_thin_simulated_groups(parinc, flow, begin_debt, cell_label):
+    """Warn once per group when a simulated group has few positive flows."""
+    parinc = np.asarray(parinc, dtype=np.int64).reshape(-1)
+    positive_flow = np.asarray(flow, dtype=np.float64).reshape(-1) > 0.0
+    has_debt = np.asarray(begin_debt, dtype=np.float64).reshape(-1) > 0.0
+    for level in range(1, 5):
+        selected = parinc == level
+        for status_mask, status_name in (
+            (~has_debt, "beginning debt == 0"),
+            (has_debt, "beginning debt > 0"),
+        ):
+            key = (str(cell_label), level, status_name)
+            if key in _WARNED_THIN_SIMULATED_GROUPS:
+                continue
+            group_n = int(np.sum(selected & status_mask & positive_flow))
+            if group_n < SPLIT_MOMENT_MINIMUM_GROUP_N:
+                _WARNED_THIN_SIMULATED_GROUPS.add(key)
+                print(
+                    f"WARNING [{cell_label}] {NEED_MIXTURE_MOMENT_SPEC} "
+                    f"SIMULATED group parinc={level}, {status_name}: "
+                    f"N={group_n} positive flows < "
+                    f"{SPLIT_MOMENT_MINIMUM_GROUP_N}."
+                )
+
+
+def build_graduation_panel(contexts):
+    """Person-by-enrolled-period layout behind the graduation moment block.
+
+    Columns follow the pooled order the cell evaluations produce: cells in
+    ``contexts`` order and, within a cell, the prepared model-period packs in
+    their preparation order. Everything that does not depend on the borrowing
+    decision is resolved once here: each person's enrolled sequence, the
+    interest factor carrying a flow to the last enrolled period, the
+    four-year-completer and persistence samples, and the adjacent-period pairs
+    behind the autocorrelation moment. ``graduation_block_moments`` then reads
+    any flow vector in that same column order, so the observed flows and every
+    simulated draw go through one identical definition.
+
+    The panel is built from the prepared (sampled) packs, which under the
+    production ``n_sample=None`` are the complete enrolled sample.
+    """
+    individual, period, education, parinc, observed_flow = [], [], [], [], []
+    for context in contexts:
+        cell_education = int(context["education"])
+        for pack in context["sample_by_period"].values():
+            n = len(pack["x1"])
+            individual.append(
+                np.asarray(pack["individual_index"], dtype=np.int64)
+            )
+            period.append(np.full(n, int(pack["period"]), dtype=np.int64))
+            education.append(np.full(n, cell_education, dtype=np.int64))
+            parinc.append(np.asarray(pack["parinc"], dtype=np.int64))
+            observed_flow.append(
+                np.asarray(pack["loan_flow"], dtype=np.float64)
+            )
+    individual = np.concatenate(individual)
+    period = np.concatenate(period)
+    education = np.concatenate(education)
+    parinc = np.concatenate(parinc)
+    observed_flow = np.concatenate(observed_flow)
+
+    order = np.lexsort((period, individual))
+    sorted_individual = individual[order]
+    sorted_period = period[order]
+    unique, first, counts = np.unique(
+        sorted_individual, return_index=True, return_counts=True
+    )
+    person_index = np.repeat(np.arange(unique.size, dtype=np.int64), counts)
+    last_period = np.repeat(sorted_period[first + counts - 1], counts)
+    duplicated = int(np.sum((sorted_period[1:] == sorted_period[:-1])
+                            & (sorted_individual[1:] == sorted_individual[:-1])))
+    if duplicated:
+        print(
+            f"WARNING: the graduation panel contains {duplicated} duplicated "
+            "person-period rows; enrollment sequences are taken as given."
+        )
+    enrolled_years = counts.astype(np.int64)
+    completed_years = np.bincount(
+        person_index,
+        weights=(education[order] == GRADUATION_EDUCATION).astype(np.float64),
+        minlength=unique.size,
+    )
+    # Adjacent enrolled periods one model year apart. Debt keeps accruing
+    # through any enrollment gap, which the interest factor already carries,
+    # but a gap is not a lag-1 pair.
+    same_person = person_index[1:] == person_index[:-1]
+    adjacent = np.flatnonzero(
+        same_person & ((sorted_period[1:] - sorted_period[:-1]) == 1)
+    )
+    return {
+        "order": np.ascontiguousarray(order, dtype=np.int64),
+        "person_index": np.ascontiguousarray(person_index, dtype=np.int64),
+        "n_persons": int(unique.size),
+        # Debt at graduation is the end-of-period stock of the last enrolled
+        # year: b' = (1+r) * b + flow applied along the sequence, which is the
+        # same law of motion the simulated flows come from.
+        "accrual_factor": np.ascontiguousarray(
+            (1.0 + r) ** (last_period - sorted_period), dtype=np.float64
+        ),
+        "enrolled_years": enrolled_years,
+        "person_parinc": np.ascontiguousarray(
+            parinc[order][first], dtype=np.int64
+        ),
+        "completer": completed_years >= GRADUATION_MINIMUM_ENROLLED_YEARS,
+        "persistent": enrolled_years >= PERSISTENCE_MINIMUM_ENROLLED_YEARS,
+        "pair_first": np.ascontiguousarray(adjacent, dtype=np.int64),
+        "pair_second": np.ascontiguousarray(adjacent + 1, dtype=np.int64),
+        "observed_flow": np.ascontiguousarray(observed_flow, dtype=np.float64),
+    }
+
+
+def _nearest_debt_grid_value(values):
+    """Snap dollar amounts to the ascending model debt grid.
+
+    Same convention as ``debt_limits.nearest_grid_index``, ties going to the
+    lower grid point, but vectorized: the graduation block snaps every person
+    on every draw, so a full distance matrix would dominate its cost.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    upper = np.clip(np.searchsorted(debt_range, values), 1, debt_range.size - 1)
+    lower = upper - 1
+    take_lower = (values - debt_range[lower]) <= (debt_range[upper] - values)
+    return debt_range[np.where(take_lower, lower, upper)]
+
+
+def graduation_block_moments(panel, flow, eps=0.01):
+    """Graduation-debt and persistence moments for one flow vector.
+
+    ``flow`` is one annual-flow value per panel column, in the pooled column
+    order: the observed flows for the data targets, one simulated draw for the
+    simulated targets. Debt at graduation accumulates those flows along each
+    person's observed enrollment sequence at the model interest rate and is
+    then measured on the model debt grid, on both sides. The moment ordering
+    is, for each parental-income quartile over four-year completers,
+
+      1. share with positive debt at graduation;
+      2. mean positive debt at graduation;
+      3. median positive debt at graduation;
+      4. 90th percentile of positive debt at graduation;
+
+    followed by two pooled persistence moments:
+
+      17. always-borrow share among persons with at least three enrolled
+          years;
+      18. within-person lag-1 autocorrelation of log positive flow over
+          adjacent enrolled periods.
+
+    The last two are what pin the within-person amount margin: the per-cell
+    moments leave graduation median free by 24-31% and p90 by 13-24%, and
+    these two shrink that spread by about 90%.
+    """
+    flow = np.asarray(flow, dtype=np.float64).reshape(-1)
+    if flow.size != panel["order"].size:
+        raise ValueError("flow must contain one value per graduation-panel column.")
+    flow = flow[panel["order"]]
+    n_persons = int(panel["n_persons"])
+    accumulated = np.bincount(
+        panel["person_index"], weights=panel["accrual_factor"] * flow,
+        minlength=n_persons,
+    )
+    debt = _nearest_debt_grid_value(accumulated)
+
+    positive_debt = debt > 0.0
+    output = []
+    for level in range(1, 5):
+        selected = panel["completer"] & (panel["person_parinc"] == level)
+        group_n = int(selected.sum())
+        indebted = selected & positive_debt
+        if group_n == 0 or not np.any(indebted):
+            output.extend((eps, eps, eps, eps))
+            continue
+        values = debt[indebted]
+        output.extend((
+            float(np.sum(indebted)) / group_n,
+            float(np.mean(values)),
+            float(np.median(values)),
+            float(np.percentile(values, 90)),
+        ))
+
+    positive_flow = flow > 0.0
+    borrowing_years = np.bincount(
+        panel["person_index"], weights=positive_flow.astype(np.float64),
+        minlength=n_persons,
+    )
+    persistent = panel["persistent"]
+    always_borrow = (
+        float(np.mean(borrowing_years[persistent] == panel["enrolled_years"][persistent]))
+        if np.any(persistent) else eps
+    )
+    first_flow = flow[panel["pair_first"]]
+    second_flow = flow[panel["pair_second"]]
+    both_positive = (first_flow > 0.0) & (second_flow > 0.0)
+    autocorrelation = eps
+    if int(both_positive.sum()) > 1:
+        first_log = np.log(first_flow[both_positive])
+        second_log = np.log(second_flow[both_positive])
+        if np.std(first_log) > 0.0 and np.std(second_log) > 0.0:
+            autocorrelation = float(np.corrcoef(first_log, second_log)[0, 1])
+    output.extend((always_borrow, autocorrelation))
+    return np.asarray(output, dtype=np.float64)
+
+
+def graduation_block_loss_and_residuals(simulated, data_moments):
+    """The pooled graduation block's weighted loss and its residuals.
+
+    Weights are 4/2/1/1 on the four graduation moments of each parental-income
+    quartile and 3 on each pooled persistence moment. Standardization uses the
+    same per-moment scale floors as the rest of ``need_mixture_v1``, so a
+    near-zero data moment cannot dominate. ``sum(residuals**2) == loss``.
+    """
+    simulated = np.asarray(simulated, dtype=np.float64)
+    data_moments = np.asarray(data_moments, dtype=np.float64)
+    weights = np.concatenate((
+        np.tile(GRADUATION_MOMENT_WEIGHTS, 4), PERSISTENCE_MOMENT_WEIGHTS
+    ))
+    floors = np.concatenate((
+        np.tile(GRADUATION_SCALE_FLOORS, 4), PERSISTENCE_SCALE_FLOORS
+    ))
+    if simulated.size != weights.size or data_moments.size != weights.size:
+        raise ValueError(
+            f"The graduation block has {weights.size} moments; received "
+            f"{data_moments.size} data and {simulated.size} simulated."
+        )
+    valid = np.isfinite(data_moments) & np.isfinite(simulated)
+    scale = np.maximum(np.abs(data_moments), floors)
+    standardized_error = (simulated - data_moments) / scale
+    loss = float(np.sum(weights[valid] * standardized_error[valid] ** 2))
+    residuals = np.zeros(weights.size, dtype=np.float64)
+    residuals[valid] = np.sqrt(weights[valid]) * standardized_error[valid]
+    return loss, residuals
 
 
 def parental_income_loan_type_distribution_moments(
@@ -2181,6 +2657,11 @@ def prepare_education_cell_crns(
             "transfer_u": rng.random((draws, n)),
             "transfer_z": rng.standard_normal((draws, n)),
             "budget_z": rng.standard_normal((draws, n)),
+            # Component selector of the two-component need mixture. Drawn
+            # LAST and unconditionally, so every stream above keeps the exact
+            # values it had before the mixture existed; it is simply never
+            # read while the mixture is off.
+            "budget_u": rng.random((draws, n)),
         }
 
         x1_design = expand_x1(x1)
@@ -2267,6 +2748,7 @@ def prepare_education_cell_crns(
         prepared_pack = dict(pack)
         prepared_pack["base_budget_crn"] = np.ascontiguousarray(base_budget)
         prepared_pack["budget_z"] = np.ascontiguousarray(crn["budget_z"])
+        prepared_pack["budget_u"] = np.ascontiguousarray(crn["budget_u"])
         prepared_pack["type_integration"] = type_integration
         prepared_pack["resource_mode"] = resource_mode
         if type_integration == "sampled":
@@ -2315,6 +2797,10 @@ def prepare_education_cell_crns(
                 np.concatenate([pack["budget_z"] for pack in packs_in_order], axis=1),
                 dtype=np.float64,
             ),
+            "budget_u": np.ascontiguousarray(
+                np.concatenate([pack["budget_u"] for pack in packs_in_order], axis=1),
+                dtype=np.float64,
+            ),
             "ccp": np.ascontiguousarray(
                 np.concatenate([pack["ccp_sampled"] for pack in packs_in_order]),
                 dtype=np.float64,
@@ -2360,18 +2846,32 @@ def _pooled_observed_cell_moments(
     stock = np.concatenate([pack["debtchoice"] for pack in packs])
     if specification not in EDUCATION_CELL_SPECIFICATIONS:
         raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
-    if moment_spec == SPLIT_MOMENT_SPEC:
+    if moment_spec in (SPLIT_MOMENT_SPEC, NEED_MIXTURE_MOMENT_SPEC):
         if specification != "parental_income_basic":
             raise ValueError(
-                f"The {SPLIT_MOMENT_SPEC} moments require the "
+                f"The {moment_spec} moments require the "
                 "parental_income_basic specification."
             )
         begin_debt = np.concatenate([pack["debt"] for pack in packs])
-        annual_cap = np.concatenate([pack["annual_cap"] for pack in packs])
         _warn_thin_split_groups(
             parinc, begin_debt,
             f"cell {int(packs[0]['cell_code'])}",
         )
+        if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+            # The at-cap moment is the top-of-grid CHOICE on both sides, so
+            # the data side needs the same upper bound the debt search uses.
+            grid_cap = np.concatenate([
+                debt_range[precompute_bounds_indices(
+                    pack["debt"].astype(np.float64),
+                    pack["state"].astype(np.int64),
+                    pack["choice"].astype(np.int64),
+                )[1]]
+                for pack in packs
+            ])
+            return parental_income_need_mixture_moments(
+                parinc, flow, begin_debt, stock, grid_cap
+            )
+        annual_cap = np.concatenate([pack["annual_cap"] for pack in packs])
         return parental_income_split_moments(
             parinc, flow, begin_debt, annual_cap
         )
@@ -2412,6 +2912,17 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
 
 def parental_income_moment_weight_pattern(moment_spec, primary_moment_weight):
     """Within-parinc SMM weights in the exact moment-output ordering."""
+    if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+        # [entry rate, continuation rate, mean entry flow, mean continuation
+        #  flow, at-cap share, sd positive flow, p80 positive flow,
+        #  sub-$1,000 share] = [4, 4, 2, 2, 1, 1, 1, 1] at the defaults.
+        return np.asarray(
+            [
+                primary_moment_weight, primary_moment_weight,
+                STOCK_MOMENT_WEIGHT, STOCK_MOMENT_WEIGHT, 1.0, 1.0, 1.0, 1.0,
+            ],
+            dtype=np.float64,
+        )
     if moment_spec == SPLIT_MOMENT_SPEC:
         # [entry rate, continuation rate, mean entry flow,
         #  mean continuation flow, at-cap share] = [4, 4, 2, 2, 1] at the
@@ -2467,6 +2978,90 @@ def _print_split_fit(
     print(" cell observation weights: " + ", ".join(
         f"parinc {level}: {weights[row]:.1f}" for row, level in enumerate(labels)
     ))
+    print("=" * 132 + "\n")
+
+
+def _print_need_mixture_fit(
+    data, simulated, data_new_share, sim_new_share, weights, labels, loss,
+    primary_moment_weight,
+):
+    """Fit table for the need_mixture_v1 moments; used only for that spec."""
+    print("\n" + "=" * 132)
+    print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
+    print(
+        " loss weights per parinc group: "
+        f"entry rate={primary_moment_weight:g}, continuation "
+        f"rate={primary_moment_weight:g}, mean entry "
+        f"flow={STOCK_MOMENT_WEIGHT:g}, mean continuation "
+        f"flow={STOCK_MOMENT_WEIGHT:g}, at-cap share=1, sd flow=1, "
+        "p80 flow=1, sub-$1,000 share=1"
+    )
+    print(
+        " parinc | entry rate (debt==0) | continuation rate (debt>0) | "
+        "mean flow>0 (debt==0) | mean flow>0 (debt>0) | at-cap share "
+        "(top grid choice) | sd flow>0 | p80 flow>0 | share flow<$1,000 "
+        "  [data/sim/diff]"
+    )
+    for row, parinc in enumerate(labels):
+        m = 8 * row
+        pieces = []
+        for offset, numeric_format in (
+            (0, "6.4f"), (1, "6.4f"), (2, "8.2f"), (3, "8.2f"),
+            (4, "6.4f"), (5, "8.2f"), (6, "8.2f"), (7, "6.4f"),
+        ):
+            pieces.append(
+                f"{data[m+offset]:{numeric_format}}/"
+                f"{simulated[m+offset]:{numeric_format}}/"
+                f"{simulated[m+offset]-data[m+offset]:+8.2f}"
+            )
+        print(f"   {parinc:>2}   | " + " | ".join(pieces))
+    print(" positive-flow share diagnostic (data -> simulation): " + ", ".join(
+        f"parinc {level}: {data_new_share[row]:.4f}->{sim_new_share[row]:.4f}"
+        for row, level in enumerate(labels)
+    ))
+    print(" cell observation weights: " + ", ".join(
+        f"parinc {level}: {weights[row]:.1f}" for row, level in enumerate(labels)
+    ))
+    print("=" * 132 + "\n")
+
+
+def _print_graduation_fit(data, simulated, loss):
+    """Fit table for the pooled graduation and persistence moments."""
+    print("\n" + "=" * 132)
+    print(
+        f"[graduation block] weighted standardized loss={loss:.6f}; "
+        "four-year completers are persons with at least "
+        f"{GRADUATION_MINIMUM_ENROLLED_YEARS} enrolled years at education "
+        f"{GRADUATION_EDUCATION}; debt at graduation accumulates annual flows "
+        "at the model interest rate and is measured on the debt grid"
+    )
+    print(
+        " loss weights per parinc quartile: share indebted=4, mean positive=2,"
+        " median positive=1, p90 positive=1; pooled persistence moments=3"
+    )
+    print(
+        " parinc | share with debt>0 | mean debt>0 | median debt>0 | "
+        "p90 debt>0   [data/sim/diff]"
+    )
+    for row in range(4):
+        m = 4 * row
+        pieces = []
+        for offset, numeric_format in (
+            (0, "6.4f"), (1, "9.2f"), (2, "9.2f"), (3, "9.2f"),
+        ):
+            pieces.append(
+                f"{data[m+offset]:{numeric_format}}/"
+                f"{simulated[m+offset]:{numeric_format}}/"
+                f"{simulated[m+offset]-data[m+offset]:+9.2f}"
+            )
+        print(f"   {row + 1:>2}   | " + " | ".join(pieces))
+    print(
+        " pooled: always-borrow share (>= "
+        f"{PERSISTENCE_MINIMUM_ENROLLED_YEARS} enrolled years) "
+        f"{data[16]:.4f}/{simulated[16]:.4f}/{simulated[16]-data[16]:+.4f} | "
+        "within-person lag-1 autocorrelation of log positive flow "
+        f"{data[17]:.4f}/{simulated[17]:.4f}/{simulated[17]-data[17]:+.4f}"
+    )
     print("=" * 132 + "\n")
 
 
@@ -2701,6 +3296,15 @@ def minimize_distance_education_cell(
         )
         print("loan mean shift:", np.round(spec["loan_mean_shift"], 3),
               "loan sigma ratio:", np.round(np.exp(spec["loan_log_sigma_ratio"]), 4))
+        append_smm_log_record({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "record": "evaluation",
+            "objective": "education_cell_joint_type",
+            "evaluation": int(EVAL_COUNTER),
+            "cell_code": int(cell_code),
+            "loss": loss,
+            "parameter_vector": _log_values(params),
+        })
     return loss
 
 
@@ -2764,18 +3368,35 @@ def _pool_sampled_education_cell_evaluation(
     pooled["kappa_entry_i"], pooled["kappa_cont_i"], _ = (
         _new_borrowing_kernel_arrays(spec, pooled["loan_type"], pooled["debt"])
     )
-    pooled["shock"] = np.ascontiguousarray(
-        bs.realization(
-            spec, x1, None, pooled["budget_z"],
-            loan_type=(
-                pooled["loan_type"]
-                if spec.get("loan_heterogeneity") == "mean" else None
+    if bs.mixture_enabled(spec):
+        # Two-component need mixture: the uniform stream picks the component
+        # and the same standard draw enters both, so the shock still moves
+        # smoothly in the parameters under common random numbers. The need
+        # probability uses the sampled loan type and the OBSERVED
+        # beginning-of-period debt, exactly like the debt-status split of the
+        # targeted moments.
+        pooled["shock"] = np.ascontiguousarray(
+            bs.realization_mixture(
+                spec, x1, None, pooled["budget_z"], pooled["budget_u"],
+                pooled["debt"] > 0.0, loan_type=pooled["loan_type"],
+                education=education, program_year=program_year,
+                pre_choice_resources=pooled["base_budget"],
             ),
-            education=education, program_year=program_year,
-            pre_choice_resources=pooled["base_budget"],
-        ),
-        dtype=np.float64,
-    )
+            dtype=np.float64,
+        )
+    else:
+        pooled["shock"] = np.ascontiguousarray(
+            bs.realization(
+                spec, x1, None, pooled["budget_z"],
+                loan_type=(
+                    pooled["loan_type"]
+                    if spec.get("loan_heterogeneity") == "mean" else None
+                ),
+                education=education, program_year=program_year,
+                pre_choice_resources=pooled["base_budget"],
+            ),
+            dtype=np.float64,
+        )
     if pooled["base_budget"].shape != pooled["shock"].shape:
         raise ValueError("Pooled budget and shock arrays are misaligned.")
     return pooled
@@ -2794,11 +3415,21 @@ def parental_income_cell_loss_and_residuals(
     with zeros at non-finite moments, so ``sum(r**2) == loss`` exactly (up
     to floating point). Least-squares optimizers (DFO-LS) consume the
     residuals; every scalar optimizer keeps consuming the identical loss.
+
+    ``need_mixture_v1`` is the one specification that does not use the 1e-6
+    denominator: each of its moments is floored at the scale of its own units
+    (NEED_MIXTURE_SCALE_FLOORS), because a near-zero data share otherwise
+    explodes into the objective. Every other specification is untouched.
     """
     simulated = np.asarray(simulated, dtype=np.float64)
     data_moments = np.asarray(data_moments, dtype=np.float64)
     valid = np.isfinite(data_moments) & np.isfinite(simulated)
-    scale = np.maximum(np.abs(data_moments), 1.0e-6)
+    if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+        scale = np.maximum(
+            np.abs(data_moments), np.tile(NEED_MIXTURE_SCALE_FLOORS, 4)
+        )
+    else:
+        scale = np.maximum(np.abs(data_moments), 1.0e-6)
     moment_weights = np.tile(
         parental_income_moment_weight_pattern(
             moment_spec, primary_moment_weight
@@ -2818,6 +3449,7 @@ def _evaluate_sampled_parental_income_cell(
     full_params, data_moments, sample_by_period, cell_code, education,
     program_year, moment_spec, primary_moment_weight,
     new_borrowing_costs=None, loan_type_debt_penalty_shift=None,
+    need_mixture=None, return_flows=False,
 ):
     """Evaluate one cell's parental-income moments without a global count.
 
@@ -2827,6 +3459,12 @@ def _evaluate_sampled_parental_income_cell(
     14-entry per-cell vector deliberately does not carry the kappa block.
     ``loan_type_debt_penalty_shift`` is the optional shared loan-type
     debt-penalty shift (Spec B), injected the same way for the same reason.
+    ``need_mixture`` is the optional shared five-entry need-mixture tail
+    ``[a0, a_type, a_debt, mu_noneed, sigma_noneed]``, injected the same way.
+
+    With ``return_flows`` the simulated annual flows of every draw are
+    returned as a sixth item, so the parent can assemble the pooled
+    graduation block without a second forward simulation.
     """
     spec = bs.unpack_parental_income_estimation_vector(
         full_params, [cell_code], index_kind="education_cell"
@@ -2848,6 +3486,17 @@ def _evaluate_sampled_parental_income_cell(
         spec["debt_penalty_loan_type_shift"] = float(
             loan_type_debt_penalty_shift
         )
+    if need_mixture is not None:
+        need_mixture = np.asarray(need_mixture, dtype=np.float64).reshape(-1)
+        if need_mixture.size != bs.N_MIXTURE_PARAMETERS:
+            raise ValueError(
+                "need_mixture must contain "
+                f"{bs.N_MIXTURE_PARAMETERS} entries."
+            )
+        spec["mixture_logits"] = need_mixture[:3].copy()
+        spec["mixture_noneed_mean"] = float(need_mixture[3])
+        spec["mixture_noneed_sigma"] = float(need_mixture[4])
+        spec["need_mixture_timing"] = bs.NEED_MIXTURE_TIMING
     pooled = _pool_sampled_education_cell_evaluation(
         sample_by_period, spec, education, program_year
     )
@@ -2872,8 +3521,24 @@ def _evaluate_sampled_parental_income_cell(
     flow_by_draw = stock_by_draw - (1.0 + r) * pooled["debt"][None, :]
     simulated_by_draw = []
     diagnostic_by_draw = []
+    # Top-of-grid choice behind the need_mixture_v1 at-cap moment; the other
+    # specifications never look at it.
+    grid_cap = (
+        debt_range[pooled["max_idx"]]
+        if moment_spec == NEED_MIXTURE_MOMENT_SPEC else None
+    )
     for draw_index in range(stock_by_draw.shape[0]):
-        if moment_spec == SPLIT_MOMENT_SPEC:
+        if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+            moments, new_share, _, _ = parental_income_need_mixture_moments(
+                pooled["parinc"], flow_by_draw[draw_index], pooled["debt"],
+                stock_by_draw[draw_index], grid_cap,
+            )
+            if draw_index == 0:
+                _warn_thin_simulated_groups(
+                    pooled["parinc"], flow_by_draw[draw_index],
+                    pooled["debt"], f"cell {int(cell_code)}",
+                )
+        elif moment_spec == SPLIT_MOMENT_SPEC:
             moments, new_share, _, _ = parental_income_split_moments(
                 pooled["parinc"], flow_by_draw[draw_index], pooled["debt"],
                 pooled["annual_cap"],
@@ -2890,6 +3555,8 @@ def _evaluate_sampled_parental_income_cell(
     loss, residuals = parental_income_cell_loss_and_residuals(
         simulated, data_moments, moment_spec, primary_moment_weight
     )
+    if return_flows:
+        return loss, simulated, sim_new_share, spec, residuals, flow_by_draw
     return loss, simulated, sim_new_share, spec, residuals
 
 
@@ -2918,6 +3585,44 @@ def _split_loan_type_debt_penalty_tail(params, include_loan_type_debt_penalty):
     if not include_loan_type_debt_penalty:
         return params, None
     return params[:-1], float(params[-1])
+
+
+def multicell_free_parameter_mask(n_parameters, n_cells):
+    """Which multicell entries the optimizer is allowed to vary.
+
+    Frozen entries keep their slot in the vector layout, so nothing is
+    renumbered and every unpack still sees a complete vector; they are simply
+    pinned at zero and removed from the optimizer's search space. The only
+    frozen block today is the four shared debt penalties under
+    FREEZE_DEBT_PENALTY, whose zero levels make ``debt_pen_parinc`` a zero
+    four-vector in the unpacked specification.
+    """
+    mask = np.ones(int(n_parameters), dtype=bool)
+    if FREEZE_DEBT_PENALTY:
+        penalty_start = (
+            int(n_cells) * bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+            + bs.N_RISK_PARAMETERS
+        )
+        mask[penalty_start:penalty_start + bs.N_DEBT_PENALTY_PARAMETERS] = False
+    return mask
+
+
+def _split_need_mixture_tail(params, include_need_mixture):
+    """Strip the five need-mixture parameters when they are estimated.
+
+    The block sits after whatever kappa tail is active and before the
+    loan-type debt-penalty shift, so callers strip the shift first. Returns
+    ``(core_params, need_mixture)`` where ``need_mixture`` is ``None`` with the
+    flag off, so ``_split_multicell_shared_tail`` consumes ``core_params``
+    exactly as before.
+    """
+    params = np.asarray(params, dtype=np.float64)
+    if not include_need_mixture:
+        return params, None
+    return (
+        params[:-bs.N_MIXTURE_PARAMETERS],
+        params[-bs.N_MIXTURE_PARAMETERS:].copy(),
+    )
 
 
 def _split_multicell_shared_tail(params, n_cells, include_new_borrowing):
@@ -2950,30 +3655,37 @@ def _evaluate_cell_smm_worker(task):
     cell_index, block, shared_risk, shared_debt = task[:4]
     new_borrowing = task[4] if len(task) > 4 else None
     loan_type_shift = task[5] if len(task) > 5 else None
+    need_mixture = task[6] if len(task) > 6 else None
     context = _CELL_WORKER_CONTEXTS[cell_index]
     full_params = np.concatenate(
         (block[0:5], shared_risk, shared_debt, block[5:6])
     )
-    loss, simulated, sim_new_share, _, residuals = (
-        _evaluate_sampled_parental_income_cell(
-            full_params,
-            context["data_moments"],
-            context["sample_by_period"],
-            context["cell_code"],
-            int(context["education"]),
-            int(context["program_year"]),
-            _CELL_WORKER_MOMENT_SPEC,
-            _CELL_WORKER_PRIMARY_WEIGHT,
-            new_borrowing_costs=new_borrowing,
-            loan_type_debt_penalty_shift=loan_type_shift,
-        )
+    # The graduation block is assembled by the parent from these per-draw
+    # flows, so the need_mixture_v1 specification ships them back.
+    return_flows = _CELL_WORKER_MOMENT_SPEC == NEED_MIXTURE_MOMENT_SPEC
+    evaluation = _evaluate_sampled_parental_income_cell(
+        full_params,
+        context["data_moments"],
+        context["sample_by_period"],
+        context["cell_code"],
+        int(context["education"]),
+        int(context["program_year"]),
+        _CELL_WORKER_MOMENT_SPEC,
+        _CELL_WORKER_PRIMARY_WEIGHT,
+        new_borrowing_costs=new_borrowing,
+        loan_type_debt_penalty_shift=loan_type_shift,
+        need_mixture=need_mixture,
+        return_flows=return_flows,
     )
+    loss, simulated, sim_new_share, _, residuals = evaluation[:5]
+    if return_flows:
+        return cell_index, loss, simulated, sim_new_share, residuals, evaluation[5]
     return cell_index, loss, simulated, sim_new_share, residuals
 
 
 def minimize_distance_education_cells_parental_income(
     params, contexts, moment_spec, primary_moment_weight, cell_pool=None,
-    return_residuals=False,
+    graduation=None, return_residuals=False,
 ):
     """Joint multi-cell loss with risk aversion shared across cells.
 
@@ -2982,6 +3694,11 @@ def minimize_distance_education_cells_parental_income(
     in the existing cell order, ``sqrt(cell_weight)`` times the cell's
     residuals from ``parental_income_cell_loss_and_residuals``. Its sum of
     squares equals the scalar loss returned by the default mode exactly.
+
+    ``graduation`` is the optional pooled graduation block: the panel built
+    once by ``build_graduation_panel`` together with its data targets. It adds
+    one unweighted-by-cell term to the loss and one residual block, computed
+    from the per-draw flows the cell evaluations already produced.
     """
     global EVAL_COUNTER
     EVAL_COUNTER += 1
@@ -2989,9 +3706,13 @@ def minimize_distance_education_cells_parental_income(
     n_cells = len(contexts)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
     # The loan-type debt-penalty shift, when estimated, is always the last
-    # entry; strip it first so the kappa/risk/debt tail slicing is unchanged.
+    # entry; strip it first, then the need mixture, so the kappa/risk/debt
+    # tail slicing is unchanged.
     core_params, shared_loan_type_shift = _split_loan_type_debt_penalty_tail(
         params, ESTIMATE_LOAN_TYPE_DEBT_PENALTY
+    )
+    core_params, shared_need_mixture = _split_need_mixture_tail(
+        core_params, ESTIMATE_NEED_MIXTURE
     )
     shared_risk, shared_debt, shared_new_borrowing = (
         _split_multicell_shared_tail(
@@ -3001,7 +3722,13 @@ def minimize_distance_education_cells_parental_income(
     tasks = []
     for cell_index in range(n_cells):
         block = params[cell_index * block_size:(cell_index + 1) * block_size]
-        if shared_loan_type_shift is not None:
+        if shared_need_mixture is not None:
+            tasks.append((
+                cell_index, block, shared_risk, shared_debt,
+                shared_new_borrowing, shared_loan_type_shift,
+                shared_need_mixture,
+            ))
+        elif shared_loan_type_shift is not None:
             tasks.append((
                 cell_index, block, shared_risk, shared_debt,
                 shared_new_borrowing, shared_loan_type_shift,
@@ -3022,26 +3749,28 @@ def minimize_distance_education_cells_parental_income(
             full_params = np.concatenate(
                 (block[0:5], task[2], task[3], block[5:6])
             )
-            loss, simulated, sim_new_share, _, residuals = (
-                _evaluate_sampled_parental_income_cell(
-                    full_params,
-                    context["data_moments"],
-                    context["sample_by_period"],
-                    context["cell_code"],
-                    int(context["education"]),
-                    int(context["program_year"]),
-                    moment_spec,
-                    primary_moment_weight,
-                    new_borrowing_costs=(
-                        task[4] if len(task) > 4 else None
-                    ),
-                    loan_type_debt_penalty_shift=(
-                        task[5] if len(task) > 5 else None
-                    ),
-                )
+            evaluation = _evaluate_sampled_parental_income_cell(
+                full_params,
+                context["data_moments"],
+                context["sample_by_period"],
+                context["cell_code"],
+                int(context["education"]),
+                int(context["program_year"]),
+                moment_spec,
+                primary_moment_weight,
+                new_borrowing_costs=(
+                    task[4] if len(task) > 4 else None
+                ),
+                loan_type_debt_penalty_shift=(
+                    task[5] if len(task) > 5 else None
+                ),
+                need_mixture=(task[6] if len(task) > 6 else None),
+                return_flows=(moment_spec == NEED_MIXTURE_MOMENT_SPEC),
             )
+            loss, simulated, sim_new_share, _, residuals = evaluation[:5]
             results.append(
                 (cell_index, loss, simulated, sim_new_share, residuals)
+                + tuple(evaluation[5:])
             )
     else:
         results = cell_pool.map(_evaluate_cell_smm_worker, tasks, chunksize=1)
@@ -3050,6 +3779,26 @@ def minimize_distance_education_cells_parental_income(
     total_loss = float(sum(
         contexts[item[0]]["cell_weight"] * item[1] for item in results
     ))
+    graduation_loss = 0.0
+    graduation_residuals = None
+    simulated_graduation = None
+    if graduation is not None:
+        # One pass over the flows the cell kernels already produced: no second
+        # forward simulation, and the data targets came from this same panel.
+        flow_by_draw = np.concatenate([item[5] for item in results], axis=1)
+        simulated_graduation = np.mean(
+            np.asarray([
+                graduation_block_moments(graduation["panel"], flow_by_draw[draw_index])
+                for draw_index in range(flow_by_draw.shape[0])
+            ]),
+            axis=0,
+        )
+        graduation_loss, graduation_residuals = (
+            graduation_block_loss_and_residuals(
+                simulated_graduation, graduation["data_moments"]
+            )
+        )
+        total_loss += graduation_loss
 
     if EVAL_COUNTER % 10 == 0:
         print("\n" + "#" * 132)
@@ -3071,6 +3820,18 @@ def minimize_distance_education_cells_parental_income(
                 f"{bs.DEBT_PENALTY_SHIFT_LOAN_TYPE}, the low-borrowing/"
                 f"debt-averse type): {round(shared_loan_type_shift, 4)}"
             )
+        if shared_need_mixture is not None:
+            print(
+                "need-mixture logits (a0, a_type, a_debt)="
+                f"{np.round(shared_need_mixture[:3], 4)}; no-need component "
+                f"mean={round(float(shared_need_mixture[3]), 2)}, "
+                f"sigma={round(float(shared_need_mixture[4]), 2)}"
+            )
+        if graduation is not None:
+            print(
+                f"graduation block contribution={graduation_loss:.6f} "
+                f"(unweighted by cell)"
+            )
         print("#" * 132)
         for context, evaluation in zip(contexts, results):
             education = int(context["education"])
@@ -3090,7 +3851,14 @@ def minimize_distance_education_cells_parental_income(
                 f"cell weight={cell_weight:.4f}; raw loss={loss:.6f}; "
                 f"weighted contribution={weighted_loss:.6f}"
             )
-            if moment_spec == SPLIT_MOMENT_SPEC:
+            if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+                _print_need_mixture_fit(
+                    context["data_moments"], simulated,
+                    context["data_new_share"], sim_new_share,
+                    context["data_weights"], context["labels"], loss,
+                    primary_moment_weight,
+                )
+            elif moment_spec == SPLIT_MOMENT_SPEC:
                 _print_split_fit(
                     context["data_moments"], simulated,
                     context["data_new_share"], sim_new_share,
@@ -3112,11 +3880,44 @@ def minimize_distance_education_cells_parental_income(
             )
             if float(block[4]) <= 1.000001:
                 print("WARNING: cell budget-shock sigma is at its lower bound (1.0).")
+        if graduation is not None:
+            _print_graduation_fit(
+                graduation["data_moments"], simulated_graduation,
+                graduation_loss,
+            )
+        # The same tables, in one machine-readable line per printed
+        # evaluation, so a finished run can be analyzed without parsing stdout.
+        record = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "record": "evaluation",
+            "objective": "education_cells_parental_income",
+            "evaluation": int(EVAL_COUNTER),
+            "moment_spec": moment_spec,
+            "total_loss": total_loss,
+            "cells": [
+                {
+                    "cell_code": int(contexts[item[0]]["cell_code"]),
+                    "raw_loss": float(item[1]),
+                    "weighted_loss": float(
+                        contexts[item[0]]["cell_weight"] * item[1]
+                    ),
+                }
+                for item in results
+            ],
+            "parameters": decode_multicell_parameter_blocks(params, n_cells),
+        }
+        if graduation is not None:
+            record["graduation_loss"] = graduation_loss
+            record["graduation_moments"] = _log_values(simulated_graduation, 4)
+        append_smm_log_record(record)
     if return_residuals:
-        return np.concatenate([
+        stacked = [
             np.sqrt(float(contexts[item[0]]["cell_weight"])) * item[4]
             for item in results
-        ])
+        ]
+        if graduation_residuals is not None:
+            stacked.append(graduation_residuals)
+        return np.concatenate(stacked)
     return total_loss
 
 
@@ -3387,6 +4188,16 @@ def minimize_distance_education_cell_parental_income(
         )
         if float(spec["sigma_e"][0]) <= 1.000001:
             print("WARNING: common budget-shock sigma is at its lower bound (1.0).")
+        append_smm_log_record({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "record": "evaluation",
+            "objective": "education_cell_parental_income",
+            "evaluation": int(EVAL_COUNTER),
+            "cell_code": int(cell_code),
+            "moment_spec": moment_spec,
+            "loss": loss,
+            "parameter_vector": _log_values(params),
+        })
     return loss
 
 
@@ -3706,9 +4517,9 @@ def fit_education_cells(
         raise ValueError("Multi-cell estimation requires at least two unique education cells.")
     if any(educ not in (1, 2, 3) or year < 1 for educ, year in cells):
         raise ValueError("Education cells must use education 1, 2, or 3 and a positive year.")
-    if moment_spec not in EXTENDED_PARENTAL_INCOME_MOMENT_SPECS:
+    if moment_spec not in MULTICELL_PARENTAL_INCOME_MOMENT_SPECS:
         raise ValueError(
-            f"moment_spec must be one of {EXTENDED_PARENTAL_INCOME_MOMENT_SPECS}."
+            f"moment_spec must be one of {MULTICELL_PARENTAL_INCOME_MOMENT_SPECS}."
         )
     if resource_mode not in EDUCATION_CELL_RESOURCE_MODES:
         raise ValueError(f"resource_mode must be one of {EDUCATION_CELL_RESOURCE_MODES}.")
@@ -3810,15 +4621,49 @@ def fit_education_cells(
     print(f"[current resources] {resource_mode}")
     print(f"[parallel debt solver] {get_num_threads()} Numba threads")
 
+    # The pooled graduation block reuses the flows the per-cell kernels
+    # already produce; its data targets come from the same panel, so data and
+    # simulation cannot drift apart.
+    graduation = None
+    if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+        panel = build_graduation_panel(contexts)
+        graduation = {
+            "panel": panel,
+            "data_moments": graduation_block_moments(
+                panel, panel["observed_flow"]
+            ),
+        }
+        targets = graduation["data_moments"]
+        print(
+            f"[graduation block] {panel['n_persons']:,} persons, "
+            f"{int(np.sum(panel['completer'])):,} four-year completers, "
+            f"{int(np.sum(panel['persistent'])):,} persons with at least "
+            f"{PERSISTENCE_MINIMUM_ENROLLED_YEARS} enrolled years, "
+            f"{panel['pair_first'].size:,} adjacent-period pairs"
+        )
+        print(
+            f"[graduation data targets] share indebted={np.round(targets[0:16:4], 4)}; "
+            f"mean+={np.round(targets[1:16:4], 0)}; "
+            f"median+={np.round(targets[2:16:4], 0)}; "
+            f"p90+={np.round(targets[3:16:4], 0)}; "
+            f"always-borrow={targets[16]:.4f}; "
+            f"log-flow lag-1 autocorrelation={targets[17]:.4f}"
+        )
+
     n_cells = len(cells)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
     legacy_expected = bs.estimation_vector_size_multicell(n_cells)
-    pre_shift_expected = bs.estimation_vector_size_multicell(
+    pre_mixture_expected = bs.estimation_vector_size_multicell(
         n_cells, include_new_borrowing=ESTIMATE_NEW_BORROWING_COST
+    )
+    pre_shift_expected = bs.estimation_vector_size_multicell(
+        n_cells, include_new_borrowing=ESTIMATE_NEW_BORROWING_COST,
+        include_need_mixture=ESTIMATE_NEED_MIXTURE,
     )
     expected = bs.estimation_vector_size_multicell(
         n_cells, include_new_borrowing=ESTIMATE_NEW_BORROWING_COST,
         include_loan_type_debt_penalty=ESTIMATE_LOAN_TYPE_DEBT_PENALTY,
+        include_need_mixture=ESTIMATE_NEED_MIXTURE,
     )
     if initial is None:
         cell_block = np.array(
@@ -3855,6 +4700,24 @@ def fit_education_cells(
             "(kappa0 low/high, kappa1) to the legacy "
             f"{legacy_expected}-parameter vector."
         )
+    if ESTIMATE_NEED_MIXTURE and initial.size in (
+        pre_mixture_expected,
+        pre_mixture_expected + bs.N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS,
+    ):
+        # Restart upgrade: the mixture block is inserted after whatever kappa
+        # tail the saved vector carries and before the loan-type debt-penalty
+        # shift, which stays the last entry. Unlike kappa and the shift the
+        # mixture has no neutral value, so the first evaluation deliberately
+        # does NOT reproduce the saved single-component estimate.
+        saved_shift = initial[pre_mixture_expected:]
+        initial = np.concatenate(
+            (initial[:pre_mixture_expected], NEED_MIXTURE_START, saved_shift)
+        )
+        print(
+            "[initial] Inserting the five need-mixture parameters "
+            f"{NEED_MIXTURE_START} into the "
+            f"{pre_mixture_expected + saved_shift.size}-parameter vector."
+        )
     if ESTIMATE_LOAN_TYPE_DEBT_PENALTY and initial.size == pre_shift_expected:
         # Restart upgrade: a saved vector without the shift starts the
         # extended specification at a zero shift, so the first evaluation
@@ -3872,6 +4735,10 @@ def fit_education_cells(
             + (
                 " and three shared new-borrowing costs"
                 if ESTIMATE_NEW_BORROWING_COST else ""
+            )
+            + (
+                " and five shared need-mixture parameters"
+                if ESTIMATE_NEED_MIXTURE else ""
             )
             + (
                 " and one shared loan-type debt-penalty shift)."
@@ -3896,10 +4763,39 @@ def fit_education_cells(
         bounds.extend(
             [NEW_BORROWING_COST_BOUNDS] * bs.N_NEW_BORROWING_PARAMETERS
         )
+    if ESTIMATE_NEED_MIXTURE:
+        # Three logits of the need probability, then the shared no-need mean
+        # and standard deviation in dollars.
+        bounds.extend([NEED_MIXTURE_LOGIT_BOUNDS] * 3)
+        bounds.append(NEED_MIXTURE_NONEED_MEAN_BOUNDS)
+        bounds.append(NEED_MIXTURE_NONEED_SIGMA_BOUNDS)
     if ESTIMATE_LOAN_TYPE_DEBT_PENALTY:
         # The shift is a per-period flow-utility penalty like the shared
         # debt penalties themselves; always the last vector entry.
         bounds.append(LOAN_TYPE_DEBT_PENALTY_BOUNDS)
+
+    # Frozen parameters keep their slot in the vector and stay at zero; the
+    # optimizer works in the reduced free space and never spends a dimension
+    # on them. With nothing frozen this is the historical vector exactly.
+    free_mask = multicell_free_parameter_mask(expected, n_cells)
+    freezing = not bool(np.all(free_mask))
+    if freezing:
+        initial = np.where(free_mask, initial, 0.0)
+        bounds = [pair for pair, free in zip(bounds, free_mask) if free]
+        print(
+            f"[frozen parameters] optimizing {int(np.sum(free_mask))} of "
+            f"{expected} entries; the four shared debt penalties are held at "
+            "zero in their existing slots."
+        )
+        initial = initial[free_mask]
+
+    def expand_free_parameters(values):
+        """Reinsert the frozen zeros, so consumers see the full vector."""
+        if not freezing:
+            return values
+        full = np.zeros(expected, dtype=np.float64)
+        full[free_mask] = np.asarray(values, dtype=np.float64).reshape(-1)
+        return full
 
     def make_initial_simplex(center):
         center = np.asarray(center, dtype=np.float64)
@@ -3913,14 +4809,18 @@ def fit_education_cells(
             if center[slope_index] == 0.0:
                 simplex[slope_index + 1, slope_index] = 100.0
         # The loan-type debt-penalty shift, when estimated, occupies the last
-        # entry; the kappa block then sits immediately before it.
+        # entry; the need mixture sits before it and the kappa block before
+        # that. Cell blocks keep their positions under freezing, because only
+        # entries after them can be frozen.
         shift_tail = int(ESTIMATE_LOAN_TYPE_DEBT_PENALTY)
+        mixture_tail = bs.N_MIXTURE_PARAMETERS * int(ESTIMATE_NEED_MIXTURE)
         if ESTIMATE_NEW_BORROWING_COST:
             # A zero-initialized kappa needs a negative in-bounds step of a
             # meaningful flow-utility size, not the tiny default 0.00025.
             for kappa_index in range(
-                center.size - bs.N_NEW_BORROWING_PARAMETERS - shift_tail,
-                center.size - shift_tail,
+                center.size - bs.N_NEW_BORROWING_PARAMETERS - mixture_tail
+                - shift_tail,
+                center.size - mixture_tail - shift_tail,
             ):
                 if center[kappa_index] == 0.0:
                     simplex[kappa_index + 1, kappa_index] = -0.25
@@ -3955,15 +4855,23 @@ def fit_education_cells(
         print("[parallel SMM cells] disabled; using serial cell evaluation")
 
     objective_args = (
-        contexts, moment_spec, primary_moment_weight, cell_pool,
+        contexts, moment_spec, primary_moment_weight, cell_pool, graduation,
     )
+    if freezing:
+        def scalar_objective(params, *args):
+            return minimize_distance_education_cells_parental_income(
+                expand_free_parameters(params), *args
+            )
+    else:
+        scalar_objective = minimize_distance_education_cells_parental_income
     print(f"[multi-cell optimizer] {optimizer}")
     try:
         if optimizer == "dfols":
             def dfols_residual_objective(params):
                 return minimize_distance_education_cells_parental_income(
-                    params, contexts, moment_spec, primary_moment_weight,
-                    cell_pool, return_residuals=True,
+                    expand_free_parameters(params), contexts, moment_spec,
+                    primary_moment_weight, cell_pool, graduation,
+                    return_residuals=True,
                 )
 
             if dfols_maxfun is not None:
@@ -3999,7 +4907,7 @@ def fit_education_cells(
         annealing_result = None
         if optimizer in ("dual-annealing", "hybrid"):
             annealing_result = dual_annealing(
-                minimize_distance_education_cells_parental_income,
+                scalar_objective,
                 bounds=bounds,
                 args=objective_args,
                 x0=initial,
@@ -4020,7 +4928,7 @@ def fit_education_cells(
                 annealing_result.x if optimizer == "hybrid" else initial
             )
             result = minimize(
-                minimize_distance_education_cells_parental_income,
+                scalar_objective,
                 local_start,
                 args=objective_args,
                 method="Nelder-Mead",
@@ -4039,6 +4947,12 @@ def fit_education_cells(
         if cell_pool is not None:
             cell_pool.close()
             cell_pool.join()
+    if freezing:
+        # Everything downstream (saving, restarts, reporting) expects the full
+        # layout, frozen zeros included.
+        result.x = expand_free_parameters(result.x)
+        if hasattr(result, "annealing_x"):
+            result.annealing_x = expand_free_parameters(result.annealing_x)
     result.smm_optimizer = optimizer
     result.smm_cell_workers = int(cell_workers)
     result.smm_cell_numba_threads = int(cell_numba_threads)
@@ -4048,6 +4962,18 @@ def fit_education_cells(
     result.smm_cell_weights = np.asarray(
         [context["cell_weight"] for context in contexts], dtype=np.float64
     )
+    append_smm_log_record({
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "record": "final",
+        "objective": "education_cells_parental_income",
+        "evaluations": int(EVAL_COUNTER),
+        "moment_spec": moment_spec,
+        "optimizer": optimizer,
+        "final_loss": float(result.fun),
+        "parameters": decode_multicell_parameter_blocks(result.x, n_cells),
+        "parameter_vector": _log_values(result.x),
+    })
+    print(f"[SMM log] appended the final record to {smm_log_path()}")
     return result, data_summaries
 
 # ==============================================================================
@@ -4335,12 +5261,17 @@ def estimate_budget_shock_all_education(
 
     cell_codes = [bs.budget_education_cell_code(*cell) for cell in cells]
     legacy_vector_size = bs.estimation_vector_size_multicell(len(cells))
-    pre_shift_vector_size = bs.estimation_vector_size_multicell(
+    pre_mixture_vector_size = bs.estimation_vector_size_multicell(
         len(cells), include_new_borrowing=ESTIMATE_NEW_BORROWING_COST
+    )
+    pre_shift_vector_size = bs.estimation_vector_size_multicell(
+        len(cells), include_new_borrowing=ESTIMATE_NEW_BORROWING_COST,
+        include_need_mixture=ESTIMATE_NEED_MIXTURE,
     )
     expected_size = bs.estimation_vector_size_multicell(
         len(cells), include_new_borrowing=ESTIMATE_NEW_BORROWING_COST,
         include_loan_type_debt_penalty=ESTIMATE_LOAN_TYPE_DEBT_PENALTY,
+        include_need_mixture=ESTIMATE_NEED_MIXTURE,
     )
     if initial is None and restart:
         raw_path = EST("budgetshock_bestx.npy")
@@ -4386,6 +5317,24 @@ def estimate_budget_shock_all_education(
                     f"[restart] Using saved {candidate.size}-parameter "
                     f"estimate {raw_path}; the loan-type debt-penalty "
                     "shift starts at zero."
+                )
+            elif (
+                ESTIMATE_NEED_MIXTURE
+                and candidate.size in (
+                    pre_mixture_vector_size,
+                    pre_mixture_vector_size
+                    + bs.N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS,
+                )
+            ):
+                # A saved vector without the mixture block restarts the
+                # mixture specification; fit_education_cells inserts the five
+                # need-mixture parameters at their start values, keeping the
+                # cell, risk-aversion and shift blocks as saved.
+                initial = candidate
+                print(
+                    f"[restart] Using saved {candidate.size}-parameter "
+                    f"estimate {raw_path}; the need mixture starts at "
+                    f"{NEED_MIXTURE_START}."
                 )
         if initial is None and current is not None:
             print(
@@ -4448,6 +5397,9 @@ def estimate_budget_shock_all_education(
             "smm_debt_penalty_shift_loan_type": int(
                 bs.DEBT_PENALTY_SHIFT_LOAN_TYPE
             ),
+            "smm_estimate_need_mixture": bool(ESTIMATE_NEED_MIXTURE),
+            "smm_need_mixture_timing": bs.NEED_MIXTURE_TIMING,
+            "smm_freeze_debt_penalty": bool(FREEZE_DEBT_PENALTY),
             "smm_optimizer": optimizer,
             "smm_annealing_maxfun": int(annealing_maxfun),
             "smm_cell_workers": int(result.smm_cell_workers),

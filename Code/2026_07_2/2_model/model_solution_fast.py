@@ -130,21 +130,59 @@ def _budget_standard(deg_budget=5):
     return _BUDGET_STANDARD_CACHE[deg_budget]
 
 
-def _edu_joint_nodes(j, nb, deg=5, deg_budget=5):
+def _mixture_active():
+    """True when the loaded bundle turns the two-component need mixture on.
+
+    None-safe: the unit checks build node layouts with no bundle loaded.
+    """
+    return ms.budget_params is not None and bs.mixture_enabled(ms.budget_params)
+
+
+def _edu_joint_nodes(j, nb, b=None, loan_type=None, deg=5, deg_budget=5):
     """Cached joint wage x budget node layout for one education choice.
 
     Returns (e_joint, z_standard_joint, w_joint, w_vis) exactly as assembled in
     ``get_expected_conditional`` (tile/repeat/kron in the same order).
+
+    Under the two-component need mixture ``e_joint`` doubles (need block first,
+    no-need block second, both reusing the same ``z_standard_joint``) and
+    ``w_vis`` is the flattened (2 * n_joint, nb) weight matrix, because the
+    component probability depends on 1{b > 0} and is therefore no longer
+    debt-invariant. The single-component layout depends on none of the
+    budget-shock parameters; the mixture layout depends on the logits, on the
+    task's loan type and on the debt grid, so all three enter the cache key --
+    without them this process-wide cache would serve stale weights across
+    parameter draws and across tasks.
     """
     sigma = None if j[2] == 0 else float(ms.get_sigma(j, ms.sigmas))
-    key = (deg, deg_budget, sigma, nb)
+    if _mixture_active():
+        mixture_key = (
+            np.asarray(ms.budget_params["mixture_logits"],
+                       dtype=np.float64).tobytes(),
+            int(loan_type),
+            b.tobytes(),
+        )
+    else:
+        mixture_key = None
+    key = (deg, deg_budget, sigma, nb, mixture_key)
     if key not in _EDU_JOINT_CACHE:
         e_nodes, we = _wage_quadrature(j, deg)
         standard_nodes, wz = _budget_standard(deg_budget)
         e_joint = np.tile(e_nodes, len(standard_nodes))
         z_standard_joint = np.repeat(standard_nodes, len(e_nodes))
         w_joint = np.kron(wz, we)
-        w_vis = np.repeat(w_joint, nb)
+        if mixture_key is None:
+            w_vis = np.repeat(w_joint, nb)
+        else:
+            n_joint = len(w_joint)
+            p_need = bs.mixture_probability(
+                ms.budget_params, loan_type=loan_type, has_debt=(b > 0)
+            )
+            w_mixture = np.empty((2 * n_joint, nb))
+            w_mixture[:n_joint] = w_joint[:, None] * p_need[None, :]
+            w_mixture[n_joint:] = w_joint[:, None] * (1.0 - p_need[None, :])
+            e_joint = np.concatenate((e_joint, e_joint))
+            w_vis = w_mixture.reshape(-1)
         _EDU_JOINT_CACHE[key] = (e_joint, z_standard_joint, w_joint, w_vis)
     return _EDU_JOINT_CACHE[key]
 
@@ -725,16 +763,40 @@ def _edu_payload(j, s, st, period, inv, x1_new, x2, x2_new, b,
         h0 + real_wage[:, None] - ms.tuition(j)
         - (1.0 + ms.r) * b[None, :]
     )
-    z_joint = bs.realization(
-        ms.budget_params,
-        inv,
-        period,
-        z_standard_joint[:, None],
-        loan_type=loan_type,
-        education=int(j[1]),
-        state=x2,
-        pre_choice_resources=pre_choice_resources,
-    ).reshape(-1)
+    # Mixture branch, verbatim from get_expected_conditional: the doubled
+    # ``e_joint`` duplicates the pre-choice resources, so the need component is
+    # built on the first half of the rows and the no-need component reuses the
+    # same standard nodes on top of the shared mean and sigma.
+    if _mixture_active():
+        nb = b.shape[0]
+        n_joint = z_standard_joint.shape[0]
+        mean_need, sigma_need, mean_noneed, sigma_noneed = bs.mixture_components(
+            ms.budget_params,
+            inv,
+            period,
+            loan_type=loan_type,
+            education=int(j[1]),
+            state=x2,
+            pre_choice_resources=pre_choice_resources[:n_joint],
+        )
+        z_need = np.broadcast_to(
+            mean_need + sigma_need * z_standard_joint[:, None], (n_joint, nb)
+        )
+        z_noneed = np.broadcast_to(
+            mean_noneed + sigma_noneed * z_standard_joint[:, None], (n_joint, nb)
+        )
+        z_joint = np.concatenate((z_need, z_noneed)).reshape(-1)
+    else:
+        z_joint = bs.realization(
+            ms.budget_params,
+            inv,
+            period,
+            z_standard_joint[:, None],
+            loan_type=loan_type,
+            education=int(j[1]),
+            state=x2,
+            pre_choice_resources=pre_choice_resources,
+        ).reshape(-1)
 
     resources = ms.get_consumption_resources(
         x1_new, x2_new, b, e_joint, j, financial_parameters, z=z_joint
@@ -800,7 +862,7 @@ def _solve_state(
         for idxs in st.edu_groups[s]:
             j0 = Jx[idxs[0]]
             e_joint, z_standard_joint, w_joint, w_vis = \
-                _edu_joint_nodes(j0, nb)
+                _edu_joint_nodes(j0, nb, b, loan_type)
             z_joint, resources = _edu_payload(
                 j0, s, st, period, inv, x1_new, x2, x2_new, b,
                 financial_parameters, task_cache, e_joint, z_standard_joint,
@@ -823,7 +885,9 @@ def _solve_state(
                 b, kappa0, kappa1,
             )
             for fi in range(nf):
-                v = (payoffs[fi] * w_vis).reshape((len(w_joint), nb)).T
+                # len(e_joint) is the joint node count on both paths: n_joint
+                # without the mixture, 2 * n_joint with it.
+                v = (payoffs[fi] * w_vis).reshape((len(e_joint), nb)).T
                 all_vjt[:, idxs[fi]] = np.sum(v, axis=1)
     else:
         for c in range(Jx.shape[0]):
@@ -836,7 +900,7 @@ def _solve_state(
                 )
             else:
                 e_joint, z_standard_joint, w_joint, w_vis = \
-                    _edu_joint_nodes(j, nb)
+                    _edu_joint_nodes(j, nb, b, loan_type)
                 z_joint, resources = _edu_payload(
                     j, s, st, period, inv, x1_new, x2, x2_new, b,
                     financial_parameters, task_cache, e_joint,
@@ -857,7 +921,7 @@ def _solve_state(
                         sigma_u, c_mat, continuation, inv, b, j, x2, maxdebt,
                         kappa0, kappa1,
                     )
-                v = (max_vjt * w_vis).reshape((len(w_joint), nb)).T
+                v = (max_vjt * w_vis).reshape((len(e_joint), nb)).T
                 all_vjt[:, c] = np.sum(v, axis=1)
 
     # ---- expectation / CCP step, verbatim from get_all_choices ----

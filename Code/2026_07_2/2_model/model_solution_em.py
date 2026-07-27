@@ -1736,6 +1736,50 @@ def get_expected_conditional(
         h0 + real_wage[:, None] - tuition(j)
         - (1.0 + r) * b[None, :]
     )
+
+    # Two-component need mixture: the enrolled-period shock comes from the need
+    # distribution with probability p and from the no-need one otherwise. Each
+    # component keeps the same deg_budget-point rule, so the joint node set
+    # doubles -- need block first, no-need block second, both reusing the same
+    # standard nodes. The weights then stop being debt-invariant, because p
+    # depends on 1{b > 0} and b is the nb axis, so they become an
+    # (2 * n_joint, nb) matrix flattened in the same (node, current debt) order
+    # the reshape below assumes.
+    if bs.mixture_enabled(budget_params):
+        n_joint = len(w_joint)
+        mean_need, sigma_need, mean_noneed, sigma_noneed = bs.mixture_components(
+            budget_params,
+            x1,
+            period,
+            loan_type=task_loan_type,
+            education=int(j[1]),
+            state=x2,
+            pre_choice_resources=pre_choice_resources,
+        )
+        z_need = np.broadcast_to(
+            mean_need + sigma_need * z_standard_joint[:, None], (n_joint, nb)
+        )
+        z_noneed = np.broadcast_to(
+            mean_noneed + sigma_noneed * z_standard_joint[:, None], (n_joint, nb)
+        )
+        z_joint = np.concatenate((z_need, z_noneed)).reshape(-1)
+
+        p_need = bs.mixture_probability(
+            budget_params, loan_type=task_loan_type, has_debt=(b > 0)
+        )
+        w_mixture = np.empty((2 * n_joint, nb))
+        w_mixture[:n_joint] = w_joint[:, None] * p_need[None, :]
+        w_mixture[n_joint:] = w_joint[:, None] * (1.0 - p_need[None, :])
+
+        v = get_conditional(
+            sigma_u, x1, x1_new, x2, x2_new, b, b1,
+            np.concatenate((e_joint, e_joint)), j, period, evt, conterfactual,
+            maxdebt, financial_parameters, z=z_joint
+        ) * w_mixture.reshape(-1)
+
+        v = v.reshape((2 * n_joint, nb)).T
+        return np.sum(v, axis=1)
+
     z_joint = bs.realization(
         budget_params,
         x1,
@@ -2602,6 +2646,11 @@ def _trace_expected_conditional_debug(
         raise NotImplementedError(
             "_trace_expected_conditional_debug does not implement the "
             "loan-type debt-penalty shift; rerun with a zero task shift."
+        )
+    if bs.mixture_enabled(budget_params):
+        raise NotImplementedError(
+            "_trace_expected_conditional_debug does not implement the "
+            "two-component need mixture; rerun with the mixture off."
         )
     nb = np.shape(b)[0]
     e_nodes, we = get_quadrature_wage(deg, mu, j)

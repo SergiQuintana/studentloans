@@ -68,6 +68,7 @@ import model_getccp_sequence as mgs
 import model_getccp_sequence_fast as mgsf
 from model_interpolate_terminal import build_interp_cache 
 import model_fitloans_dynamic as mfd
+import budget_shock as bs
 from model_fitloans_dynamic import estimate_budget_shock_all_education
 from latent_types import TYPE_IDS, load_em_posteriors, validate_q
 #-----------------------------------------------------------------------------------------------#
@@ -149,12 +150,25 @@ BUDGET_SMM_ANNEALING_MAXFUN = 500
 BUDGET_SMM_MAXITER = 1000
 BUDGET_SMM_CCP_WORKERS = 60
 BUDGET_SMM_CELL_WORKERS = None  # automatically one worker per cell, CPU permitting
-# Profiling 2026-07-23: the pooled kernel is bitwise thread-count-invariant, so
-# raising this to 6 uses all 60 server cores (10 cell workers x 6 threads) for
-# a ~1.5x SMM speedup with no other pool active during the SMM phase.
-# Promoted 1 -> 6 on 2026-07-24 (researcher approval; see
-# Agents_Readme/Tasks/ESTIMATION_SPEED_ANALYSIS_2026_07_24.md, point 2).
-BUDGET_SMM_CELL_NUMBA_THREADS = 6
+# Numba threads inside each SMM cell worker. Profiling 2026-07-23: the pooled
+# kernel is bitwise thread-count-invariant, so this only buys speed. The ten
+# education cells get one process each, and nothing else runs during the SMM
+# phase, so the machine is filled when ten workers together cover its threads.
+# Raised 6 -> 12 on 2026-07-27: Sergi reports the server has about 120 threads,
+# and 10 x 12 matches that exactly (the previous 6 covered only half of them,
+# which is why the machine was not at capacity). If those 120 are 60 physical
+# cores with SMT, expect appreciably less than the nominal 2x, since sibling
+# threads share execution units. Set back to 6 to restore the 2026-07-24
+# configuration exactly.
+BUDGET_SMM_CELL_NUMBA_THREADS = 12
+
+
+def _available_cores():
+    """Cores this process may actually use (honors Linux CPU affinity)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
 # "dfols" is the benchmarked faster least-squares alternative (see
 # Agents_Readme/Tasks/STUDENT_LOANS_FIT_MASTER_PLAN.md, section 5).
 # Promoted "hybrid" -> "dfols" on 2026-07-24 (researcher approval; see
@@ -172,10 +186,35 @@ BUDGET_SMM_OPTIMIZER = "dfols"
 #   BUDGET_SMM_MOMENT_SPEC = "flow_split_stock" -> entry/continuation moments
 #       split by observed beginning-of-period debt + at-cap share.
 ESTIMATE_NEW_BORROWING_COST = False
-BUDGET_SMM_MOMENT_SPEC = "flow_split_stock"
+BUDGET_SMM_MOMENT_SPEC = "need_mixture_v1"
 # Spec B, heterogeneous debt aversion (loan-type debt-penalty shift, always the
-# last vector entry; sizes 68/69/71/72): see the master plan.
-ESTIMATE_LOAN_TYPE_DEBT_PENALTY = True
+# last vector entry; sizes 68/69/71/72): see the master plan. Switched off
+# 2026-07-27 together with FREEZE_DEBT_PENALTY: the shift is an additive
+# adjustment to the debt penalty, so estimating it while the penalty itself is
+# held at zero would reintroduce debt aversion for one loan type through the
+# back door, and its participation role is now carried by the mixture's
+# a_type logit.
+ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
+
+# --- Need-mixture switches (2026-07-27) --------------------------------------
+# Two-component need mixture: each enrolled period the residual budget shock is
+# drawn from the NEED component with probability
+#     p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0})
+# and from the NO-NEED component otherwise (budget_shock.NEED_MIXTURE_TIMING;
+# see Agents_Readme/Tasks/2026_07_24_fit_research/IMPLEMENTATION_PLAN.md). Both
+# default to the pre-mixture production behavior; flip them together with the
+# moment specification to run the new one:
+#   ESTIMATE_NEED_MIXTURE = True -> five mixture parameters appended to the
+#       vector, [a0, a_type, a_debt, mu_noneed, sigma_noneed], between the
+#       kappa block and the always-last loan-type shift.
+#   FREEZE_DEBT_PENALTY = True -> the four parental-income debt penalties are
+#       held at zero rather than estimated. They stay in the saved bundle, so
+#       every consumer keeps its current shape.
+#   BUDGET_SMM_MOMENT_SPEC = "need_mixture_v1" -> the moment set of the new
+#       specification (entry/continuation split, the dispersion moments and
+#       the graduation block).
+ESTIMATE_NEED_MIXTURE = True
+FREEZE_DEBT_PENALTY = True
 
 def _timing(stage, start, it=None):
     """Stage-timing print (added 2026-07-24): grep the run log for [TIMING]."""
@@ -243,15 +282,83 @@ def _print_run_header():
     print(f"  BUDGET_SMM_OPTIMIZER          = {BUDGET_SMM_OPTIMIZER}")
     print(f"  BUDGET_SMM_MOMENT_SPEC        = {BUDGET_SMM_MOMENT_SPEC}")
     print(f"  BUDGET_SMM_DRAWS              = {BUDGET_SMM_DRAWS}")
-    print(f"  BUDGET_SMM_CELL_NUMBA_THREADS = {BUDGET_SMM_CELL_NUMBA_THREADS}")
+    print(f"  BUDGET_SMM_CELL_NUMBA_THREADS = {BUDGET_SMM_CELL_NUMBA_THREADS}"
+          f" (available cores {_available_cores()}, "
+          f"{len(bs.BUDGET_EDUCATION_CELLS)} education cells)")
     print(f"  ESTIMATE_NEW_BORROWING_COST   = {ESTIMATE_NEW_BORROWING_COST}")
     print(f"  ESTIMATE_LOAN_TYPE_DEBT_PENALTY = "
           f"{ESTIMATE_LOAN_TYPE_DEBT_PENALTY}")
+    print(f"  ESTIMATE_NEED_MIXTURE         = {ESTIMATE_NEED_MIXTURE}")
+    print(f"  FREEZE_DEBT_PENALTY           = {FREEZE_DEBT_PENALTY}")
+    print(f"  need-mixture timing           = {bs.NEED_MIXTURE_TIMING}")
     print(f"  debt-penalty bounds           = {mfd.DEBT_PENALTY_BOUNDS}")
     print(f"  loan-type shift bounds        = "
           f"{mfd.LOAN_TYPE_DEBT_PENALTY_BOUNDS}")
     print(f"  kappa bounds                  = {mfd.NEW_BORROWING_COST_BOUNDS}")
     print("=" * 70, flush=True)
+
+
+def _print_budget_estimates(it, smm_loss=None):
+    """Budget-shock block of one NPL iteration (extended 2026-07-27).
+
+    Everything the budget SMM estimated this iteration, so the run can be
+    reconstructed from the log alone: the shared blocks and the SMM loss on
+    one line, the need mixture on the next, then one line per education cell
+    with its four parental-income mean levels, its sigma and its resource
+    slope. All lines carry the [ESTIMATES it k] tag, so a single grep on the
+    log returns the whole history. The per-evaluation detail is printed by
+    the SMM itself; this is the per-iteration summary. As before, a failure
+    here is reported and swallowed: no log line may stop the NPL loop.
+    """
+    try:
+        bundle = np.load(
+            f"{path_estimates}/budgetshock_params.npy", allow_pickle=True,
+        ).item()
+        loss = "n/a" if smm_loss is None else f"{float(smm_loss):.6f}"
+        # Watch the debt penalties against their (-100, 0) bounds and the
+        # risk aversions against their 3 cap directly in the log.
+        print(
+            f"[ESTIMATES it {it}] debt_pen_parinc="
+            f"{np.round(np.asarray(bundle['debt_pen_parinc']), 3)}"
+            f" | risk_aversion="
+            f"{np.round(np.asarray(bundle['risk_aversion']), 4)}"
+            f" | loan_type_shift="
+            f"{float(bundle.get('debt_penalty_loan_type_shift', 0.0)):.4f}"
+            f" | smm_loss={loss}",
+            flush=True,
+        )
+        logits = bundle.get("mixture_logits")
+        if logits is None:
+            print(f"[ESTIMATES it {it}] need mixture off", flush=True)
+        else:
+            a0, a_type, a_debt = np.asarray(logits, dtype=np.float64)
+            print(
+                f"[ESTIMATES it {it}] need mixture: a0={a0:.4f} "
+                f"a_type={a_type:.4f} a_debt={a_debt:.4f}"
+                f" | mu_noneed={float(bundle['mixture_noneed_mean']):,.1f}"
+                f" | sigma_noneed={float(bundle['mixture_noneed_sigma']):,.1f}",
+                flush=True,
+            )
+        # The cell means are stored as an intercept plus three
+        # parental-income deviations; print the four LEVELS instead, which
+        # is what the moments target.
+        mu_blocks = np.asarray(bundle["mu_blocks"], dtype=np.float64)
+        mean_levels = mu_blocks[:, 0:1] + np.column_stack(
+            (np.zeros(mu_blocks.shape[0]), mu_blocks[:, 1:4])
+        )
+        sigma_e = np.asarray(bundle["sigma_e"], dtype=np.float64)
+        slopes = np.asarray(bundle["budget_resource_slope"], dtype=np.float64)
+        cells = np.asarray(bundle["periods"], dtype=np.int64)
+        for index, cell in enumerate(cells):
+            print(
+                f"[ESTIMATES it {it}] cell {int(cell)}: mu="
+                f"{np.round(mean_levels[index], 1)}"
+                f" | sigma={sigma_e[index]:,.1f}"
+                f" | resource_slope={slopes[index]:.4f}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ESTIMATES it {it}] bundle summary failed: {exc}", flush=True)
 
 
 if __name__ == '__main__':
@@ -496,7 +603,9 @@ if __name__ == '__main__':
 
             mfd.ESTIMATE_NEW_BORROWING_COST = ESTIMATE_NEW_BORROWING_COST
             mfd.ESTIMATE_LOAN_TYPE_DEBT_PENALTY = ESTIMATE_LOAN_TYPE_DEBT_PENALTY
-            estimate_budget_shock_all_education(
+            mfd.ESTIMATE_NEED_MIXTURE = ESTIMATE_NEED_MIXTURE
+            mfd.FREEZE_DEBT_PENALTY = FREEZE_DEBT_PENALTY
+            smm_result, _ = estimate_budget_shock_all_education(
                 draws=BUDGET_SMM_DRAWS,
                 maxiter=BUDGET_SMM_MAXITER,
                 optimizer=BUDGET_SMM_OPTIMIZER,
@@ -514,25 +623,9 @@ if __name__ == '__main__':
             )
             ms.reload_budgetshock_params()
             _timing("budget SMM", _stage_started, it)
-            # One-line estimate summary per iteration (added 2026-07-24):
-            # watch the debt penalties against their (-100, 0) bounds and
-            # the risk aversions against their 3 cap directly in the log.
-            try:
-                _bundle = np.load(
-                    f"{path_estimates}/budgetshock_params.npy",
-                    allow_pickle=True,
-                ).item()
-                print(
-                    f"[ESTIMATES it {it}] debt_pen_parinc="
-                    f"{np.round(np.asarray(_bundle['debt_pen_parinc']), 3)}"
-                    f" | risk_aversion="
-                    f"{np.round(np.asarray(_bundle['risk_aversion']), 4)}"
-                    f" | loan_type_shift="
-                    f"{float(_bundle.get('debt_penalty_loan_type_shift', 0.0)):.4f}",
-                    flush=True,
-                )
-            except Exception as _exc:  # noqa: BLE001
-                print(f"[ESTIMATES it {it}] bundle summary failed: {_exc}")
+            # Estimate summary per iteration (added 2026-07-24, extended to
+            # the full budget-shock block 2026-07-27).
+            _print_budget_estimates(it, getattr(smm_result, "fun", None))
 
         #--------------------------------------#
         # Solve the model with ccps

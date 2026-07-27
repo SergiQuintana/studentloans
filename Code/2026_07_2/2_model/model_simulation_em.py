@@ -826,6 +826,16 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
     )
     budget_psi_educ = np.empty(n_educ, dtype=np.float64)
     budget_standard_draw = np.random.standard_normal(n_educ)
+    # Two-component need mixture (see budget_shock.NEED_MIXTURE_TIMING): with
+    # probability p the shock comes from the need component (the per-cell
+    # distribution below), otherwise from the shared no-need component. The
+    # component-selecting uniform is drawn ONLY when the mixture is active,
+    # because any extra draw here would shift this cohort's global random
+    # stream and change every later draw of the simulation.
+    need_mixture = bs.mixture_enabled(budget_params)
+    if need_mixture:
+        budget_uniform_draw = np.random.random(n_educ)
+        has_debt_educ = debt_range[x_educ[:, 15].astype(np.int64)] > 0.0
     for education in (1, 2, 3):
         education_rows = np.flatnonzero(
             choices_educ_original[:, 1].astype(np.int64) == education
@@ -838,6 +848,20 @@ def move_states_and_debt(sigma_u,x,choices,period,conterfactual,types,maxdebt,co
         for cell_code in np.unique(cell_codes):
             rows = education_rows[cell_codes == cell_code]
             program_year = int(cell_code - 100 * education)
+            if need_mixture:
+                budget_psi_educ[rows] = bs.realization_mixture(
+                    budget_params,
+                    x1_educ[rows],
+                    period,
+                    budget_standard_draw[rows],
+                    budget_uniform_draw[rows],
+                    has_debt_educ[rows],
+                    loan_type=loan_types[rows],
+                    education=education,
+                    program_year=program_year,
+                    pre_choice_resources=pre_choice_resources[rows],
+                )
+                continue
             budget_psi_educ[rows] = bs.realization(
                 budget_params,
                 x1_educ[rows],

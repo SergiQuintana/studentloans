@@ -58,6 +58,16 @@ DEBT_PENALTY_TIMING = "flow_explicit_horizon_periods_1_through_9"
 # is charged exactly once in the period of the borrowing event, with no
 # discounting multiplier ever.
 NEW_BORROWING_COST_TIMING = "one_shot_event_no_multiplier"
+# Two-component budget shock. Each enrolled period the residual shock is drawn
+# from the "need" distribution with probability p and from the "no-need"
+# distribution with probability 1 - p, where
+#     p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0}).
+# The need component reuses the existing per-cell mean blocks, sigma and
+# resource slope; the no-need component has its own shared mean and sigma.
+# Both components and all three logits are estimated. Absent parameters mean
+# the mixture is OFF and every consumer keeps its single-normal behavior.
+NEED_MIXTURE_TIMING = "two_component_loan_type_probability_v1"
+N_MIXTURE_PARAMETERS = 5
 BUDGET_EDUCATION_CELLS = tuple(
     (education, year)
     for education, cap in EDUCATION_BUDGET_YEAR_CAP.items()
@@ -164,13 +174,16 @@ def estimation_vector_size(periods, loan_heterogeneity: str = "homogeneous") -> 
 def estimation_vector_size_multicell(
     n_cells: int, include_new_borrowing: bool = False,
     include_loan_type_debt_penalty: bool = False,
+    include_need_mixture: bool = False,
 ) -> int:
     """Number of SMM parameters in the multicell parental-income vector.
 
     Tail layout (each block optional, in this order): three new-borrowing
-    costs (kappa), then one loan-type debt-penalty shift. With ten cells the
-    accepted sizes are 68 (base), 69 (base + shift), 71 (base + kappa), and
-    72 (base + kappa + shift); the shift is always the last entry.
+    costs (kappa), five need-mixture parameters, then one loan-type
+    debt-penalty shift. With ten cells the accepted sizes are 68 (base),
+    69 (base + shift), 71 (base + kappa), 72 (base + kappa + shift),
+    73 (base + mixture), 74 (base + mixture + shift), 76 (base + kappa +
+    mixture) and 77 (all); the shift is always the last entry.
     """
     n_cells = int(n_cells)
     if n_cells < 2:
@@ -181,9 +194,34 @@ def estimation_vector_size_multicell(
     )
     if include_new_borrowing:
         size += N_NEW_BORROWING_PARAMETERS
+    if include_need_mixture:
+        size += N_MIXTURE_PARAMETERS
     if include_loan_type_debt_penalty:
         size += N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS
     return size
+
+
+def _decode_multicell_tail(extra: int) -> tuple[bool, bool, bool]:
+    """Which optional tail blocks a vector carries, from its extra length.
+
+    The three block sizes (3 kappa, 5 mixture, 1 shift) give eight distinct
+    totals, so the combination is recovered without ambiguity.
+    """
+    for has_kappa in (False, True):
+        for has_mixture in (False, True):
+            for has_shift in (False, True):
+                size = (
+                    N_NEW_BORROWING_PARAMETERS * has_kappa
+                    + N_MIXTURE_PARAMETERS * has_mixture
+                    + N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS * has_shift
+                )
+                if size == extra:
+                    return has_kappa, has_mixture, has_shift
+    raise ValueError(
+        f"Multicell parental-income vector has {extra} entries past the base "
+        "block; expected a combination of 3 (new-borrowing costs), 5 (need "
+        "mixture) and 1 (loan-type debt-penalty shift)."
+    )
 
 
 def unpack_estimation_vector(
@@ -329,48 +367,56 @@ def unpack_parental_income_multicell_estimation_vector(
     zero current debt and the shared continuation cost with positive current
     debt.  Legacy vectors without them unpack to zero costs.
 
+    Five further optional entries carry the two-component need mixture:
+    ``[a0, a_type, a_debt, mu_noneed, sigma_noneed]``.  The first three are
+    the logits of the probability of drawing the need component; the last two
+    are the shared mean and standard deviation of the no-need component.  The
+    per-cell blocks above then describe the NEED component.
+
     A further optional tail entry, ALWAYS the last one after whatever kappa
-    tail is active, is ``debt_penalty_loan_type_shift``: the additive
-    per-period debt-penalty shift of the debt-averse latent loan type
+    and mixture tails are active, is ``debt_penalty_loan_type_shift``: the
+    additive per-period debt-penalty shift of the debt-averse latent loan type
     (``DEBT_PENALTY_SHIFT_LOAN_TYPE``, the low-borrowing type 0).  Accepted
-    sizes are therefore base (68 with ten cells), base+1 (shift only),
-    base+3 (kappa only), and base+4 (kappa plus shift).  Vectors without it
-    unpack to a zero shift.
+    sizes are therefore base (68 with ten cells) plus any combination of
+    3 (kappa), 5 (mixture) and 1 (shift).  Vectors without a block unpack to
+    the neutral value for that block: zero costs, no mixture, a zero shift.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
     periods = np.asarray(periods, dtype=np.int64).reshape(-1)
     block_size = PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL * periods.size
     expected = block_size + N_RISK_PARAMETERS + N_DEBT_PENALTY_PARAMETERS
-    expected_shift = expected + N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS
-    expected_extended = expected + N_NEW_BORROWING_PARAMETERS
-    expected_extended_shift = (
-        expected_extended + N_LOAN_TYPE_DEBT_PENALTY_PARAMETERS
-    )
     if periods.size < 2:
         raise ValueError("The multicell parameterization requires at least two cells.")
     if np.unique(periods).size != periods.size:
         raise ValueError("Multicell education-cell codes must be unique.")
-    if vector.size not in (
-        expected, expected_shift, expected_extended, expected_extended_shift,
-    ):
+    if vector.size < expected:
         raise ValueError(
             f"Multicell parental-income vector has {vector.size} entries; "
-            f"expected {expected} (legacy), {expected_shift} (with the "
-            f"loan-type debt-penalty shift), {expected_extended} (with "
-            f"new-borrowing costs), or {expected_extended_shift} (with both)."
+            f"expected at least {expected}."
         )
+    has_kappa, has_mixture, has_shift = _decode_multicell_tail(
+        vector.size - expected
+    )
     shared_risk_aversion = vector[block_size:block_size + N_RISK_PARAMETERS]
     debt_levels = vector[block_size + N_RISK_PARAMETERS:expected]
-    if vector.size in (expected_extended, expected_extended_shift):
-        new_borrow_entry = vector[expected:expected + 2].copy()
-        new_borrow_continuation = float(vector[expected + 2])
+    tail = expected
+    if has_kappa:
+        new_borrow_entry = vector[tail:tail + 2].copy()
+        new_borrow_continuation = float(vector[tail + 2])
+        tail += N_NEW_BORROWING_PARAMETERS
     else:
         new_borrow_entry = np.zeros(2, dtype=np.float64)
         new_borrow_continuation = 0.0
-    if vector.size in (expected_shift, expected_extended_shift):
-        debt_penalty_loan_type_shift = float(vector[-1])
+    if has_mixture:
+        mixture_logits = vector[tail:tail + 3].copy()
+        mixture_noneed_mean = float(vector[tail + 3])
+        mixture_noneed_sigma = float(vector[tail + 4])
+        tail += N_MIXTURE_PARAMETERS
     else:
-        debt_penalty_loan_type_shift = 0.0
+        mixture_logits = None
+        mixture_noneed_mean = 0.0
+        mixture_noneed_sigma = 0.0
+    debt_penalty_loan_type_shift = float(vector[-1]) if has_shift else 0.0
     index_kind = str(index_kind)
     if index_kind not in INDEX_KINDS:
         raise ValueError(f"index_kind must be one of {INDEX_KINDS}")
@@ -409,6 +455,10 @@ def unpack_parental_income_multicell_estimation_vector(
         "new_borrow_cost_continuation": new_borrow_continuation,
         "new_borrowing_cost_timing": NEW_BORROWING_COST_TIMING,
         "debt_penalty_loan_type_shift": debt_penalty_loan_type_shift,
+        "mixture_logits": mixture_logits,
+        "mixture_noneed_mean": mixture_noneed_mean,
+        "mixture_noneed_sigma": mixture_noneed_sigma,
+        "need_mixture_timing": NEED_MIXTURE_TIMING,
         "estimation_parameterization": "parental_income_basic_multicell_shared_risk_debt",
     }
     if index_kind == "education_cell":
@@ -468,6 +518,9 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     borrow_timing = out.get("new_borrowing_cost_timing")
     if borrow_timing is not None and borrow_timing != NEW_BORROWING_COST_TIMING:
         raise ValueError(f"Unsupported new_borrowing_cost_timing: {borrow_timing!r}")
+    mixture_timing = out.get("need_mixture_timing")
+    if mixture_timing is not None and mixture_timing != NEED_MIXTURE_TIMING:
+        raise ValueError(f"Unsupported need_mixture_timing: {mixture_timing!r}")
     out["mu_blocks"] = np.asarray(out["mu_blocks"], dtype=np.float64)
     out["sigma_e"] = np.asarray(out["sigma_e"], dtype=np.float64)
     out["debt_pen_parinc"] = np.asarray(out["debt_pen_parinc"], dtype=np.float64)
@@ -504,6 +557,29 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
     out["debt_penalty_loan_type_shift"] = float(
         out.get("debt_penalty_loan_type_shift", 0.0)
     )
+    # Legacy bundles carry no mixture: ``mixture_logits`` stays None and every
+    # consumer keeps the single-normal path unchanged.
+    logits = out.get("mixture_logits")
+    if logits is None:
+        out["mixture_logits"] = None
+        out["mixture_noneed_mean"] = float(out.get("mixture_noneed_mean", 0.0))
+        out["mixture_noneed_sigma"] = float(out.get("mixture_noneed_sigma", 0.0))
+    else:
+        logits = np.asarray(logits, dtype=np.float64).reshape(-1)
+        if logits.shape != (3,):
+            raise ValueError(
+                "mixture_logits must have three entries [a0, a_type, a_debt]"
+            )
+        if not np.all(np.isfinite(logits)):
+            raise ValueError("mixture_logits contains non-finite values")
+        out["mixture_logits"] = logits
+        out["mixture_noneed_mean"] = float(out["mixture_noneed_mean"])
+        out["mixture_noneed_sigma"] = float(out["mixture_noneed_sigma"])
+        if not np.isfinite(out["mixture_noneed_mean"]):
+            raise ValueError("mixture_noneed_mean must be finite")
+        if not np.isfinite(out["mixture_noneed_sigma"]) or out["mixture_noneed_sigma"] <= 0:
+            raise ValueError("mixture_noneed_sigma must be positive and finite")
+        out["need_mixture_timing"] = NEED_MIXTURE_TIMING
     if out["mu_blocks"].shape != (p, N_MEAN_PARAMETERS):
         raise ValueError("mu_blocks must have shape (number of periods, 7)")
     if out["sigma_e"].shape != (p,) or np.any(out["sigma_e"] <= 0):
@@ -803,6 +879,90 @@ def new_borrowing_cost(spec: dict[str, Any], has_debt, loan_type=None):
         entry_cost = entry[loan]
     cost = np.where(has_debt, continuation, entry_cost)
     return float(cost) if cost.ndim == 0 else cost
+
+
+def mixture_enabled(spec: dict[str, Any]) -> bool:
+    """True when the two-component need mixture is active."""
+    return spec.get("mixture_logits") is not None
+
+
+def mixture_probability(spec: dict[str, Any], loan_type=None, has_debt=False):
+    """Probability of drawing the NEED component.
+
+    ``p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0})``.
+    Broadcasts over ``loan_type`` and ``has_debt``; returns a float when both
+    are scalars. Raises if the mixture is not active.
+    """
+    if not mixture_enabled(spec):
+        raise ValueError("Budget-shock specification has no need mixture")
+    a0, a_type, a_debt = (float(value) for value in spec["mixture_logits"])
+    loan = 0.0 if loan_type is None else np.asarray(loan_type, dtype=np.float64)
+    debt = np.asarray(has_debt, dtype=np.float64)
+    linear = a0 + a_type * loan + a_debt * debt
+    # Stable logistic: exp is evaluated on the non-positive branch only.
+    positive = linear >= 0.0
+    exp_negative = np.exp(-np.abs(linear))
+    probability = np.where(
+        positive, 1.0 / (1.0 + exp_negative), exp_negative / (1.0 + exp_negative)
+    )
+    return float(probability) if np.ndim(probability) == 0 else probability
+
+
+def mixture_components(
+    spec: dict[str, Any], x1: np.ndarray, period: int | None = None,
+    loan_type=None, *, education=None, state=None, program_year=None,
+    pre_choice_resources=None,
+):
+    """(mean, sigma) of the need component and of the no-need component.
+
+    The need component is the existing per-cell distribution; the no-need
+    component is the shared pair estimated alongside it. Quadrature builders
+    call this once and lay both components' nodes side by side.
+    """
+    if not mixture_enabled(spec):
+        raise ValueError("Budget-shock specification has no need mixture")
+    support_keywords = dict(
+        education=education, state=state, program_year=program_year,
+    )
+    mean_need = conditional_mean(
+        spec, x1, period, loan_type=loan_type,
+        pre_choice_resources=pre_choice_resources, **support_keywords,
+    )
+    sigma_need = conditional_sigma(
+        spec, period, loan_type=loan_type, **support_keywords,
+    )
+    return (
+        mean_need,
+        sigma_need,
+        float(spec["mixture_noneed_mean"]),
+        float(spec["mixture_noneed_sigma"]),
+    )
+
+
+def realization_mixture(
+    spec: dict[str, Any], x1: np.ndarray, period: int,
+    standard_draw: np.ndarray, uniform_draw: np.ndarray, has_debt,
+    loan_type=None, *, education=None, state=None, program_year=None,
+    pre_choice_resources=None,
+) -> np.ndarray:
+    """Realized shock under the two-component mixture.
+
+    ``uniform_draw`` selects the component and ``standard_draw`` is reused by
+    both, so a parameter change moves the shock smoothly under common random
+    numbers. The SMM estimator and the forward simulation both go through
+    this transform; ``realization`` remains the single-component path.
+    """
+    mean_need, sigma_need, mean_noneed, sigma_noneed = mixture_components(
+        spec, x1, period, loan_type=loan_type, education=education,
+        state=state, program_year=program_year,
+        pre_choice_resources=pre_choice_resources,
+    )
+    standard_draw = np.asarray(standard_draw, dtype=np.float64)
+    probability = mixture_probability(spec, loan_type=loan_type, has_debt=has_debt)
+    need = mean_need + sigma_need * standard_draw
+    noneed = mean_noneed + sigma_noneed * standard_draw
+    return np.where(np.asarray(uniform_draw, dtype=np.float64) < probability,
+                    need, noneed)
 
 
 def realization(spec: dict[str, Any], x1: np.ndarray, period: int,
