@@ -117,8 +117,22 @@ EXTENDED_PARENTAL_INCOME_MOMENT_SPECS = (
 # existing validation keeps its exact current membership; the multicell
 # estimator validates against the tuple below instead.
 NEED_MIXTURE_MOMENT_SPEC = "need_mixture_v1"
+# need_mixture_v2 (researcher decision 2026-07-27): identical eight per-cell
+# moments; the graduation block keeps only the share indebted and the mean
+# positive debt per quartile (median/p90 and the two pooled persistence
+# moments are dropped); six pooled posterior-weighted loan-type moments are
+# added (entry rate, continuation rate, and mean positive flow, each for the
+# low and high latent loan type — see ``build_loan_type_block``). The type is
+# never assigned on the data side: observed outcomes are weighted by each
+# individual's marginal posterior P(loan type), the same methodology as
+# ``parental_income_loan_type_distribution_moments``; the simulated side uses
+# the persistent sampled loan type, whose expectation is that same posterior.
+NEED_MIXTURE_V2_MOMENT_SPEC = "need_mixture_v2"
+NEED_MIXTURE_MOMENT_SPECS = (
+    NEED_MIXTURE_MOMENT_SPEC, NEED_MIXTURE_V2_MOMENT_SPEC,
+)
 MULTICELL_PARENTAL_INCOME_MOMENT_SPECS = (
-    EXTENDED_PARENTAL_INCOME_MOMENT_SPECS + (NEED_MIXTURE_MOMENT_SPEC,)
+    EXTENDED_PARENTAL_INCOME_MOMENT_SPECS + NEED_MIXTURE_MOMENT_SPECS
 )
 SPLIT_MOMENT_MINIMUM_GROUP_N = 30
 STOCK_MOMENT_WEIGHT = 2.0
@@ -143,6 +157,20 @@ GRADUATION_MOMENT_WEIGHTS = (4.0, 2.0, 1.0, 1.0)
 GRADUATION_SCALE_FLOORS = (0.02, 500.0, 500.0, 500.0)
 PERSISTENCE_MOMENT_WEIGHTS = (3.0, 3.0)
 PERSISTENCE_SCALE_FLOORS = (0.02, 0.05)
+# need_mixture_v2 graduation block: share indebted and mean positive debt per
+# quartile only (researcher decision 2026-07-27).
+GRADUATION_V2_MOMENT_WEIGHTS = (4.0, 2.0)
+GRADUATION_V2_SCALE_FLOORS = (0.02, 500.0)
+# Pooled loan-type block of need_mixture_v2, in the ordering of
+# ``loan_type_block_moments``: [entry rate low, entry rate high, continuation
+# rate low, continuation rate high, mean positive flow low, mean positive
+# flow high]. Entry and continuation by type are where the mixture logits
+# a_type and a_debt live; the mean-flow pair is the overidentifying check
+# that conditional amounts stay nearly flat across types (the specification
+# has no type-specific amount parameter, so any simulated gap is pure
+# composition).
+LOAN_TYPE_BLOCK_MOMENT_WEIGHTS = (3.0, 3.0, 3.0, 3.0, 1.0, 1.0)
+LOAN_TYPE_BLOCK_SCALE_FLOORS = (0.02, 0.02, 0.02, 0.02, 500.0, 500.0)
 # Estimate the one-shot new-borrowing event cost (kappa) block. When False,
 # the production SMM keeps its exact current behavior: a 68-entry multicell
 # vector, unchanged moments, and kernels whose zero-kappa path is numerically
@@ -1241,7 +1269,7 @@ def _warn_thin_simulated_groups(parinc, flow, begin_debt, cell_label):
             if group_n < SPLIT_MOMENT_MINIMUM_GROUP_N:
                 _WARNED_THIN_SIMULATED_GROUPS.add(key)
                 print(
-                    f"WARNING [{cell_label}] {NEED_MIXTURE_MOMENT_SPEC} "
+                    f"WARNING [{cell_label}] need-mixture "
                     f"SIMULATED group parinc={level}, {status_name}: "
                     f"N={group_n} positive flows < "
                     f"{SPLIT_MOMENT_MINIMUM_GROUP_N}."
@@ -1348,15 +1376,18 @@ def _nearest_debt_grid_value(values):
     return debt_range[np.where(take_lower, lower, upper)]
 
 
-def graduation_block_moments(panel, flow, eps=0.01):
+def graduation_block_moments(
+    panel, flow, eps=0.01, moment_spec=NEED_MIXTURE_MOMENT_SPEC,
+):
     """Graduation-debt and persistence moments for one flow vector.
 
     ``flow`` is one annual-flow value per panel column, in the pooled column
     order: the observed flows for the data targets, one simulated draw for the
     simulated targets. Debt at graduation accumulates those flows along each
     person's observed enrollment sequence at the model interest rate and is
-    then measured on the model debt grid, on both sides. The moment ordering
-    is, for each parental-income quartile over four-year completers,
+    then measured on the model debt grid, on both sides. Under the default
+    ``need_mixture_v1`` the moment ordering is, for each parental-income
+    quartile over four-year completers,
 
       1. share with positive debt at graduation;
       2. mean positive debt at graduation;
@@ -1370,10 +1401,17 @@ def graduation_block_moments(panel, flow, eps=0.01):
       18. within-person lag-1 autocorrelation of log positive flow over
           adjacent enrolled periods.
 
-    The last two are what pin the within-person amount margin: the per-cell
-    moments leave graduation median free by 24-31% and p90 by 13-24%, and
-    these two shrink that spread by about 90%.
+    Under ``need_mixture_v2`` only the first two per-quartile moments are
+    produced (eight in total) and the persistence pair is dropped entirely
+    (researcher decision 2026-07-27: the loan-type block takes over the
+    type-composition margin, and amount persistence is deferred to the
+    three-level loan type).
     """
+    if moment_spec not in NEED_MIXTURE_MOMENT_SPECS:
+        raise ValueError(
+            f"moment_spec must be one of {NEED_MIXTURE_MOMENT_SPECS}."
+        )
+    reduced = moment_spec == NEED_MIXTURE_V2_MOMENT_SPEC
     flow = np.asarray(flow, dtype=np.float64).reshape(-1)
     if flow.size != panel["order"].size:
         raise ValueError("flow must contain one value per graduation-panel column.")
@@ -1392,15 +1430,21 @@ def graduation_block_moments(panel, flow, eps=0.01):
         group_n = int(selected.sum())
         indebted = selected & positive_debt
         if group_n == 0 or not np.any(indebted):
-            output.extend((eps, eps, eps, eps))
+            output.extend((eps, eps) if reduced else (eps, eps, eps, eps))
             continue
         values = debt[indebted]
-        output.extend((
+        group = (
             float(np.sum(indebted)) / group_n,
             float(np.mean(values)),
-            float(np.median(values)),
-            float(np.percentile(values, 90)),
-        ))
+        )
+        if not reduced:
+            group += (
+                float(np.median(values)),
+                float(np.percentile(values, 90)),
+            )
+        output.extend(group)
+    if reduced:
+        return np.asarray(output, dtype=np.float64)
 
     positive_flow = flow > 0.0
     borrowing_years = np.bincount(
@@ -1425,25 +1469,161 @@ def graduation_block_moments(panel, flow, eps=0.01):
     return np.asarray(output, dtype=np.float64)
 
 
-def graduation_block_loss_and_residuals(simulated, data_moments):
+def graduation_block_loss_and_residuals(
+    simulated, data_moments, moment_spec=NEED_MIXTURE_MOMENT_SPEC,
+):
     """The pooled graduation block's weighted loss and its residuals.
 
-    Weights are 4/2/1/1 on the four graduation moments of each parental-income
-    quartile and 3 on each pooled persistence moment. Standardization uses the
-    same per-moment scale floors as the rest of ``need_mixture_v1``, so a
-    near-zero data moment cannot dominate. ``sum(residuals**2) == loss``.
+    Under the default ``need_mixture_v1``, weights are 4/2/1/1 on the four
+    graduation moments of each parental-income quartile and 3 on each pooled
+    persistence moment; under ``need_mixture_v2``, 4/2 on the two remaining
+    per-quartile moments. Standardization uses the same per-moment scale
+    floors as the rest of the specification, so a near-zero data moment
+    cannot dominate. ``sum(residuals**2) == loss``.
     """
     simulated = np.asarray(simulated, dtype=np.float64)
     data_moments = np.asarray(data_moments, dtype=np.float64)
-    weights = np.concatenate((
-        np.tile(GRADUATION_MOMENT_WEIGHTS, 4), PERSISTENCE_MOMENT_WEIGHTS
-    ))
-    floors = np.concatenate((
-        np.tile(GRADUATION_SCALE_FLOORS, 4), PERSISTENCE_SCALE_FLOORS
-    ))
+    if moment_spec == NEED_MIXTURE_V2_MOMENT_SPEC:
+        weights = np.tile(GRADUATION_V2_MOMENT_WEIGHTS, 4)
+        floors = np.tile(GRADUATION_V2_SCALE_FLOORS, 4)
+    else:
+        weights = np.concatenate((
+            np.tile(GRADUATION_MOMENT_WEIGHTS, 4), PERSISTENCE_MOMENT_WEIGHTS
+        ))
+        floors = np.concatenate((
+            np.tile(GRADUATION_SCALE_FLOORS, 4), PERSISTENCE_SCALE_FLOORS
+        ))
     if simulated.size != weights.size or data_moments.size != weights.size:
         raise ValueError(
             f"The graduation block has {weights.size} moments; received "
+            f"{data_moments.size} data and {simulated.size} simulated."
+        )
+    valid = np.isfinite(data_moments) & np.isfinite(simulated)
+    scale = np.maximum(np.abs(data_moments), floors)
+    standardized_error = (simulated - data_moments) / scale
+    loss = float(np.sum(weights[valid] * standardized_error[valid] ** 2))
+    residuals = np.zeros(weights.size, dtype=np.float64)
+    residuals[valid] = np.sqrt(weights[valid]) * standardized_error[valid]
+    return loss, residuals
+
+
+def build_loan_type_block(contexts):
+    """Column-order arrays behind the pooled loan-type moments (need_mixture_v2).
+
+    Columns follow the exact pooled order the cell evaluations produce (the
+    same convention as ``build_graduation_panel``): cells in ``contexts``
+    order and, within a cell, the prepared model-period packs in their
+    preparation order, so any per-draw flow vector the kernels ship back
+    reads off directly.
+
+    The latent loan type is never assigned on the data side. Each observed
+    outcome is weighted by the individual's marginal posterior
+    P(loan type | data) — the loan-margin sum of the EM posterior row ``q``,
+    the same posterior-weighting methodology as
+    ``parental_income_loan_type_distribution_moments``. Because that weight
+    is the expected type indicator, the weighted average is consistent for
+    the true type-conditional moment. The simulated side uses the persistent
+    sampled loan type (one posterior draw per person) as a hard indicator,
+    whose expectation across persons is that same posterior weight, so both
+    sides estimate the identical posterior-weighted object.
+    """
+    begin_debt, observed_flow, posterior_high, sampled_loan_type = [], [], [], []
+    for context in contexts:
+        for pack in context["sample_by_period"].values():
+            n = len(pack["x1"])
+            begin_debt.append(np.asarray(pack["debt"], dtype=np.float64))
+            observed_flow.append(
+                np.asarray(pack["loan_flow"], dtype=np.float64)
+            )
+            q = validate_q(pack["q"], n_individuals=n)
+            posterior_high.append(
+                q[:, np.flatnonzero(TYPE_LOAN == 1)].sum(axis=1)
+            )
+            sampled_loan_type.append(
+                np.asarray(pack["sampled_loan_type"], dtype=np.int64)
+            )
+    begin_debt = np.concatenate(begin_debt)
+    observed_flow = np.concatenate(observed_flow)
+    posterior_high = np.concatenate(posterior_high)
+    sampled_loan_type = np.concatenate(sampled_loan_type)
+    if not np.all(np.isin(sampled_loan_type, (0, 1))):
+        raise ValueError("sampled_loan_type must contain only zero and one.")
+    return {
+        "begin_debt": np.ascontiguousarray(begin_debt, dtype=np.float64),
+        "observed_flow": np.ascontiguousarray(observed_flow, dtype=np.float64),
+        # Row per loan type (low then high), one column per pooled
+        # observation. Data weights are the posterior type probabilities;
+        # simulation weights are the sampled-type indicators.
+        "data_weights": np.ascontiguousarray(
+            np.stack((1.0 - posterior_high, posterior_high)),
+            dtype=np.float64,
+        ),
+        "sim_weights": np.ascontiguousarray(
+            np.stack((sampled_loan_type == 0, sampled_loan_type == 1)),
+            dtype=np.float64,
+        ),
+    }
+
+
+def loan_type_block_moments(begin_debt, flow, type_weights, eps=0.01):
+    """Six pooled loan-type moments for one flow vector (need_mixture_v2).
+
+    Ordering: [entry rate low, entry rate high, continuation rate low,
+    continuation rate high, mean positive flow low, mean positive flow high].
+    ``type_weights`` is the ``(2, n)`` row-per-loan-type weight matrix from
+    ``build_loan_type_block``: posterior probabilities for the observed data
+    targets, sampled-type indicators for the simulated ones. Restriction
+    sets reuse the observed beginning-of-period debt state, so the debt
+    split is identical in data and simulation, exactly like the per-cell
+    entry/continuation moments. Empty groups receive the ``eps`` floor.
+    """
+    begin_debt = np.asarray(begin_debt, dtype=np.float64).reshape(-1)
+    flow = np.asarray(flow, dtype=np.float64).reshape(-1)
+    type_weights = np.asarray(type_weights, dtype=np.float64)
+    if flow.shape != begin_debt.shape:
+        raise ValueError("flow and begin_debt must align.")
+    if type_weights.shape != (2, flow.size):
+        raise ValueError(
+            f"type_weights must have shape {(2, flow.size)}; received "
+            f"{type_weights.shape}."
+        )
+    has_debt = begin_debt > 0.0
+    positive_flow = flow > 0.0
+    entry, continuation, mean_flow = [], [], []
+    for loan_level in (0, 1):
+        weights = type_weights[loan_level]
+        for mask, destination in (
+            (~has_debt, entry), (has_debt, continuation),
+        ):
+            denominator = float(np.sum(weights[mask]))
+            destination.append(
+                float(np.sum(weights[mask] * positive_flow[mask]))
+                / denominator
+                if denominator > 0.0 else eps
+            )
+        denominator = float(np.sum(weights[positive_flow]))
+        mean_flow.append(
+            float(np.sum(weights[positive_flow] * flow[positive_flow]))
+            / denominator
+            if denominator > 0.0 else eps
+        )
+    return np.asarray(entry + continuation + mean_flow, dtype=np.float64)
+
+
+def loan_type_block_loss_and_residuals(simulated, data_moments):
+    """The pooled loan-type block's weighted loss and its residuals.
+
+    Weights are 3 on each entry and continuation rate and 1 on each mean
+    positive flow (LOAN_TYPE_BLOCK_MOMENT_WEIGHTS); standardization uses the
+    specification's per-moment scale floors. ``sum(residuals**2) == loss``.
+    """
+    simulated = np.asarray(simulated, dtype=np.float64)
+    data_moments = np.asarray(data_moments, dtype=np.float64)
+    weights = np.asarray(LOAN_TYPE_BLOCK_MOMENT_WEIGHTS, dtype=np.float64)
+    floors = np.asarray(LOAN_TYPE_BLOCK_SCALE_FLOORS, dtype=np.float64)
+    if simulated.size != weights.size or data_moments.size != weights.size:
+        raise ValueError(
+            f"The loan-type block has {weights.size} moments; received "
             f"{data_moments.size} data and {simulated.size} simulated."
         )
     valid = np.isfinite(data_moments) & np.isfinite(simulated)
@@ -2846,7 +3026,7 @@ def _pooled_observed_cell_moments(
     stock = np.concatenate([pack["debtchoice"] for pack in packs])
     if specification not in EDUCATION_CELL_SPECIFICATIONS:
         raise ValueError(f"specification must be one of {EDUCATION_CELL_SPECIFICATIONS}.")
-    if moment_spec in (SPLIT_MOMENT_SPEC, NEED_MIXTURE_MOMENT_SPEC):
+    if moment_spec in (SPLIT_MOMENT_SPEC,) + NEED_MIXTURE_MOMENT_SPECS:
         if specification != "parental_income_basic":
             raise ValueError(
                 f"The {moment_spec} moments require the "
@@ -2857,7 +3037,7 @@ def _pooled_observed_cell_moments(
             parinc, begin_debt,
             f"cell {int(packs[0]['cell_code'])}",
         )
-        if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+        if moment_spec in NEED_MIXTURE_MOMENT_SPECS:
             # The at-cap moment is the top-of-grid CHOICE on both sides, so
             # the data side needs the same upper bound the debt search uses.
             grid_cap = np.concatenate([
@@ -2912,7 +3092,7 @@ def _print_cell_fit(data, simulated, data_new_share, sim_new_share, weights, lab
 
 def parental_income_moment_weight_pattern(moment_spec, primary_moment_weight):
     """Within-parinc SMM weights in the exact moment-output ordering."""
-    if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+    if moment_spec in NEED_MIXTURE_MOMENT_SPECS:
         # [entry rate, continuation rate, mean entry flow, mean continuation
         #  flow, at-cap share, sd positive flow, p80 positive flow,
         #  sub-$1,000 share] = [4, 4, 2, 2, 1, 1, 1, 1] at the defaults.
@@ -2985,7 +3165,7 @@ def _print_need_mixture_fit(
     data, simulated, data_new_share, sim_new_share, weights, labels, loss,
     primary_moment_weight,
 ):
-    """Fit table for the need_mixture_v1 moments; used only for that spec."""
+    """Fit table for the need-mixture per-cell moments (v1 and v2 share them)."""
     print("\n" + "=" * 132)
     print(f"[education-cell eval {EVAL_COUNTER}] weighted standardized loss={loss:.6f}")
     print(
@@ -3025,8 +3205,11 @@ def _print_need_mixture_fit(
     print("=" * 132 + "\n")
 
 
-def _print_graduation_fit(data, simulated, loss):
-    """Fit table for the pooled graduation and persistence moments."""
+def _print_graduation_fit(
+    data, simulated, loss, moment_spec=NEED_MIXTURE_MOMENT_SPEC,
+):
+    """Fit table for the pooled graduation (and, under v1, persistence) moments."""
+    reduced = moment_spec == NEED_MIXTURE_V2_MOMENT_SPEC
     print("\n" + "=" * 132)
     print(
         f"[graduation block] weighted standardized loss={loss:.6f}; "
@@ -3035,33 +3218,79 @@ def _print_graduation_fit(data, simulated, loss):
         f"{GRADUATION_EDUCATION}; debt at graduation accumulates annual flows "
         "at the model interest rate and is measured on the debt grid"
     )
-    print(
-        " loss weights per parinc quartile: share indebted=4, mean positive=2,"
-        " median positive=1, p90 positive=1; pooled persistence moments=3"
-    )
-    print(
-        " parinc | share with debt>0 | mean debt>0 | median debt>0 | "
-        "p90 debt>0   [data/sim/diff]"
-    )
-    for row in range(4):
-        m = 4 * row
-        pieces = []
-        for offset, numeric_format in (
+    if reduced:
+        print(
+            " loss weights per parinc quartile: share indebted=4, "
+            "mean positive=2"
+        )
+        print(
+            " parinc | share with debt>0 | mean debt>0   [data/sim/diff]"
+        )
+        per_group = (
+            (0, "6.4f"), (1, "9.2f"),
+        )
+    else:
+        print(
+            " loss weights per parinc quartile: share indebted=4, mean positive=2,"
+            " median positive=1, p90 positive=1; pooled persistence moments=3"
+        )
+        print(
+            " parinc | share with debt>0 | mean debt>0 | median debt>0 | "
+            "p90 debt>0   [data/sim/diff]"
+        )
+        per_group = (
             (0, "6.4f"), (1, "9.2f"), (2, "9.2f"), (3, "9.2f"),
-        ):
+        )
+    for row in range(4):
+        m = len(per_group) * row
+        pieces = []
+        for offset, numeric_format in per_group:
             pieces.append(
                 f"{data[m+offset]:{numeric_format}}/"
                 f"{simulated[m+offset]:{numeric_format}}/"
                 f"{simulated[m+offset]-data[m+offset]:+9.2f}"
             )
         print(f"   {row + 1:>2}   | " + " | ".join(pieces))
+    if not reduced:
+        print(
+            " pooled: always-borrow share (>= "
+            f"{PERSISTENCE_MINIMUM_ENROLLED_YEARS} enrolled years) "
+            f"{data[16]:.4f}/{simulated[16]:.4f}/{simulated[16]-data[16]:+.4f} | "
+            "within-person lag-1 autocorrelation of log positive flow "
+            f"{data[17]:.4f}/{simulated[17]:.4f}/{simulated[17]-data[17]:+.4f}"
+        )
+    print("=" * 132 + "\n")
+
+
+def _print_loan_type_block_fit(data, simulated, loss):
+    """Fit table for the pooled posterior-weighted loan-type moments."""
+    print("\n" + "=" * 132)
     print(
-        " pooled: always-borrow share (>= "
-        f"{PERSISTENCE_MINIMUM_ENROLLED_YEARS} enrolled years) "
-        f"{data[16]:.4f}/{simulated[16]:.4f}/{simulated[16]-data[16]:+.4f} | "
-        "within-person lag-1 autocorrelation of log positive flow "
-        f"{data[17]:.4f}/{simulated[17]:.4f}/{simulated[17]-data[17]:+.4f}"
+        f"[loan-type block] weighted standardized loss={loss:.6f}; pooled "
+        "over cells and parental income; data side weighted by the posterior "
+        "P(loan type), simulated side by the persistent sampled loan type"
     )
+    print(
+        " loss weights: entry rate=3, continuation rate=3, "
+        "mean positive flow=1 (each per type)"
+    )
+    print(
+        " loan type | entry rate (debt==0) | continuation rate (debt>0) | "
+        "mean positive flow   [data/sim/diff]"
+    )
+    for loan_level, label in ((0, "low"), (1, "high")):
+        entry = loan_level
+        continuation = 2 + loan_level
+        mean_flow = 4 + loan_level
+        print(
+            f"   {label:>4}   | "
+            f"{data[entry]:6.4f}/{simulated[entry]:6.4f}/"
+            f"{simulated[entry]-data[entry]:+7.4f} | "
+            f"{data[continuation]:6.4f}/{simulated[continuation]:6.4f}/"
+            f"{simulated[continuation]-data[continuation]:+7.4f} | "
+            f"{data[mean_flow]:9.2f}/{simulated[mean_flow]:9.2f}/"
+            f"{simulated[mean_flow]-data[mean_flow]:+9.2f}"
+        )
     print("=" * 132 + "\n")
 
 
@@ -3424,7 +3653,7 @@ def parental_income_cell_loss_and_residuals(
     simulated = np.asarray(simulated, dtype=np.float64)
     data_moments = np.asarray(data_moments, dtype=np.float64)
     valid = np.isfinite(data_moments) & np.isfinite(simulated)
-    if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+    if moment_spec in NEED_MIXTURE_MOMENT_SPECS:
         scale = np.maximum(
             np.abs(data_moments), np.tile(NEED_MIXTURE_SCALE_FLOORS, 4)
         )
@@ -3521,14 +3750,14 @@ def _evaluate_sampled_parental_income_cell(
     flow_by_draw = stock_by_draw - (1.0 + r) * pooled["debt"][None, :]
     simulated_by_draw = []
     diagnostic_by_draw = []
-    # Top-of-grid choice behind the need_mixture_v1 at-cap moment; the other
+    # Top-of-grid choice behind the need-mixture at-cap moment; the other
     # specifications never look at it.
     grid_cap = (
         debt_range[pooled["max_idx"]]
-        if moment_spec == NEED_MIXTURE_MOMENT_SPEC else None
+        if moment_spec in NEED_MIXTURE_MOMENT_SPECS else None
     )
     for draw_index in range(stock_by_draw.shape[0]):
-        if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+        if moment_spec in NEED_MIXTURE_MOMENT_SPECS:
             moments, new_share, _, _ = parental_income_need_mixture_moments(
                 pooled["parinc"], flow_by_draw[draw_index], pooled["debt"],
                 stock_by_draw[draw_index], grid_cap,
@@ -3660,9 +3889,9 @@ def _evaluate_cell_smm_worker(task):
     full_params = np.concatenate(
         (block[0:5], shared_risk, shared_debt, block[5:6])
     )
-    # The graduation block is assembled by the parent from these per-draw
-    # flows, so the need_mixture_v1 specification ships them back.
-    return_flows = _CELL_WORKER_MOMENT_SPEC == NEED_MIXTURE_MOMENT_SPEC
+    # The graduation and loan-type blocks are assembled by the parent from
+    # these per-draw flows, so the need-mixture specifications ship them back.
+    return_flows = _CELL_WORKER_MOMENT_SPEC in NEED_MIXTURE_MOMENT_SPECS
     evaluation = _evaluate_sampled_parental_income_cell(
         full_params,
         context["data_moments"],
@@ -3765,7 +3994,7 @@ def minimize_distance_education_cells_parental_income(
                     task[5] if len(task) > 5 else None
                 ),
                 need_mixture=(task[6] if len(task) > 6 else None),
-                return_flows=(moment_spec == NEED_MIXTURE_MOMENT_SPEC),
+                return_flows=(moment_spec in NEED_MIXTURE_MOMENT_SPECS),
             )
             loss, simulated, sim_new_share, _, residuals = evaluation[:5]
             results.append(
@@ -3782,23 +4011,53 @@ def minimize_distance_education_cells_parental_income(
     graduation_loss = 0.0
     graduation_residuals = None
     simulated_graduation = None
+    loan_type_loss = 0.0
+    loan_type_residuals = None
+    simulated_loan_type = None
+    loan_type_block = (
+        graduation.get("loan_type") if graduation is not None else None
+    )
     if graduation is not None:
         # One pass over the flows the cell kernels already produced: no second
         # forward simulation, and the data targets came from this same panel.
         flow_by_draw = np.concatenate([item[5] for item in results], axis=1)
         simulated_graduation = np.mean(
             np.asarray([
-                graduation_block_moments(graduation["panel"], flow_by_draw[draw_index])
+                graduation_block_moments(
+                    graduation["panel"], flow_by_draw[draw_index],
+                    moment_spec=moment_spec,
+                )
                 for draw_index in range(flow_by_draw.shape[0])
             ]),
             axis=0,
         )
         graduation_loss, graduation_residuals = (
             graduation_block_loss_and_residuals(
-                simulated_graduation, graduation["data_moments"]
+                simulated_graduation, graduation["data_moments"],
+                moment_spec=moment_spec,
             )
         )
         total_loss += graduation_loss
+    if loan_type_block is not None:
+        # Same per-draw flows, hard-assigned to the persistent sampled loan
+        # type; the data targets used the posterior weights on the identical
+        # column layout.
+        simulated_loan_type = np.mean(
+            np.asarray([
+                loan_type_block_moments(
+                    loan_type_block["begin_debt"], flow_by_draw[draw_index],
+                    loan_type_block["sim_weights"],
+                )
+                for draw_index in range(flow_by_draw.shape[0])
+            ]),
+            axis=0,
+        )
+        loan_type_loss, loan_type_residuals = (
+            loan_type_block_loss_and_residuals(
+                simulated_loan_type, loan_type_block["data_moments"]
+            )
+        )
+        total_loss += loan_type_loss
 
     if EVAL_COUNTER % 10 == 0:
         print("\n" + "#" * 132)
@@ -3832,6 +4091,11 @@ def minimize_distance_education_cells_parental_income(
                 f"graduation block contribution={graduation_loss:.6f} "
                 f"(unweighted by cell)"
             )
+        if loan_type_block is not None:
+            print(
+                f"loan-type block contribution={loan_type_loss:.6f} "
+                f"(unweighted by cell)"
+            )
         print("#" * 132)
         for context, evaluation in zip(contexts, results):
             education = int(context["education"])
@@ -3851,7 +4115,7 @@ def minimize_distance_education_cells_parental_income(
                 f"cell weight={cell_weight:.4f}; raw loss={loss:.6f}; "
                 f"weighted contribution={weighted_loss:.6f}"
             )
-            if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+            if moment_spec in NEED_MIXTURE_MOMENT_SPECS:
                 _print_need_mixture_fit(
                     context["data_moments"], simulated,
                     context["data_new_share"], sim_new_share,
@@ -3883,7 +4147,12 @@ def minimize_distance_education_cells_parental_income(
         if graduation is not None:
             _print_graduation_fit(
                 graduation["data_moments"], simulated_graduation,
-                graduation_loss,
+                graduation_loss, moment_spec=moment_spec,
+            )
+        if loan_type_block is not None:
+            _print_loan_type_block_fit(
+                loan_type_block["data_moments"], simulated_loan_type,
+                loan_type_loss,
             )
         # The same tables, in one machine-readable line per printed
         # evaluation, so a finished run can be analyzed without parsing stdout.
@@ -3909,6 +4178,9 @@ def minimize_distance_education_cells_parental_income(
         if graduation is not None:
             record["graduation_loss"] = graduation_loss
             record["graduation_moments"] = _log_values(simulated_graduation, 4)
+        if loan_type_block is not None:
+            record["loan_type_loss"] = loan_type_loss
+            record["loan_type_moments"] = _log_values(simulated_loan_type, 4)
         append_smm_log_record(record)
     if return_residuals:
         stacked = [
@@ -3917,6 +4189,8 @@ def minimize_distance_education_cells_parental_income(
         ]
         if graduation_residuals is not None:
             stacked.append(graduation_residuals)
+        if loan_type_residuals is not None:
+            stacked.append(loan_type_residuals)
         return np.concatenate(stacked)
     return total_loss
 
@@ -4625,12 +4899,12 @@ def fit_education_cells(
     # already produce; its data targets come from the same panel, so data and
     # simulation cannot drift apart.
     graduation = None
-    if moment_spec == NEED_MIXTURE_MOMENT_SPEC:
+    if moment_spec in NEED_MIXTURE_MOMENT_SPECS:
         panel = build_graduation_panel(contexts)
         graduation = {
             "panel": panel,
             "data_moments": graduation_block_moments(
-                panel, panel["observed_flow"]
+                panel, panel["observed_flow"], moment_spec=moment_spec
             ),
         }
         targets = graduation["data_moments"]
@@ -4641,14 +4915,47 @@ def fit_education_cells(
             f"{PERSISTENCE_MINIMUM_ENROLLED_YEARS} enrolled years, "
             f"{panel['pair_first'].size:,} adjacent-period pairs"
         )
-        print(
-            f"[graduation data targets] share indebted={np.round(targets[0:16:4], 4)}; "
-            f"mean+={np.round(targets[1:16:4], 0)}; "
-            f"median+={np.round(targets[2:16:4], 0)}; "
-            f"p90+={np.round(targets[3:16:4], 0)}; "
-            f"always-borrow={targets[16]:.4f}; "
-            f"log-flow lag-1 autocorrelation={targets[17]:.4f}"
-        )
+        if moment_spec == NEED_MIXTURE_V2_MOMENT_SPEC:
+            print(
+                "[graduation data targets] share indebted="
+                f"{np.round(targets[0:8:2], 4)}; "
+                f"mean+={np.round(targets[1:8:2], 0)} "
+                "(median/p90 and the pooled persistence moments are not "
+                "targeted under need_mixture_v2)"
+            )
+            # Pooled posterior-weighted loan-type moments: the columns are the
+            # same pooled person-periods the cell kernels simulate, so the
+            # per-draw flows read off directly.
+            loan_type_block = build_loan_type_block(contexts)
+            loan_type_block["data_moments"] = loan_type_block_moments(
+                loan_type_block["begin_debt"],
+                loan_type_block["observed_flow"],
+                loan_type_block["data_weights"],
+            )
+            graduation["loan_type"] = loan_type_block
+            loan_targets = loan_type_block["data_moments"]
+            posterior_mass = loan_type_block["data_weights"].sum(axis=1)
+            sampled_mass = loan_type_block["sim_weights"].sum(axis=1)
+            print(
+                "[loan-type block] posterior observation mass "
+                f"low/high={np.round(posterior_mass, 1)}; sampled "
+                f"low/high={np.round(sampled_mass, 1)}"
+            )
+            print(
+                "[loan-type data targets] entry rate low/high="
+                f"{np.round(loan_targets[0:2], 4)}; continuation rate "
+                f"low/high={np.round(loan_targets[2:4], 4)}; mean positive "
+                f"flow low/high={np.round(loan_targets[4:6], 0)}"
+            )
+        else:
+            print(
+                f"[graduation data targets] share indebted={np.round(targets[0:16:4], 4)}; "
+                f"mean+={np.round(targets[1:16:4], 0)}; "
+                f"median+={np.round(targets[2:16:4], 0)}; "
+                f"p90+={np.round(targets[3:16:4], 0)}; "
+                f"always-borrow={targets[16]:.4f}; "
+                f"log-flow lag-1 autocorrelation={targets[17]:.4f}"
+            )
 
     n_cells = len(cells)
     block_size = bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL

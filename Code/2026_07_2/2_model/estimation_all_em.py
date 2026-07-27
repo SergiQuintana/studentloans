@@ -186,7 +186,15 @@ BUDGET_SMM_OPTIMIZER = "dfols"
 #   BUDGET_SMM_MOMENT_SPEC = "flow_split_stock" -> entry/continuation moments
 #       split by observed beginning-of-period debt + at-cap share.
 ESTIMATE_NEW_BORROWING_COST = False
-BUDGET_SMM_MOMENT_SPEC = "need_mixture_v1"
+# "need_mixture_v2" (researcher decision 2026-07-27): the same eight per-cell
+# moments as need_mixture_v1; the graduation block keeps only the share
+# indebted and the mean positive debt per quartile; the pooled always-borrow
+# and autocorrelation moments are dropped; six pooled posterior-weighted
+# loan-type moments are added (entry rate, continuation rate, mean positive
+# flow, each by latent loan type) so the mixture logits a_type and a_debt are
+# identified directly. Set back to "need_mixture_v1" to recover the previous
+# moment set exactly.
+BUDGET_SMM_MOMENT_SPEC = "need_mixture_v2"
 # Spec B, heterogeneous debt aversion (loan-type debt-penalty shift, always the
 # last vector entry; sizes 68/69/71/72): see the master plan. Switched off
 # 2026-07-27 together with FREEZE_DEBT_PENALTY: the shift is an additive
@@ -210,9 +218,9 @@ ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
 #   FREEZE_DEBT_PENALTY = True -> the four parental-income debt penalties are
 #       held at zero rather than estimated. They stay in the saved bundle, so
 #       every consumer keeps its current shape.
-#   BUDGET_SMM_MOMENT_SPEC = "need_mixture_v1" -> the moment set of the new
-#       specification (entry/continuation split, the dispersion moments and
-#       the graduation block).
+#   BUDGET_SMM_MOMENT_SPEC = "need_mixture_v2" -> the moment set of the new
+#       specification (entry/continuation split, the dispersion moments, the
+#       reduced graduation block and the pooled loan-type block).
 ESTIMATE_NEED_MIXTURE = True
 FREEZE_DEBT_PENALTY = True
 
@@ -291,10 +299,26 @@ def _print_run_header():
     print(f"  ESTIMATE_NEED_MIXTURE         = {ESTIMATE_NEED_MIXTURE}")
     print(f"  FREEZE_DEBT_PENALTY           = {FREEZE_DEBT_PENALTY}")
     print(f"  need-mixture timing           = {bs.NEED_MIXTURE_TIMING}")
-    print(f"  debt-penalty bounds           = {mfd.DEBT_PENALTY_BOUNDS}")
-    print(f"  loan-type shift bounds        = "
-          f"{mfd.LOAN_TYPE_DEBT_PENALTY_BOUNDS}")
-    print(f"  kappa bounds                  = {mfd.NEW_BORROWING_COST_BOUNDS}")
+    # Bounds are only meaningful for blocks the optimizer is actually free to
+    # move: a frozen or switched-off block is reported as such instead.
+    if FREEZE_DEBT_PENALTY:
+        print("  debt penalty                  = frozen at zero "
+              "(kept in the saved bundle so every consumer keeps its shape)")
+    else:
+        print(f"  debt-penalty bounds           = {mfd.DEBT_PENALTY_BOUNDS}")
+    if ESTIMATE_NEED_MIXTURE:
+        print(f"  mixture logit bounds          = "
+              f"{mfd.NEED_MIXTURE_LOGIT_BOUNDS}")
+        print(f"  mixture no-need mean bounds   = "
+              f"{mfd.NEED_MIXTURE_NONEED_MEAN_BOUNDS}")
+        print(f"  mixture no-need sigma bounds  = "
+              f"{mfd.NEED_MIXTURE_NONEED_SIGMA_BOUNDS}")
+        print(f"  mixture starting values       = {mfd.NEED_MIXTURE_START}")
+    if ESTIMATE_LOAN_TYPE_DEBT_PENALTY:
+        print(f"  loan-type shift bounds        = "
+              f"{mfd.LOAN_TYPE_DEBT_PENALTY_BOUNDS}")
+    if ESTIMATE_NEW_BORROWING_COST:
+        print(f"  kappa bounds                  = {mfd.NEW_BORROWING_COST_BOUNDS}")
     print("=" * 70, flush=True)
 
 
