@@ -532,7 +532,12 @@ if __name__ == '__main__':
     _timing("ensure_initial_ccps", _stage_started)
 
     # Generate the amount of aguirregabiria_mira iterations.
-    iterations = 30
+    # Reduced 30 -> 4 (Sergi, 2026-07-28): short validation run of the
+    # need_mixture_v2 specification (frozen debt penalties, loan-type
+    # moments) to check that the structural likelihood is finite again and
+    # the new fit tables look sane before committing to a full-length run.
+    # Set back to 30 for production.
+    iterations = 4
     solution_mode = 0
 
     for it in range(iterations):

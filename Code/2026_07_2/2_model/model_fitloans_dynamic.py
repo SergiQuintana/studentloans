@@ -5017,6 +5017,17 @@ def fit_education_cells(
         # mixture has no neutral value, so the first evaluation deliberately
         # does NOT reproduce the saved single-component estimate.
         saved_shift = initial[pre_mixture_expected:]
+        if saved_shift.size and not ESTIMATE_LOAN_TYPE_DEBT_PENALTY:
+            # A saved vector from a Spec B run carries a trailing shift the
+            # current configuration does not estimate; carrying it forward
+            # would produce an over-long vector. Drop it (its participation
+            # role is taken over by the mixture's a_type logit).
+            print(
+                "[initial] Dropping the saved loan-type debt-penalty shift "
+                f"({float(saved_shift[0]):.4f}): "
+                "ESTIMATE_LOAN_TYPE_DEBT_PENALTY is off."
+            )
+            saved_shift = saved_shift[:0]
         initial = np.concatenate(
             (initial[:pre_mixture_expected], NEED_MIXTURE_START, saved_shift)
         )
