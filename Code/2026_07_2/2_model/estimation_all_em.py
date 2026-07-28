@@ -224,6 +224,19 @@ ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
 ESTIMATE_NEED_MIXTURE = True
 FREEZE_DEBT_PENALTY = True
 
+# Warm-start the structural utility parameters g() from the saved
+# param_g.npy of a previous run. Default False (Sergi, 2026-07-28): iteration
+# 0 starts from g() = 0, so choice values sit on the flow-utility scale and
+# choice probabilities cannot inherit the saturated (exact-0/exact-1) CCPs of
+# a stale saved vector. Root cause this addresses: param_g.npy had not been
+# updated since the structural likelihood turned -inf (the optimizer exited
+# with "Iterations: 0" every time), so every run re-loaded a stale vector
+# from the old huge-debt-penalty regime, whose values saturate the stored
+# CCPs (diagnose_likelihood_inputs 2026-07-28: 76% of observed home-CCPs
+# exactly 0.0 at period 1) and keep the likelihood at -inf permanently. Set
+# True only to deliberately continue from a KNOWN-HEALTHY saved vector.
+RESTART_PARAM_G = False
+
 def _timing(stage, start, it=None):
     """Stage-timing print (added 2026-07-24): grep the run log for [TIMING]."""
     elapsed = time.perf_counter() - start
@@ -298,6 +311,8 @@ def _print_run_header():
           f"{ESTIMATE_LOAN_TYPE_DEBT_PENALTY}")
     print(f"  ESTIMATE_NEED_MIXTURE         = {ESTIMATE_NEED_MIXTURE}")
     print(f"  FREEZE_DEBT_PENALTY           = {FREEZE_DEBT_PENALTY}")
+    print(f"  RESTART_PARAM_G               = {RESTART_PARAM_G}"
+          + ("" if RESTART_PARAM_G else " (g() starts from zeros)"))
     print(f"  need-mixture timing           = {bs.NEED_MIXTURE_TIMING}")
     # Bounds are only meaningful for blocks the optimizer is actually free to
     # move: a frozen or switched-off block is reported as such instead.
@@ -550,9 +565,14 @@ if __name__ == '__main__':
             ccp_real = 1
         else:
             ccp_real = 0
-            # Initial guess:
+            # Initial guess: zeros by default; the saved warm start is opt-in
+            # (see RESTART_PARAM_G above).
             x0 = np.zeros((total_n,))
-            x0 = np.load(f"{path_estimates}/param_g.npy")
+            if RESTART_PARAM_G:
+                x0 = np.load(f"{path_estimates}/param_g.npy")
+                print("[param_g] warm start from saved param_g.npy")
+            else:
+                print("[param_g] starting from zeros (fresh g() estimation)")
     
             # Prepare the get_x matrix
             me.get_feasible()
