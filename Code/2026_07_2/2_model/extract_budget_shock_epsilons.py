@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import time
 
 import numpy as np
@@ -345,6 +346,90 @@ def build_terminal(pooled, sigma):
     return terminal, beta_term
 
 
+# Per-process state for the sigma-level pool. Populated in the parent BEFORE
+# the pool is created, so fork-based workers inherit the pooled arrays
+# copy-on-write instead of pickling ~100 MB per task.
+_SIGMA_CONTEXT = {}
+
+
+def _extract_one_sigma(sigma):
+    """Run the full inversion for one sigma value and write its npz file."""
+    pooled = _SIGMA_CONTEXT["pooled"]
+    posterior_high = _SIGMA_CONTEXT["posterior_high"]
+    type_indices = _SIGMA_CONTEXT["type_indices"]
+    tolerance = _SIGMA_CONTEXT["tolerance"]
+    output_dir = _SIGMA_CONTEXT["output_dir"]
+    started = time.perf_counter()
+    terminal, beta_term = build_terminal(pooled, sigma)
+    total = pooled["budget"].size
+    xi_lo = np.full((N_TYPES, total), np.nan)
+    xi_hi = np.full((N_TYPES, total), np.nan)
+    status = np.full((N_TYPES, total), STATUS_INFEASIBLE, dtype=np.int8)
+    for type_index in type_indices:
+        continuation = (
+            pooled["ccp_by_type"][type_index]
+            + beta_term[:, None] * terminal
+        )
+        lo, hi, flags = invert_cell_type(
+            pooled["budget"], continuation,
+            pooled["b_idx"], pooled["max_idx"], pooled["j_obs"],
+            float(sigma), float(tolerance),
+        )
+        xi_lo[type_index] = lo
+        xi_hi[type_index] = hi
+        status[type_index] = flags
+        counts = {
+            name: int(np.sum(flags == code))
+            for name, code in (
+                ("interior", STATUS_INTERIOR), ("zero", STATUS_ZERO),
+                ("cap", STATUS_CAP), ("infeasible", STATUS_INFEASIBLE),
+                ("degenerate", STATUS_DEGENERATE),
+            )
+        }
+        print(
+            f"  sigma={sigma:g} type={TYPE_IDS[type_index]}: {counts}",
+            flush=True,
+        )
+
+    metadata = {
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sigma": float(sigma),
+        "tolerance": float(tolerance),
+        "ccp_tree": str(mgsf.DENSE_ROOT),
+        "status_legend": STATUS_LEGEND,
+        "type_ids": [int(value) for value in TYPE_IDS],
+        "type_loan": [int(value) for value in TYPE_LOAN],
+        "sign_convention": (
+            "shock is ADDED to resources; zero -> lower bound only "
+            "(xi_hi=+inf); cap -> upper bound only (xi_lo=-inf)"
+        ),
+    }
+    output_path = f"{output_dir}/epsilons_sigma_{sigma:.2f}.npz"
+    np.savez_compressed(
+        output_path,
+        xi_lo=xi_lo, xi_hi=xi_hi, status=status,
+        q=pooled["q"], posterior_high=posterior_high,
+        individual_index=pooled["individual_index"],
+        period=pooled["period"], cell_code=pooled["cell_code"],
+        education=pooled["education"],
+        program_year=pooled["program_year"],
+        parinc=pooled["parinc"], begin_debt=pooled["begin_debt"],
+        observed_flow=pooled["observed_flow"], budget=pooled["budget"],
+        annual_cap=pooled["annual_cap"], j_obs=pooled["j_obs"],
+        b_idx=pooled["b_idx"], max_idx=pooled["max_idx"],
+        debt_grid=mfd.debt_range,
+        metadata=np.frombuffer(
+            json.dumps(metadata).encode("utf-8"), dtype=np.uint8
+        ),
+    )
+    print(
+        f"[epsilons] wrote {output_path} "
+        f"({time.perf_counter() - started:,.1f} s)",
+        flush=True,
+    )
+    return output_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Invert budget-shock epsilons that rationalize observed loans."
@@ -365,6 +450,14 @@ def main():
         "--types", type=int, nargs="+", default=None,
         help="Subset of joint-type indices 0-15 (default: all sixteen).",
     )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help=(
+            "Processes for the sigma-level parallelism (default: one per "
+            "sigma value). Sigmas are independent -- each writes its own "
+            "file -- so the full grid runs in roughly the time of one."
+        ),
+    )
     args = parser.parse_args()
 
     type_indices = (
@@ -379,73 +472,28 @@ def main():
         pooled["q"][:, np.flatnonzero(TYPE_LOAN == 1)].sum(axis=1)
     )
 
-    for sigma in args.sigmas:
-        started = time.perf_counter()
-        terminal, beta_term = build_terminal(pooled, sigma)
-        total = pooled["budget"].size
-        xi_lo = np.full((N_TYPES, total), np.nan)
-        xi_hi = np.full((N_TYPES, total), np.nan)
-        status = np.full((N_TYPES, total), STATUS_INFEASIBLE, dtype=np.int8)
-        for type_index in type_indices:
-            continuation = (
-                pooled["ccp_by_type"][type_index]
-                + beta_term[:, None] * terminal
-            )
-            lo, hi, flags = invert_cell_type(
-                pooled["budget"], continuation,
-                pooled["b_idx"], pooled["max_idx"], pooled["j_obs"],
-                float(sigma), float(args.tolerance),
-            )
-            xi_lo[type_index] = lo
-            xi_hi[type_index] = hi
-            status[type_index] = flags
-            counts = {
-                name: int(np.sum(flags == code))
-                for name, code in (
-                    ("interior", STATUS_INTERIOR), ("zero", STATUS_ZERO),
-                    ("cap", STATUS_CAP), ("infeasible", STATUS_INFEASIBLE),
-                    ("degenerate", STATUS_DEGENERATE),
-                )
-            }
-            print(
-                f"  sigma={sigma:g} type={TYPE_IDS[type_index]}: {counts}"
-            )
+    # Populate the shared context BEFORE creating the pool: fork-based
+    # workers inherit the arrays copy-on-write, so nothing large is pickled.
+    _SIGMA_CONTEXT["pooled"] = pooled
+    _SIGMA_CONTEXT["posterior_high"] = posterior_high
+    _SIGMA_CONTEXT["type_indices"] = type_indices
+    _SIGMA_CONTEXT["tolerance"] = float(args.tolerance)
+    _SIGMA_CONTEXT["output_dir"] = output_dir
 
-        metadata = {
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "sigma": float(sigma),
-            "tolerance": float(args.tolerance),
-            "ccp_tree": str(mgsf.DENSE_ROOT),
-            "status_legend": STATUS_LEGEND,
-            "type_ids": [int(value) for value in TYPE_IDS],
-            "type_loan": [int(value) for value in TYPE_LOAN],
-            "sign_convention": (
-                "shock is ADDED to resources; zero -> lower bound only "
-                "(xi_hi=+inf); cap -> upper bound only (xi_lo=-inf)"
-            ),
-        }
-        output_path = f"{output_dir}/epsilons_sigma_{sigma:.2f}.npz"
-        np.savez_compressed(
-            output_path,
-            xi_lo=xi_lo, xi_hi=xi_hi, status=status,
-            q=pooled["q"], posterior_high=posterior_high,
-            individual_index=pooled["individual_index"],
-            period=pooled["period"], cell_code=pooled["cell_code"],
-            education=pooled["education"],
-            program_year=pooled["program_year"],
-            parinc=pooled["parinc"], begin_debt=pooled["begin_debt"],
-            observed_flow=pooled["observed_flow"], budget=pooled["budget"],
-            annual_cap=pooled["annual_cap"], j_obs=pooled["j_obs"],
-            b_idx=pooled["b_idx"], max_idx=pooled["max_idx"],
-            debt_grid=mfd.debt_range,
-            metadata=np.frombuffer(
-                json.dumps(metadata).encode("utf-8"), dtype=np.uint8
-            ),
-        )
-        print(
-            f"[epsilons] wrote {output_path} "
-            f"({time.perf_counter() - started:,.1f} s)"
-        )
+    sigmas = list(args.sigmas)
+    workers = (
+        len(sigmas) if args.workers is None
+        else max(1, min(int(args.workers), len(sigmas)))
+    )
+    if workers > 1 and "fork" in multiprocessing.get_all_start_methods():
+        print(f"[epsilons] {workers} sigma workers (fork)")
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            pool.map(_extract_one_sigma, sigmas)
+    else:
+        if workers > 1:
+            print("[epsilons] fork unavailable; running sigmas sequentially")
+        for sigma in sigmas:
+            _extract_one_sigma(sigma)
 
 
 if __name__ == "__main__":
