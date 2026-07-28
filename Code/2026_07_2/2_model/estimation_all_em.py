@@ -148,19 +148,23 @@ USE_FAST_CCP_SEQUENCE = True
 BUDGET_SMM_DRAWS = 100
 BUDGET_SMM_ANNEALING_MAXFUN = 500
 BUDGET_SMM_MAXITER = 1000
-BUDGET_SMM_CCP_WORKERS = 60
+# Worker count for every heavy multiprocessing stage (Bellman solve,
+# CCP-sequence build, budget-SMM CCP load). Raised 60 -> 90 on 2026-07-28
+# (Sergi's request): the server reports ~112 available cores and the
+# historical 60 left it half idle outside the SMM phase.
+N_POOL_WORKERS = 90
+BUDGET_SMM_CCP_WORKERS = N_POOL_WORKERS
 BUDGET_SMM_CELL_WORKERS = None  # automatically one worker per cell, CPU permitting
 # Numba threads inside each SMM cell worker. Profiling 2026-07-23: the pooled
 # kernel is bitwise thread-count-invariant, so this only buys speed. The ten
 # education cells get one process each, and nothing else runs during the SMM
 # phase, so the machine is filled when ten workers together cover its threads.
-# Raised 6 -> 12 on 2026-07-27: Sergi reports the server has about 120 threads,
-# and 10 x 12 matches that exactly (the previous 6 covered only half of them,
-# which is why the machine was not at capacity). If those 120 are 60 physical
-# cores with SMT, expect appreciably less than the nominal 2x, since sibling
-# threads share execution units. Set back to 6 to restore the 2026-07-24
-# configuration exactly.
-BUDGET_SMM_CELL_NUMBA_THREADS = 12
+# Raised 6 -> 12 on 2026-07-27, adjusted 12 -> 9 on 2026-07-28 (Sergi):
+# the run logs report ~112 AVAILABLE cores, so 10 cells x 12 = 120 was
+# oversubscribing; 10 x 9 = 90 matches the 90-worker target used everywhere
+# else and leaves headroom for the parent process. Set back to 6 to restore
+# the 2026-07-24 configuration exactly.
+BUDGET_SMM_CELL_NUMBA_THREADS = 9
 
 
 def _available_cores():
@@ -313,6 +317,7 @@ def _print_run_header():
     print(f"  FREEZE_DEBT_PENALTY           = {FREEZE_DEBT_PENALTY}")
     print(f"  RESTART_PARAM_G               = {RESTART_PARAM_G}"
           + ("" if RESTART_PARAM_G else " (g() starts from zeros)"))
+    print(f"  N_POOL_WORKERS                = {N_POOL_WORKERS}")
     print(f"  need-mixture timing           = {bs.NEED_MIXTURE_TIMING}")
     # Bounds are only meaningful for blocks the optimizer is actually free to
     # move: a frozen or switched-off block is reported as such instead.
@@ -477,7 +482,7 @@ if __name__ == '__main__':
             for i in range(np.shape(ms.invariant_states)[0])
         ]
 
-        pool_obj = multiprocessing.Pool(60)
+        pool_obj = multiprocessing.Pool(N_POOL_WORKERS)
         results = pool_obj.starmap(bellman_solver, args, chunksize=1)
         pool_obj.close()
         print("Simulating choices...")
@@ -606,7 +611,7 @@ if __name__ == '__main__':
                     ):
                         print("Building auxiliary-model CCP sequences "
                               "(stored for reuse by later runs)")
-                        pool_obj = multiprocessing.Pool(processes=60)
+                        pool_obj = multiprocessing.Pool(processes=N_POOL_WORKERS)
                         args = [
                             (i, ms.invariant_states, ms.debt_range, em_type)
                             for em_type in TYPE_IDS
@@ -634,7 +639,7 @@ if __name__ == '__main__':
                 ccp_root = (
                     mgsf.initial_ccp_root() if it <= 1 else None
                 )
-                pool_obj = multiprocessing.Pool(processes=60)
+                pool_obj = multiprocessing.Pool(processes=N_POOL_WORKERS)
                 args = [
                     (i, ms.invariant_states, ms.debt_range, em_type, ccp_root)
                     for em_type in TYPE_IDS
@@ -683,7 +688,7 @@ if __name__ == '__main__':
         models = 0
         conter = 0
         maxdebt = True
-        pool_obj = multiprocessing.Pool(processes=60, initializer=ms.reload_budgetshock_params)
+        pool_obj = multiprocessing.Pool(processes=N_POOL_WORKERS, initializer=ms.reload_budgetshock_params)
     
         args = [
             (i, ms.invariant_states, debt_range, debt_range, ccp_real,
