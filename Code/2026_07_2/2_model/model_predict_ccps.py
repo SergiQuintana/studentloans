@@ -25,6 +25,7 @@ from model_em_algorithm import (
     load_fixed_wage_parameters,
     predict_expected_wages,
 )
+from debt_limits import CONSUMPTION_FLOOR, INTEREST_RATE
 import model_solution_em as ms
 from financial_process import (
     expected_grants_vectorized,
@@ -109,14 +110,22 @@ def get_vjt_static(model_parameters, x1, x1_new, x2, Jx, period, b, type_id):
     choices = np.asarray(Jx)
     nonhome = np.any(choices != 0, axis=1).astype(float)
     debt = np.asarray(b, dtype=float).reshape(-1, 1)
+    # 2026-07-29 respecification: there is no debt coefficient; the debt
+    # stock enters only through consumption net of debt service on the
+    # beginning-of-period stock, bottom-coded at the consumption floor,
+    # non-home alternatives only (mirrors _net_consumption_regressor in
+    # model_em_algorithm.py).
+    net_consumption = (
+        np.maximum(
+            expected_consumption[None, :] - (1.0 + INTEREST_RATE) * debt,
+            CONSUMPTION_FLOOR,
+        )
+        * nonhome[None, :]
+    )
     return (
         g
         + model_parameters["consumption_coefficient"]
-        * expected_consumption[None, :]
-        / MONEY_SCALE
-        + model_parameters["debt_coefficient"]
-        * debt
-        * nonhome[None, :]
+        * net_consumption
         / MONEY_SCALE
     )
     
@@ -437,11 +446,16 @@ def load_utility_parameters(type_id, results_file=AUXILIARY_RESULTS_FILE):
                 f"Auxiliary EM results {results_file} do not contain choice_parameters."
             )
         choice_parameters = np.asarray(results["choice_parameters"], dtype=float)
-    expected_size = total_n + 2
+    # 2026-07-29 respecification: legacy g() block + ONE consumption
+    # coefficient; there is NO debt coefficient. Old (total_n + 2)-length
+    # files are rejected here on purpose — re-estimate before predicting.
+    expected_size = total_n + 1
     if choice_parameters.shape != (expected_size,):
         raise ValueError(
             f"Auxiliary choice parameters have shape {choice_parameters.shape}; "
-            f"expected {(expected_size,)}."
+            f"expected {(expected_size,)}. A (total_n + 2)-length vector is a "
+            "pre-2026-07-29 file with the removed debt coefficient — rerun the "
+            "auxiliary EM before predicting CCPs."
         )
 
     # build_param_g maps the joint ID to its schooling component. The same ID
@@ -452,7 +466,6 @@ def load_utility_parameters(type_id, results_file=AUXILIARY_RESULTS_FILE):
         "type_index": type_index(type_id),
         "utility_parameters": utility_parameters,
         "consumption_coefficient": float(choice_parameters[total_n]),
-        "debt_coefficient": float(choice_parameters[total_n + 1]),
         "financial_process": load_auxiliary_financial_process(results_file),
         "wage_parameters": load_fixed_wage_parameters(),
     }

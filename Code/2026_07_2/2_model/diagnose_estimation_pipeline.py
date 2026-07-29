@@ -485,18 +485,23 @@ def _fresh_initial_snapshot(failure, auxiliary_file):
         parameters["utility_parameters"], inv, x1_new, x2, choices, period
     )
     nonhome = np.any(choices != 0, axis=1).astype(float)
+    # 2026-07-29 respecification: no debt coefficient; debt enters only
+    # through consumption net of debt service, floored at the consumption
+    # floor (mirrors get_vjt_static in model_predict_ccps.py).
+    net_consumption = (
+        np.maximum(
+            expected_consumption[None, :]
+            - (1.0 + ccp_model.INTEREST_RATE) * debt[:, None],
+            ccp_model.CONSUMPTION_FLOOR,
+        )
+        * nonhome[None, :]
+    )
     consumption_term = (
         parameters["consumption_coefficient"]
-        * expected_consumption[None, :]
+        * net_consumption
         / ccp_model.MONEY_SCALE
     )
-    debt_term = (
-        parameters["debt_coefficient"]
-        * debt[:, None]
-        * nonhome[None, :]
-        / ccp_model.MONEY_SCALE
-    )
-    fresh_vjt = g + consumption_term + debt_term
+    fresh_vjt = g + consumption_term
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
         log_denom = logsumexp(fresh_vjt, axis=1)
         home_log_ccp = fresh_vjt[:, home] - log_denom

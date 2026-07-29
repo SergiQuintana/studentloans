@@ -50,6 +50,8 @@ from scipy.optimize import approx_fprime
 import warnings
 from scipy.special import expit, logsumexp
 
+from debt_limits import CONSUMPTION_FLOOR, INTEREST_RATE
+
 warnings.simplefilter('ignore',category=NumbaDeprecationWarning)
 warnings.simplefilter('ignore',category=NumbaPendingDeprecationWarning)
 
@@ -3804,19 +3806,31 @@ def _choice_components(choice_parameters, auxiliary_data, expected_consumption):
     legacy_count = total_n_choice_legacy
     legacy_parameters = choice_parameters[:legacy_count]
     consumption_coefficient = choice_parameters[legacy_count]
-    debt_coefficient = choice_parameters[legacy_count + 1]
     utility_parameters = build_param_g(legacy_parameters)
     return (
         utility_parameters,
         consumption_coefficient,
-        debt_coefficient,
         expected_consumption,
     )
 
 
+def _net_consumption_regressor(consumption, debt_dollars, nonhome):
+    """Expected consumption net of debt service, floored at the safety net.
+
+    2026-07-29 respecification (Sergi): the free debt-vs-home regressor is
+    removed from the auxiliary choice index; the debt stock enters only
+    through consumption net of debt service on the beginning-of-period
+    stock, bottom-coded at the consumption floor. Non-home alternatives
+    only — the home column keeps its zero normalization, which is what
+    makes the term identified in the logit.
+    """
+    net = consumption - (1.0 + INTEREST_RATE) * debt_dollars[:, None]
+    return np.maximum(net, CONSUMPTION_FLOOR) * nonhome[None, :]
+
+
 def auxiliary_choice_log_likelihoods(choice_parameters, auxiliary_data, expected_consumption):
     """Individual choice-sequence log likelihood for all sixteen joint types."""
-    utility_parameters, alpha_c, alpha_b, consumption_by_resource_type = (
+    utility_parameters, alpha_c, consumption_by_resource_type = (
         _choice_components(choice_parameters, auxiliary_data, expected_consumption)
     )
     n = auxiliary_data["n_individuals"]
@@ -3839,21 +3853,19 @@ def auxiliary_choice_log_likelihoods(choice_parameters, auxiliary_data, expected
                     SCHOOL_REPRESENTATIVE_TYPE_IDS[school_type],
                 )
             )
-        debt_regressor = (
-            period_data["debt_dollars"][:, None]
-            * auxiliary_data["nonhome"][None, :]
-            / MONEY_SCALE
-        )
         for latent_type in range(N_AUXILIARY_TYPES):
             resource_index = (
                 2 * AUXILIARY_TYPE_GRANT[latent_type]
                 + AUXILIARY_TYPE_TRANSFER[latent_type]
             )
-            consumption = consumption_by_resource_type[resource_index][period_index]
+            consumption = _net_consumption_regressor(
+                consumption_by_resource_type[resource_index][period_index],
+                period_data["debt_dollars"],
+                auxiliary_data["nonhome"],
+            )
             utility = (
                 g_school[AUXILIARY_TYPE_SCHOOL[latent_type]]
                 + alpha_c * consumption / MONEY_SCALE
-                + alpha_b * debt_regressor
             )
             utility = np.where(period_data["feasible"], utility, -np.inf)
             log_probability = utility - logsumexp(utility, axis=1, keepdims=True)
@@ -3865,11 +3877,11 @@ def auxiliary_choice_log_likelihoods(choice_parameters, auxiliary_data, expected
 
 def auxiliary_choice_objective_legacy(choice_parameters, auxiliary_data, expected_consumption, q):
     """Reference sixteen-type objective using the original analytical score path."""
-    utility_parameters, alpha_c, alpha_b, consumption_by_resource_type = (
+    utility_parameters, alpha_c, consumption_by_resource_type = (
         _choice_components(choice_parameters, auxiliary_data, expected_consumption)
     )
     legacy_gradient = np.zeros(total_n_choice_legacy, dtype=float)
-    resource_gradient = np.zeros(2, dtype=float)
+    resource_gradient = np.zeros(1, dtype=float)
     loglike = 0.0
     affected = map_param_to_choice(fields, occupations)
 
@@ -3891,11 +3903,6 @@ def auxiliary_choice_objective_legacy(choice_parameters, auxiliary_data, expecte
                 )
             )
         previous_affects = build_previous_affects(period_data["x_change"])
-        debt_regressor = (
-            period_data["debt_dollars"][:, None]
-            * auxiliary_data["nonhome"][None, :]
-            / MONEY_SCALE
-        )
         chosen = period_data["chosen_index"]
         rows = np.arange(len(chosen))
 
@@ -3905,12 +3912,15 @@ def auxiliary_choice_objective_legacy(choice_parameters, auxiliary_data, expecte
                 2 * AUXILIARY_TYPE_GRANT[latent_type]
                 + AUXILIARY_TYPE_TRANSFER[latent_type]
             )
-            consumption = consumption_by_resource_type[resource_index][period_index]
+            consumption = _net_consumption_regressor(
+                consumption_by_resource_type[resource_index][period_index],
+                period_data["debt_dollars"],
+                auxiliary_data["nonhome"],
+            )
             consumption_scaled = consumption / MONEY_SCALE
             utility = (
                 g_school[school_type]
                 + alpha_c * consumption_scaled
-                + alpha_b * debt_regressor
             )
             utility = np.where(period_data["feasible"], utility, -np.inf)
             log_denominator = logsumexp(utility, axis=1, keepdims=True)
@@ -3941,13 +3951,6 @@ def auxiliary_choice_objective_legacy(choice_parameters, auxiliary_data, expecte
                     - np.sum(probability * consumption_scaled, axis=1)
                 )
             )
-            resource_gradient[1] += np.sum(
-                q[:, latent_type]
-                * (
-                    debt_regressor[rows, chosen]
-                    - np.sum(probability * debt_regressor, axis=1)
-                )
-            )
 
     gradient = np.concatenate((legacy_gradient, resource_gradient))
     return -float(loglike), -gradient
@@ -3957,11 +3960,9 @@ def auxiliary_choice_objective_legacy(choice_parameters, auxiliary_data, expecte
 def _parallel_type_probabilities(
     g_school,
     consumption_by_resource,
-    debt_regressor,
     feasible,
     chosen,
     alpha_c,
-    alpha_b,
     type_school,
     type_grant,
     type_transfer,
@@ -3987,7 +3988,6 @@ def _parallel_type_probabilities(
                     g_school[school_type, individual, alternative]
                     + alpha_c
                     * consumption_by_resource[resource_type, individual, alternative]
-                    + alpha_b * debt_regressor[individual, alternative]
                 )
                 if utility > maximum:
                     maximum = utility
@@ -4001,7 +4001,6 @@ def _parallel_type_probabilities(
                     g_school[school_type, individual, alternative]
                     + alpha_c
                     * consumption_by_resource[resource_type, individual, alternative]
-                    + alpha_b * debt_regressor[individual, alternative]
                 )
                 denominator += np.exp(utility - maximum)
 
@@ -4015,7 +4014,6 @@ def _parallel_type_probabilities(
                     g_school[school_type, individual, alternative]
                     + alpha_c
                     * consumption_by_resource[resource_type, individual, alternative]
-                    + alpha_b * debt_regressor[individual, alternative]
                 )
                 probability[latent_type, individual, alternative] = np.exp(
                     utility - log_denominator
@@ -4153,13 +4151,13 @@ def auxiliary_choice_objective_parallel(
     choice_parameters, auxiliary_data, expected_consumption, q
 ):
     """Weighted choice likelihood with batched, parallel closed-form score."""
-    utility_parameters, alpha_c, alpha_b, consumption_by_resource_type = (
+    utility_parameters, alpha_c, consumption_by_resource_type = (
         _choice_components(choice_parameters, auxiliary_data, expected_consumption)
     )
     affected = np.asarray(map_param_to_choice(fields, occupations), dtype=float)
     common_count = total_n_choice_legacy - 2
     legacy_gradient = np.zeros(total_n_choice_legacy, dtype=float)
-    resource_gradient = np.zeros(2, dtype=float)
+    resource_gradient = np.zeros(1, dtype=float)
     loglike = 0.0
 
     for period_index, period_data in enumerate(auxiliary_data["periods"]):
@@ -4181,14 +4179,14 @@ def auxiliary_choice_objective_parallel(
             ],
             axis=0,
         )
-        debt_regressor = (
-            period_data["debt_dollars"][:, None]
-            * auxiliary_data["nonhome"][None, :]
-            / MONEY_SCALE
-        )
         consumption_by_resource = np.stack(
             [
-                consumption_by_resource_type[resource][period_index] / MONEY_SCALE
+                _net_consumption_regressor(
+                    consumption_by_resource_type[resource][period_index],
+                    period_data["debt_dollars"],
+                    auxiliary_data["nonhome"],
+                )
+                / MONEY_SCALE
                 for resource in range(4)
             ],
             axis=0,
@@ -4196,11 +4194,9 @@ def auxiliary_choice_objective_parallel(
         probability, chosen_log_probability = _parallel_type_probabilities(
             np.ascontiguousarray(g_school),
             np.ascontiguousarray(consumption_by_resource),
-            np.ascontiguousarray(debt_regressor),
             np.ascontiguousarray(period_data["feasible"]),
             np.ascontiguousarray(period_data["chosen_index"], dtype=np.int64),
             alpha_c,
-            alpha_b,
             AUXILIARY_TYPE_SCHOOL,
             AUXILIARY_TYPE_GRANT,
             AUXILIARY_TYPE_TRANSFER,
@@ -4230,10 +4226,6 @@ def auxiliary_choice_objective_parallel(
         )
 
         rows = np.arange(len(chosen))
-        resource_gradient[1] += np.sum(
-            q_all * debt_regressor[rows, chosen]
-            - np.sum(weighted_probability * debt_regressor, axis=1)
-        )
         for latent_type in range(N_AUXILIARY_TYPES):
             resource_index = (
                 2 * AUXILIARY_TYPE_GRANT[latent_type]
@@ -4340,6 +4332,7 @@ def perform_em(
     verbose=True,
     resume=False,
     checkpoint_file=None,
+    warm_start_file=None,
 ):
     """Estimate the sixteen-type schooling x grant x transfer x loan model.
 
@@ -4349,10 +4342,25 @@ def perform_em(
     are fixed throughout and all invariant arrays are cached before iteration.
     Set ``resume=True`` to restore the complete saved EM state; otherwise the
     estimator retains its original fresh-start initialization.
+
+    TEMPORARY (2026-07-29): ``warm_start_file`` seeds a FRESH run of the
+    respecified model (no debt coefficient) with the converged parameters,
+    prior, and financial processes of a previous results file — an old
+    (total_n + 2)-length choice vector is accepted and its trailing debt
+    coefficient is dropped. The posteriors are then recomputed in the
+    standard initial E-step so they are consistent with the new likelihood.
+    Remove once the respecified EM has been re-estimated from scratch.
     """
     global total_n_multi
     global total_n_late
     global total_n_summer
+
+    if resume and warm_start_file is not None:
+        raise ValueError(
+            "resume and warm_start_file are mutually exclusive: resume restores "
+            "a full same-specification EM state, warm_start_file seeds a fresh "
+            "run of the respecified model."
+        )
 
     estimation_start = time.perf_counter()
 
@@ -4430,7 +4438,6 @@ def perform_em(
         if checkpoint_file is None
         else os.fspath(checkpoint_file)
     )
-
     if resume:
         step_start = time.perf_counter()
         progress(f"Setup 4-6/8: loading EM checkpoint {checkpoint_file}...")
@@ -4611,13 +4618,194 @@ def perform_em(
             step_start,
             extra=f"resuming after iteration {start_iteration}",
         )
+    elif warm_start_file is not None:
+        # ------------------------------------------------------------------
+        # TEMPORARY warm start (Sergi, 2026-07-29). Seeds a FRESH run of the
+        # respecified model with the converged parameters of a previous
+        # results file; the old vector's trailing debt coefficient is
+        # DROPPED. Remove this branch after the from-scratch overnight
+        # re-estimation of the new specification.
+        # ------------------------------------------------------------------
+        step_start = time.perf_counter()
+        warm_path = os.fspath(warm_start_file)
+        progress(f"Setup 4-6/8: TEMPORARY warm start from {warm_path}...")
+        if not os.path.isfile(warm_path):
+            raise FileNotFoundError(
+                f"Cannot warm-start auxiliary EM: file not found: {warm_path}"
+            )
+        required_keys = {
+            "type_names", "type_school", "type_grant", "type_transfer", "type_loan",
+            "pi",
+            "choice_parameters", "measure_late", "measure_summer",
+            "grant_education_levels", "grant_receipt", "grant_amount", "grant_sigma",
+            "transfer_receipt", "transfer_amount", "transfer_sigma",
+            "loan_education_levels", "loan_receipt", "loan_amount", "loan_sigma",
+        }
+        with np.load(warm_path, allow_pickle=False) as warm:
+            missing = sorted(required_keys.difference(warm.files))
+            if missing:
+                raise ValueError(
+                    "Cannot warm-start auxiliary EM: results file is missing "
+                    + ", ".join(missing)
+                )
+            for key, expected in (
+                ("type_names", AUXILIARY_TYPE_NAMES),
+                ("type_school", AUXILIARY_TYPE_SCHOOL),
+                ("type_grant", AUXILIARY_TYPE_GRANT),
+                ("type_transfer", AUXILIARY_TYPE_TRANSFER),
+                ("type_loan", AUXILIARY_TYPE_LOAN),
+            ):
+                if not np.array_equal(warm[key], expected):
+                    raise ValueError(
+                        f"Cannot warm-start auxiliary EM: {key} does not match "
+                        "the current sixteen-type auxiliary ordering."
+                    )
+            warm_choice = np.asarray(warm["choice_parameters"], dtype=float)
+            measure_late = np.asarray(warm["measure_late"], dtype=float)
+            measure_summer = np.asarray(warm["measure_summer"], dtype=float)
+            warm_pi = np.asarray(warm["pi"], dtype=float)
+            education_levels = np.asarray(warm["grant_education_levels"], dtype=int)
+            grant_receipt = np.asarray(warm["grant_receipt"], dtype=float)
+            grant_amount = np.asarray(warm["grant_amount"], dtype=float)
+            grant_sigma = np.asarray(warm["grant_sigma"], dtype=float)
+            transfer_receipt = np.asarray(warm["transfer_receipt"], dtype=float)
+            transfer_amount = np.asarray(warm["transfer_amount"], dtype=float)
+            transfer_sigma = float(np.asarray(warm["transfer_sigma"]).reshape(()))
+            loan_education_levels = np.asarray(
+                warm["loan_education_levels"], dtype=int
+            )
+            loan_receipt = np.asarray(warm["loan_receipt"], dtype=float)
+            loan_amount = np.asarray(warm["loan_amount"], dtype=float)
+            loan_sigma = np.asarray(warm["loan_sigma"], dtype=float)
+
+        if warm_choice.shape == (total_n_multi + 1,):
+            dropped_debt = float(warm_choice[-1])
+            choice_parameters = warm_choice[:total_n_multi].copy()
+            progress(
+                "Warm start: old-layout vector detected; DROPPED the removed "
+                f"debt coefficient ({dropped_debt:+.6f}); kept g() block and "
+                "consumption coefficient "
+                f"({float(choice_parameters[total_n_choice_legacy]):+.6f})."
+            )
+        elif warm_choice.shape == (total_n_multi,):
+            choice_parameters = warm_choice.copy()
+            progress("Warm start: new-layout vector loaded unchanged.")
+        else:
+            raise ValueError(
+                "Cannot warm-start auxiliary EM: choice_parameters has shape "
+                f"{warm_choice.shape}; expected {(total_n_multi,)} (new layout) "
+                f"or {(total_n_multi + 1,)} (old layout with debt coefficient)."
+            )
+
+        if measure_late.shape != (total_n_late,) or measure_summer.shape != (
+            total_n_summer,
+        ):
+            raise ValueError(
+                "Cannot warm-start auxiliary EM: schooling-measure parameter "
+                "shapes do not match."
+            )
+        if warm_pi.shape != (N_AUXILIARY_TYPES,) or np.any(warm_pi <= 0.0) or (
+            not np.isclose(warm_pi.sum(), 1.0, atol=1.0e-8)
+        ):
+            raise ValueError(
+                "Cannot warm-start auxiliary EM: prior probabilities must be "
+                "positive and sum to one."
+            )
+        for name, array in (
+            ("choice_parameters", choice_parameters),
+            ("measure_late", measure_late),
+            ("measure_summer", measure_summer),
+        ):
+            if not np.all(np.isfinite(array)):
+                raise ValueError(
+                    f"Cannot warm-start auxiliary EM: {name} contains "
+                    "non-finite values."
+                )
+        if not np.array_equal(education_levels, np.array([1, 2, 3])) or (
+            not np.array_equal(loan_education_levels, np.array([1, 2, 3]))
+        ):
+            raise ValueError(
+                "Cannot warm-start auxiliary EM: financial education levels "
+                "must be [1, 2, 3]."
+            )
+
+        grant_parameters = {}
+        for row, education in enumerate((1, 2, 3)):
+            expected_financial_size = auxiliary_data["grant"][education]["x"].shape[1] + 1
+            if (
+                grant_receipt[row].shape != (expected_financial_size,)
+                or grant_amount[row].shape != (expected_financial_size,)
+            ):
+                raise ValueError(
+                    f"Cannot warm-start auxiliary EM: grant parameters for "
+                    f"education {education} do not match the current data design."
+                )
+            grant_parameters[education] = {
+                "receipt": grant_receipt[row].copy(),
+                "amount": grant_amount[row].copy(),
+                "sigma": float(grant_sigma[row]),
+                "receipt_success": True,
+                "receipt_message": "Loaded from warm-start results file",
+            }
+        expected_transfer_size = auxiliary_data["transfer"]["x"].shape[1] + 1
+        if (
+            transfer_receipt.shape != (expected_transfer_size,)
+            or transfer_amount.shape != (expected_transfer_size,)
+        ):
+            raise ValueError(
+                "Cannot warm-start auxiliary EM: transfer parameters do not "
+                "match the current data design."
+            )
+        transfer_parameters = {
+            "receipt": transfer_receipt.copy(),
+            "amount": transfer_amount.copy(),
+            "sigma": transfer_sigma,
+            "receipt_success": True,
+            "receipt_message": "Loaded from warm-start results file",
+        }
+        loan_parameters = {}
+        for row, education in enumerate((1, 2, 3)):
+            expected_loan_size = auxiliary_data["loan"][education]["x"].shape[1] + 1
+            if (
+                loan_receipt[row].shape != (expected_loan_size,)
+                or loan_amount[row].shape != (expected_loan_size,)
+            ):
+                raise ValueError(
+                    f"Cannot warm-start auxiliary EM: loan parameters for "
+                    f"education {education} do not match the current data design."
+                )
+            loan_parameters[education] = {
+                "receipt": loan_receipt[row].copy(),
+                "amount": loan_amount[row].copy(),
+                "sigma": float(loan_sigma[row]),
+                "receipt_success": True,
+                "receipt_message": "Loaded from warm-start results file",
+            }
+        if (
+            np.any(grant_sigma <= 0.0)
+            or not np.all(np.isfinite(grant_sigma))
+            or not np.isfinite(transfer_sigma)
+            or transfer_sigma <= 0.0
+            or np.any(loan_sigma <= 0.0)
+            or not np.all(np.isfinite(loan_sigma))
+        ):
+            raise ValueError(
+                "Cannot warm-start auxiliary EM: financial amount standard "
+                "deviations must be finite and positive."
+            )
+        finish_step(
+            "TEMPORARY warm start from previous results",
+            step_start,
+            extra="posteriors will be recomputed in the initial E-step",
+        )
     else:
         # Choice parameters retain the old g(.) block and append one common
-        # expected-consumption coefficient and one debt-vs-home coefficient.
+        # expected-consumption coefficient. There is NO debt coefficient
+        # since the 2026-07-29 respecification: debt enters only through
+        # consumption net of debt service (_net_consumption_regressor).
         choice_parameters = np.zeros(total_n_multi, dtype=float)
         choice_parameters[total_n_choice_legacy - 2:total_n_choice_legacy] = typeffect
         choice_parameters[total_n_choice_legacy] = 0.05
-        choice_parameters[total_n_choice_legacy + 1] = -0.02
 
         measure_late = np.zeros(total_n_late, dtype=float)
         measure_summer = np.zeros(total_n_summer, dtype=float)
@@ -4669,7 +4857,13 @@ def perform_em(
         )
     else:
         progress("Setup 8/8: computing initial likelihoods and posteriors...")
-        pinew = np.full(N_AUXILIARY_TYPES, 1.0 / N_AUXILIARY_TYPES, dtype=float)
+        if warm_start_file is not None:
+            # TEMPORARY warm start: use the loaded prior; the E-step below
+            # regenerates the posteriors under the NEW specification.
+            pinew = warm_pi
+            progress("Setup 8/8: prior probabilities taken from the warm-start file.")
+        else:
+            pinew = np.full(N_AUXILIARY_TYPES, 1.0 / N_AUXILIARY_TYPES, dtype=float)
         q, initial_loglike = all_auxiliary_log_likelihoods(
             pinew,
             choice_parameters,
@@ -5101,12 +5295,14 @@ n_param_g_exp = (fields-1)*4*6
 n_param_g_types = 2 # one effect on associate and one on 4y schools
 total_n = n_param_g_x1 + n_param_g_change + n_param_g_work + n_param_g_educ + n_param_g_period + n_param_g_period_work + n_param_g_first + n_param_g_exp + n_param_g_types
 total_n_choice_legacy = total_n
+# 2026-07-29 respecification: the auxiliary debt coefficient is REMOVED.
+# Debt enters the choice index only through consumption net of debt
+# service (_net_consumption_regressor); the vector holds the legacy g()
+# block plus ONE expected-consumption coefficient.
 n_param_auxiliary_consumption = 1
-n_param_auxiliary_debt = 1
 total_n_multi = (
     total_n_choice_legacy
     + n_param_auxiliary_consumption
-    + n_param_auxiliary_debt
 )
 total_n_late    = 9 + 1 # 9 coefficients + 1 type em
 total_n_summer  = 9 + 1 # 9 coefficients + 1 type em
@@ -5167,11 +5363,42 @@ if __name__ == "__main__":
             "these are additional iterations after the saved checkpoint."
         ),
     )
+    parser.add_argument(
+        "--warm-start-previous",
+        action="store_true",
+        help=(
+            "TEMPORARY (2026-07-29): seed a fresh run of the respecified model "
+            "(no debt coefficient) with the converged parameters, prior, and "
+            "financial processes of Model/Estimates/auxiliary_em_results.npz; "
+            "an old-layout vector's trailing debt coefficient is dropped and "
+            "the posteriors are recomputed in the initial E-step. Incompatible "
+            "with --resume. Remove after the from-scratch re-estimation."
+        ),
+    )
+    parser.add_argument(
+        "--warm-start-file",
+        default=None,
+        help=(
+            "Optional results .npz path for --warm-start-previous. The default "
+            "is the current Model/Estimates auxiliary_em_results.npz."
+        ),
+    )
     arguments = parser.parse_args()
     if arguments.max_iterations < 1:
         parser.error("--max-iterations must be positive.")
     if arguments.checkpoint_file is not None and not arguments.resume:
         parser.error("--checkpoint-file requires --resume.")
+    if arguments.warm_start_file is not None and not arguments.warm_start_previous:
+        parser.error("--warm-start-file requires --warm-start-previous.")
+    if arguments.warm_start_previous and arguments.resume:
+        parser.error("--warm-start-previous is incompatible with --resume.")
+    warm_start_file = None
+    if arguments.warm_start_previous:
+        warm_start_file = (
+            f"{path_estimates}/auxiliary_em_results.npz"
+            if arguments.warm_start_file is None
+            else arguments.warm_start_file
+        )
     if arguments.numba_threads is not None:
         if arguments.numba_threads < 1:
             parser.error("--numba-threads must be positive.")
@@ -5188,6 +5415,7 @@ if __name__ == "__main__":
         max_iterations=arguments.max_iterations,
         resume=arguments.resume,
         checkpoint_file=arguments.checkpoint_file,
+        warm_start_file=warm_start_file,
     )
 
 #.............................................................................#
