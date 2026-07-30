@@ -282,9 +282,17 @@ def _loan_type_posterior_tables(panel, q, loan):
     return summary, pd.DataFrame(histogram_rows), individual
 
 
-def _loan_outcomes_by_period(panel, groups):
-    """Annual cleaned borrowing flows and outstanding stocks by panel period."""
-    enrolled = panel.loc[panel["educ"].isin(EDUCATION)].copy().reset_index(drop=True)
+def _loan_outcomes_by_period(
+    panel, groups, education_levels=None, sample_label="Enrolled in current period"
+):
+    """Annual cleaned borrowing flows and outstanding stocks by panel period.
+
+    ``education_levels`` restricts the enrolled sample (default: all enrolled
+    levels); undergraduate and graduate borrowing follow different annual
+    caps, so the paper reports them in separate tables.
+    """
+    levels = EDUCATION if education_levels is None else education_levels
+    enrolled = panel.loc[panel["educ"].isin(levels)].copy().reset_index(drop=True)
     rows = []
     for _, label, individual_weights in groups:
         row_weights = _weights_for_rows(enrolled, individual_weights)
@@ -300,7 +308,7 @@ def _loan_outcomes_by_period(panel, groups):
                 {
                     "loan_type": label,
                     "period": int(period),
-                    "sample": "Enrolled in current period",
+                    "sample": sample_label,
                     "raw_enrolled_observations": int(len(index)),
                     "posterior_weighted_enrolled_observations": float(weights.sum()),
                     "mean_annual_loan_flow": _weighted_mean(flow, weights),
@@ -509,9 +517,14 @@ def _longest_true_spell(values) -> int:
     return int(longest)
 
 
-def _individual_loan_histories(panel):
-    """Construct repeated-borrowing outcomes for each individual."""
-    enrolled = panel.loc[panel["educ"].isin(EDUCATION)].copy()
+def _individual_loan_histories(panel, education_levels=None):
+    """Construct repeated-borrowing outcomes for each individual.
+
+    ``education_levels`` restricts which enrolled person-years count as part
+    of the borrowing history (default: all enrolled levels).
+    """
+    levels = EDUCATION if education_levels is None else education_levels
+    enrolled = panel.loc[panel["educ"].isin(levels)].copy()
     rows = []
     for em_row, person in enrolled.groupby("_em_row", sort=True):
         person = person.sort_values("period")
@@ -540,9 +553,20 @@ def _individual_loan_histories(panel):
     return pd.DataFrame(rows)
 
 
-def _loan_persistence_by_type(panel, groups):
-    """Person-level repetition and consecutive-period borrowing transitions."""
-    people = _individual_loan_histories(panel)
+def _loan_persistence_by_type(
+    panel,
+    groups,
+    education_levels=None,
+    sample_label="All enrolled person-years",
+):
+    """Person-level repetition and consecutive-period borrowing transitions.
+
+    ``education_levels`` restricts the enrolled person-years that count as
+    borrowing history (default: all enrolled levels), so undergraduate and
+    graduate borrowing can be reported separately.
+    """
+    levels = EDUCATION if education_levels is None else education_levels
+    people = _individual_loan_histories(panel, education_levels=levels)
     person_rows = []
     for _, label, individual_weights in groups:
         indices = people["_em_row"].to_numpy(dtype=int)
@@ -551,6 +575,7 @@ def _loan_persistence_by_type(panel, groups):
         person_rows.append(
             {
                 "loan_type": label,
+                "sample": sample_label,
                 "raw_ever_enrolled_individuals": int(len(people)),
                 "posterior_weighted_ever_enrolled_individuals": float(weights.sum()),
                 "share_ever_borrowed": _weighted_mean(ever, weights),
@@ -584,8 +609,8 @@ def _loan_persistence_by_type(panel, groups):
     ordered["previous_educ"] = grouped["educ"].shift()
     ordered["previous_loan_flow"] = grouped["auxiliary_loan_flow"].shift()
     consecutive_enrollment = (
-        ordered["educ"].isin(EDUCATION)
-        & ordered["previous_educ"].isin(EDUCATION)
+        ordered["educ"].isin(levels)
+        & ordered["previous_educ"].isin(levels)
         & ordered["previous_period"].eq(ordered["period"] - 1)
     )
     transitions = ordered.loc[consecutive_enrollment].copy().reset_index(drop=True)
@@ -602,7 +627,9 @@ def _loan_persistence_by_type(panel, groups):
         transition_rows.append(
             {
                 "loan_type": label,
-                "transition_sample": "Consecutive panel periods enrolled in both years",
+                "transition_sample": (
+                    f"Consecutive panel periods enrolled in both years ({sample_label})"
+                ),
                 "raw_transitions": int(len(transitions)),
                 "posterior_weighted_transitions": float(weights.sum()),
                 "share_borrowing_in_previous_year": _weighted_mean(previous_borrow, weights),
@@ -887,6 +914,19 @@ def main():
     persistence_people, persistence_transitions = _loan_persistence_by_type(
         panel, loan_groups
     )
+    # Undergraduate vs graduate splits: the two stages face different annual
+    # caps and the latent loan type sorts them very differently, so the paper
+    # reports them separately (Sergi, 2026-07-30).
+    UNDERGRADUATE = (1, 2)
+    GRADUATE = (3,)
+    persistence_people_ug, persistence_transitions_ug = _loan_persistence_by_type(
+        panel, loan_groups, education_levels=UNDERGRADUATE,
+        sample_label="Undergraduate person-years (two- or four-year)",
+    )
+    persistence_people_gr, persistence_transitions_gr = _loan_persistence_by_type(
+        panel, loan_groups, education_levels=GRADUATE,
+        sample_label="Graduate person-years",
+    )
     work_by_level, work_by_period = _work_while_enrolled(panel, groups)
     tables = {
         "loan_type_posterior_summary": posterior_summary,
@@ -895,11 +935,23 @@ def main():
         "loan_type_annual_flow_and_stock_by_year": _loan_outcomes_by_period(
             panel, loan_groups
         ),
+        "loan_type_annual_flow_and_stock_by_year_undergraduate": _loan_outcomes_by_period(
+            panel, loan_groups, education_levels=UNDERGRADUATE,
+            sample_label="Enrolled undergraduate (two- or four-year)",
+        ),
+        "loan_type_annual_flow_and_stock_by_year_graduate": _loan_outcomes_by_period(
+            panel, loan_groups, education_levels=GRADUATE,
+            sample_label="Enrolled graduate",
+        ),
         "loan_type_flow_and_stock_at_graduation": _loan_outcomes_at_graduation(
             panel, loan_groups
         ),
         "loan_type_persistence_person_level": persistence_people,
         "loan_type_persistence_transitions": persistence_transitions,
+        "loan_type_persistence_person_level_undergraduate": persistence_people_ug,
+        "loan_type_persistence_transitions_undergraduate": persistence_transitions_ug,
+        "loan_type_persistence_person_level_graduate": persistence_people_gr,
+        "loan_type_persistence_transitions_graduate": persistence_transitions_gr,
         "student_loans_by_year_and_type": _debt_by_period(panel, groups),
         "student_loans_at_graduation_by_type": _debt_at_graduation(panel, groups),
         "education_completion_dropout_by_type": _education_outcomes(panel, groups),

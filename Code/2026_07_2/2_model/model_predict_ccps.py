@@ -421,7 +421,7 @@ def ensure_initial_ccps(invariant_states, debt_range, model_parameters):
         )
         for state_index, type_id in missing_tasks
     ]
-    with multiprocessing.Pool(processes=min(10, len(retry_args))) as pool_obj:
+    with multiprocessing.Pool(processes=min(90, len(retry_args))) as pool_obj:
         pool_obj.starmap(get_all_ccps, retry_args, chunksize=1)
 
     remaining_tasks, remaining_files = missing_initial_ccp_tasks(invariant_states)
@@ -485,7 +485,7 @@ if __name__ == '__main__':
     }
     debt_range = ms.debt_range
     
-    pool_obj = multiprocessing.Pool(processes=10)     
+    pool_obj = multiprocessing.Pool(processes=90)
     args = [
         (i, ms.invariant_states, ms.debt_range, model_parameters[type_id], type_id)
         for type_id in TYPE_IDS

@@ -117,22 +117,22 @@ def _choice_parameter_names(number_parameters: int) -> list[str]:
     names = []
     for block, size in block_sizes:
         names.extend(f"{block}_{index + 1:03d}" for index in range(size))
+    # 2026-07-29 respecification: no debt coefficient; the vector ends with
+    # the two schooling type effects and the single consumption coefficient.
     names.extend(
         (
             "high_schooling_type_associate",
             "high_schooling_type_four_year",
             "expected_consumption",
-            "current_debt_nonhome",
         )
     )
     if len(names) != number_parameters:
         names = [f"choice_parameter_{index + 1:03d}" for index in range(number_parameters)]
-        if number_parameters >= 4:
-            names[-4:] = [
+        if number_parameters >= 3:
+            names[-3:] = [
                 "high_schooling_type_associate",
                 "high_schooling_type_four_year",
                 "expected_consumption",
-                "current_debt_nonhome",
             ]
     return names
 

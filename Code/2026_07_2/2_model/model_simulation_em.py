@@ -257,24 +257,35 @@ def get_total_choices():
     
     return choices
     
-def load_vjti(x1,x2,period,conter,types,maxdebt):
-    
+def vjti_file(x1,period,conter,types,maxdebt):
+
     """
-    This function loads the corresponding vjt depnding on which conterfactual is running. 
+    This function returns the path of the archive holding all vjt entries of
+    one (x1, latent type), depending on which conterfactual is running. Split
+    out of ``load_vjti`` so the simulation can open each archive once per
+    group of individuals instead of once per individual.
     """
-    
+
     if conter == 0:
-    
-        vjti = np.load(f"{OUT('vjt', str(period))}/vjt_t{period}_[{x1}]_em{types}.npz")[f"vjt_t{period}_[{x1}]_{x2}"]
-        
+
+        return f"{OUT('vjt', str(period))}/vjt_t{period}_[{x1}]_em{types}.npz"
+
     if conter == 1:
-        
-        vjti = np.load(f"{OUT('vjt_conter', str(period))}/vjt_t{period}_[{x1}]_em{types}_maxdebt{maxdebt}.npz")[f"vjt_t{period}_[{x1}]_{x2}"]
-        
+
+        return f"{OUT('vjt_conter', str(period))}/vjt_t{period}_[{x1}]_em{types}_maxdebt{maxdebt}.npz"
+
     if conter == 2:
-        
-        vjti = np.load(f"{OUT('vjt_conter_not', str(period))}/vjt_t{period}_[{x1}]_em{types}.npz")[f"vjt_t{period}_[{x1}]_{x2}"]
-        
+
+        return f"{OUT('vjt_conter_not', str(period))}/vjt_t{period}_[{x1}]_em{types}.npz"
+
+def load_vjti(x1,x2,period,conter,types,maxdebt):
+
+    """
+    This function loads the corresponding vjt depnding on which conterfactual is running.
+    """
+
+    vjti = np.load(vjti_file(x1,period,conter,types,maxdebt))[f"vjt_t{period}_[{x1}]_{x2}"]
+
     return vjti
 
 def get_expected_conditional_x(x,period,conter,types,maxdebt,uparams):
@@ -286,44 +297,64 @@ def get_expected_conditional_x(x,period,conter,types,maxdebt,uparams):
     column_map = np.repeat(np.nan,np.shape(x)[0]*np.shape(total_choices)[0]).reshape(np.shape(x)[0],np.shape(total_choices)[0])  # This array will hold how to map from columns in payoff, to the corresponding choice. As safety I will create it with nans
     
     gvalue = np.zeros((np.shape(x)[0],np.shape(total_choices)[0]))
-    
+
     x1new = get_x1_new(x[:,1:5])
-    
-    for i in range(np.shape(x)[0]):
-        xi = x[i,1:]   # get the first individual
-    
-        # First check which choices are feasible 
-        
-        x2 = xi[4:14]
-        x1 = xi[:4]
-        debt = xi[14]
-        
-        Jx  = get_possible_choices(x2)
 
-        # Perform the map
-        
-        idx = np.where( (total_choices==Jx[:,None]).all(-1) )[1]  # This tells which index in tota_choices corresponds to each choice in Jx
-        
-        idx = np.concatenate((idx[...,np.newaxis],np.arange(0,np.shape(idx)[0]).reshape(np.shape(idx)[0],1)),axis=1)  # This just includes the index of Jx as a column in the array. 
+    # Individuals sharing (x1, latent type) read the same vjt archive, so open
+    # each archive once and reuse its decompressed entries across the group
+    # (same pattern as model_fitloans_dynamic.load_ccp_path). There are no
+    # random draws here and every row is filled independently, so payoff and
+    # gvalue are numerically identical to the previous per-individual loads.
+    group_keys = np.concatenate(
+        (x[:, 1:5], np.asarray(types).reshape(-1, 1)), axis=1
+    ).astype(np.int64)
+    unique_groups, group_index = np.unique(group_keys, axis=0, return_inverse=True)
 
-        column_map[i,idx[:,0]] = idx[:,1]  # This performs the match to this individual of the corresponding mapping.
-        
-        # load the vjts        
-        vjt_jx = load_vjti(x1,x2,period,conter,types[i],maxdebt)
-        
-        gfunctions = get_all_g(uparams[types[i]-1],x1,x1new[i,:],x2,Jx,period)
-        
-        column = 0  # This will track which choice is in the column. 
-        for choice in range(np.shape(total_choices)[0]):
-            if choice in list(idx[:,0]):
-                payoff[i,column] = vjt_jx[debt,int(column_map[i,column])]  # Get the corresponding chioce with the corresponding debt level.
-                gvalue[i,column] = gfunctions[0,int(column_map[i,column])]
-            else:
-                payoff[i,column] = np.nan
-                gvalue[i,column] = np.nan
-            
-            column +=1 # Identify next column!
-            
+    for group in range(np.shape(unique_groups)[0]):
+        rows = np.flatnonzero(group_index == group)
+        x1_group = x[rows[0],1:5]
+        type_group = types[rows[0]]
+        vjt_cache = {}
+        with np.load(vjti_file(x1_group,period,conter,type_group,maxdebt)) as vjt_bundle:
+            for i in rows:
+                xi = x[i,1:]   # get the first individual
+
+                # First check which choices are feasible
+
+                x2 = xi[4:14]
+                x1 = xi[:4]
+                debt = xi[14]
+
+                Jx  = get_possible_choices(x2)
+
+                # Perform the map
+
+                idx = np.where( (total_choices==Jx[:,None]).all(-1) )[1]  # This tells which index in tota_choices corresponds to each choice in Jx
+
+                idx = np.concatenate((idx[...,np.newaxis],np.arange(0,np.shape(idx)[0]).reshape(np.shape(idx)[0],1)),axis=1)  # This just includes the index of Jx as a column in the array.
+
+                column_map[i,idx[:,0]] = idx[:,1]  # This performs the match to this individual of the corresponding mapping.
+
+                # load the vjts (decompressed once per distinct x2 in the group)
+                request = tuple(x2.tolist())
+                vjt_jx = vjt_cache.get(request)
+                if vjt_jx is None:
+                    vjt_jx = vjt_bundle[f"vjt_t{period}_[{x1}]_{x2}"]
+                    vjt_cache[request] = vjt_jx
+
+                gfunctions = get_all_g(uparams[types[i]-1],x1,x1new[i,:],x2,Jx,period)
+
+                column = 0  # This will track which choice is in the column.
+                for choice in range(np.shape(total_choices)[0]):
+                    if choice in list(idx[:,0]):
+                        payoff[i,column] = vjt_jx[debt,int(column_map[i,column])]  # Get the corresponding chioce with the corresponding debt level.
+                        gvalue[i,column] = gfunctions[0,int(column_map[i,column])]
+                    else:
+                        payoff[i,column] = np.nan
+                        gvalue[i,column] = np.nan
+
+                    column +=1 # Identify next column!
+
     return payoff, gvalue
 
 
@@ -1565,41 +1596,68 @@ def move_state_grad(x,j,period,grad=0):
     return z
 
 
+def evt_file(x1i,period,conter,types,maxdebt):
+
+    """
+    This function returns the path of the archive holding all evt entries of
+    one (x1, latent type), for the same conterfactual cases as the previous
+    per-individual loads in ``VT_agents``.
+    """
+
+    if conter == 0:
+        return f"{OUT('evt', str(period+1))}/evt_t{period+1}_[{x1i}]_em{types}.npz"
+    elif conter == 1:
+        return f"{OUT('evt_conter', str(period+1))}/evt_t{period+1}_[{x1i}]_em{types}_maxdebt{maxdebt}.npz"
+
+
 def VT_agents(x1,x2,b1,period,choices,conter,types,maxdebt):
 
     " This function returns the final continuation value for each individual"
     x1 = np.array(x1,dtype="int")
     x2 = np.array(x2,dtype="int")
     x1_new = get_x1_new(x1)
-    vt = np.zeros((np.shape(x2)[0],np.shape(b1)[0])) 
-    for space in range(np.shape(x2)[0]):
-        x2i = x2[space,:]
-        x1i = x1[space,:]
-        ji = choices[space,:]
+    vt = np.zeros((np.shape(x2)[0],np.shape(b1)[0]))
+    # Individuals sharing (x1, latent type) read the same evt archive, so open
+    # each archive once and reuse the continuation across repeated (x2, choice)
+    # requests within the group (same pattern as
+    # model_fitloans_dynamic.load_ccp_path). The graduation mixing below is
+    # deterministic given (x1, x2, choice), so the vt matrix is numerically
+    # identical to the previous per-individual loads.
+    group_keys = np.concatenate(
+        (x1, np.asarray(types).reshape(-1, 1)), axis=1
+    ).astype(np.int64)
+    unique_groups, group_index = np.unique(group_keys, axis=0, return_inverse=True)
+    for group in range(np.shape(unique_groups)[0]):
+        rows = np.flatnonzero(group_index == group)
+        continuation_cache = {}
+        with np.load(evt_file(x1[rows[0],:],period,conter,types[rows[0]],maxdebt)) as evt:
+            for space in rows:
+                x2i = x2[space,:]
+                x1i = x1[space,:]
+                ji = choices[space,:]
 
-        if conter == 0:
-            evt = np.load(f"{OUT('evt', str(period+1))}/evt_t{period+1}_[{x1i}]_em{types[space]}.npz")
-        elif conter == 1: 
-            evt = np.load(f"{OUT('evt_conter', str(period+1))}/evt_t{period+1}_[{x1i}]_em{types[space]}_maxdebt{maxdebt}.npz")
-        # First check if the choice and state include a possible graduation state. 
-        if ((x2i[1] >=1) & (ji[1] == 1) & (x2i[4] == 0)) | ((x2i[2]>=3) & (ji[1] == 2) & (x2i[5] == 0)) | (ji[1]==3):
-            # The choice could induce a graduation state. For this reason, take the expectation.
-            grad_x2  =  move_state_grad(x2i,ji,period,grad=1)
-            notgrad_x2 = move_state_grad(x2i,ji,period)
-            #evt = np.load(f"evt/evt_t{period+1}_{x1}.npz")
-            evt_grad =  evt[f"evt_t{period+1}_[{x1i}]_{grad_x2}"]
-            evt_nograd = evt[f"evt_t{period+1}_[{x1i}]_{notgrad_x2}"]
-            p_grad = probability_graduation(x1_new[space,:],x2[space,:],ji)
-            evt_new = p_grad*evt_grad + (1-p_grad)*evt_nograd
-            vt[space,:] = evt_new[:,0]
-        else: 
-            # load the data
-            x2_next = move_state_grad(x2i,ji,period)
-            evt_new = evt[f"evt_t{period+1}_[{x1i}]_{x2_next}"]
-            # Now for each individual take the one corresponding with its tmr level of debt
-            # Notice that if on the future the repayment scheme changes for different states
-            # I should correct for that here.
-            vt[space,:] = evt_new[:,0]
+                request = (tuple(x2i.tolist()), tuple(np.asarray(ji).tolist()))
+                evt_new = continuation_cache.get(request)
+                if evt_new is None:
+                    # First check if the choice and state include a possible graduation state.
+                    if ((x2i[1] >=1) & (ji[1] == 1) & (x2i[4] == 0)) | ((x2i[2]>=3) & (ji[1] == 2) & (x2i[5] == 0)) | (ji[1]==3):
+                        # The choice could induce a graduation state. For this reason, take the expectation.
+                        grad_x2  =  move_state_grad(x2i,ji,period,grad=1)
+                        notgrad_x2 = move_state_grad(x2i,ji,period)
+                        #evt = np.load(f"evt/evt_t{period+1}_{x1}.npz")
+                        evt_grad =  evt[f"evt_t{period+1}_[{x1i}]_{grad_x2}"]
+                        evt_nograd = evt[f"evt_t{period+1}_[{x1i}]_{notgrad_x2}"]
+                        p_grad = probability_graduation(x1_new[space,:],x2[space,:],ji)
+                        evt_new = p_grad*evt_grad + (1-p_grad)*evt_nograd
+                    else:
+                        # load the data
+                        x2_next = move_state_grad(x2i,ji,period)
+                        evt_new = evt[f"evt_t{period+1}_[{x1i}]_{x2_next}"]
+                        # Now for each individual take the one corresponding with its tmr level of debt
+                        # Notice that if on the future the repayment scheme changes for different states
+                        # I should correct for that here.
+                    continuation_cache[request] = evt_new
+                vt[space,:] = evt_new[:,0]
 
     return vt
     
