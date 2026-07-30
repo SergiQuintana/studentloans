@@ -296,9 +296,9 @@ class LoanTypeDebtPenaltyShiftTests(unittest.TestCase):
     def test_invalid_sizes_rejected(self):
         cells = _multicell_cells()
         vector = _multicell_vector(cells)
-        # Optional tail blocks are 3 (kappa), 5 (need mixture) and 1 (shift),
-        # so the legal extra lengths are 0, 1, 3, 4, 5, 6, 8 and 9.
-        for bad_extra in (2, 7):
+        # Optional tail blocks are 3 (kappa), 6 (need mixture) and 1 (shift),
+        # so the legal extra lengths are 0, 1, 3, 4, 6, 7, 9 and 10.
+        for bad_extra in (2, 5):
             with self.assertRaises(ValueError):
                 bs.unpack_parental_income_multicell_estimation_vector(
                     np.concatenate((vector, np.zeros(bad_extra))),

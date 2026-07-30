@@ -197,11 +197,15 @@ ESTIMATE_NEED_MIXTURE = False
 NEED_MIXTURE_LOGIT_BOUNDS = (-6.0, 6.0)
 NEED_MIXTURE_NONEED_MEAN_BOUNDS = (-20000.0, 20000.0)
 NEED_MIXTURE_NONEED_SIGMA_BOUNDS = (1.0, 20000.0)
-# Restart start values [a0, a_type, a_debt, mu_noneed, sigma_noneed] from the
-# fit-lab race (Agents_Readme/Tasks/2026_07_24_fit_research/
-# IMPLEMENTATION_PLAN.md, section 4): logits reproducing the observed
-# within-type entry rates (.0506/.5633) and continuation (~.84).
-NEED_MIXTURE_START = (-2.93, 3.19, 2.76, 0.0, 2000.0)
+# Restart start values [a0, a_type, a_debt, a_type_debt, mu_noneed,
+# sigma_noneed]. Logits (fit-lab race, Agents_Readme/Tasks/
+# 2026_07_24_fit_research/IMPLEMENTATION_PLAN.md, section 4) reproduce the
+# observed within-type entry rates (.0506/.5633); a_type_debt starts neutral
+# at 0.0 (the saturating interaction, added 2026-07-30). mu_noneed starts at
+# +15,000 (2026-07-30, Sergi): the no-need component is SEEDED clearly above
+# the need cell means (label orientation, like the auxiliary EM's typeffect
+# seeds) instead of the old 0.0 that let the components start merged.
+NEED_MIXTURE_START = (-2.93, 3.19, 2.76, 0.0, 15000.0, 2000.0)
 # Freeze the four shared debt penalties at zero. They keep their slots in the
 # vector layout, so nothing is renumbered and every consumer still receives a
 # four-entry ``debt_pen_parinc``; the optimizer simply never varies them (see
@@ -383,9 +387,9 @@ def decode_multicell_parameter_blocks(params, n_cells):
     if new_borrowing is not None:
         decoded["new_borrowing_costs"] = _log_values(new_borrowing, 4)
     if need_mixture is not None:
-        decoded["mixture_logits"] = _log_values(need_mixture[:3], 4)
-        decoded["mixture_noneed_mean"] = round(float(need_mixture[3]), 3)
-        decoded["mixture_noneed_sigma"] = round(float(need_mixture[4]), 3)
+        decoded["mixture_logits"] = _log_values(need_mixture[:4], 4)
+        decoded["mixture_noneed_mean"] = round(float(need_mixture[4]), 3)
+        decoded["mixture_noneed_sigma"] = round(float(need_mixture[5]), 3)
     if loan_type_shift is not None:
         decoded["loan_type_debt_penalty_shift"] = round(
             float(loan_type_shift), 4
@@ -3722,9 +3726,9 @@ def _evaluate_sampled_parental_income_cell(
                 "need_mixture must contain "
                 f"{bs.N_MIXTURE_PARAMETERS} entries."
             )
-        spec["mixture_logits"] = need_mixture[:3].copy()
-        spec["mixture_noneed_mean"] = float(need_mixture[3])
-        spec["mixture_noneed_sigma"] = float(need_mixture[4])
+        spec["mixture_logits"] = need_mixture[:4].copy()
+        spec["mixture_noneed_mean"] = float(need_mixture[4])
+        spec["mixture_noneed_sigma"] = float(need_mixture[5])
         spec["need_mixture_timing"] = bs.NEED_MIXTURE_TIMING
     pooled = _pool_sampled_education_cell_evaluation(
         sample_by_period, spec, education, program_year
@@ -5032,8 +5036,8 @@ def fit_education_cells(
             (initial[:pre_mixture_expected], NEED_MIXTURE_START, saved_shift)
         )
         print(
-            "[initial] Inserting the five need-mixture parameters "
-            f"{NEED_MIXTURE_START} into the "
+            f"[initial] Inserting the {len(NEED_MIXTURE_START)} need-mixture "
+            f"parameters {NEED_MIXTURE_START} into the "
             f"{pre_mixture_expected + saved_shift.size}-parameter vector."
         )
     if ESTIMATE_LOAN_TYPE_DEBT_PENALTY and initial.size == pre_shift_expected:
@@ -5055,7 +5059,7 @@ def fit_education_cells(
                 if ESTIMATE_NEW_BORROWING_COST else ""
             )
             + (
-                " and five shared need-mixture parameters"
+                " and six shared need-mixture parameters"
                 if ESTIMATE_NEED_MIXTURE else ""
             )
             + (
@@ -5084,7 +5088,7 @@ def fit_education_cells(
     if ESTIMATE_NEED_MIXTURE:
         # Three logits of the need probability, then the shared no-need mean
         # and standard deviation in dollars.
-        bounds.extend([NEED_MIXTURE_LOGIT_BOUNDS] * 3)
+        bounds.extend([NEED_MIXTURE_LOGIT_BOUNDS] * 4)
         bounds.append(NEED_MIXTURE_NONEED_MEAN_BOUNDS)
         bounds.append(NEED_MIXTURE_NONEED_SIGMA_BOUNDS)
     if ESTIMATE_LOAN_TYPE_DEBT_PENALTY:
@@ -5645,7 +5649,7 @@ def estimate_budget_shock_all_education(
                 )
             ):
                 # A saved vector without the mixture block restarts the
-                # mixture specification; fit_education_cells inserts the five
+                # mixture specification; fit_education_cells inserts the six
                 # need-mixture parameters at their start values, keeping the
                 # cell, risk-aversion and shift blocks as saved.
                 initial = candidate

@@ -375,10 +375,11 @@ def _print_budget_estimates(it, smm_loss=None):
         if logits is None:
             print(f"[ESTIMATES it {it}] need mixture off", flush=True)
         else:
-            a0, a_type, a_debt = np.asarray(logits, dtype=np.float64)
+            a0, a_type, a_debt, a_type_debt = np.asarray(logits, dtype=np.float64)
             print(
                 f"[ESTIMATES it {it}] need mixture: a0={a0:.4f} "
-                f"a_type={a_type:.4f} a_debt={a_debt:.4f}"
+                f"a_type={a_type:.4f} a_debt={a_debt:.4f} "
+                f"a_type_debt={a_type_debt:.4f}"
                 f" | mu_noneed={float(bundle['mixture_noneed_mean']):,.1f}"
                 f" | sigma_noneed={float(bundle['mixture_noneed_sigma']):,.1f}",
                 flush=True,

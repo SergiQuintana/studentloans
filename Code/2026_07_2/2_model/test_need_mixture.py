@@ -39,7 +39,7 @@ def _base_vector(cells, seed=0):
 SUPPORT = dict(education=2, program_year=1)
 
 
-MIXTURE_BLOCK = np.asarray([-2.0, 3.5, 1.5, 250.0, 2000.0])
+MIXTURE_BLOCK = np.asarray([-2.0, 3.5, 1.5, -0.75, 250.0, 2000.0])
 
 
 class VectorLayoutTests(unittest.TestCase):
@@ -58,9 +58,9 @@ class VectorLayoutTests(unittest.TestCase):
             np.concatenate((base, MIXTURE_BLOCK)), cells, index_kind="education_cell"
         )
         self.assertTrue(bs.mixture_enabled(spec))
-        np.testing.assert_array_equal(spec["mixture_logits"], MIXTURE_BLOCK[:3])
-        self.assertEqual(spec["mixture_noneed_mean"], MIXTURE_BLOCK[3])
-        self.assertEqual(spec["mixture_noneed_sigma"], MIXTURE_BLOCK[4])
+        np.testing.assert_array_equal(spec["mixture_logits"], MIXTURE_BLOCK[:4])
+        self.assertEqual(spec["mixture_noneed_mean"], MIXTURE_BLOCK[4])
+        self.assertEqual(spec["mixture_noneed_sigma"], MIXTURE_BLOCK[5])
 
     def test_shift_stays_last_after_the_mixture(self):
         cells = _cells()
@@ -69,7 +69,7 @@ class VectorLayoutTests(unittest.TestCase):
         spec = bs.unpack_parental_income_multicell_estimation_vector(
             vector, cells, index_kind="education_cell"
         )
-        np.testing.assert_array_equal(spec["mixture_logits"], MIXTURE_BLOCK[:3])
+        np.testing.assert_array_equal(spec["mixture_logits"], MIXTURE_BLOCK[:4])
         self.assertEqual(spec["debt_penalty_loan_type_shift"], -7.0)
 
     def test_kappa_and_mixture_together(self):
@@ -84,7 +84,7 @@ class VectorLayoutTests(unittest.TestCase):
             spec["new_borrow_cost_entry_by_loan_type"], kappa[:2]
         )
         self.assertEqual(spec["new_borrow_cost_continuation"], kappa[2])
-        np.testing.assert_array_equal(spec["mixture_logits"], MIXTURE_BLOCK[:3])
+        np.testing.assert_array_equal(spec["mixture_logits"], MIXTURE_BLOCK[:4])
         self.assertEqual(spec["debt_penalty_loan_type_shift"], -7.0)
 
     def test_vector_sizes(self):
@@ -105,7 +105,7 @@ class VectorLayoutTests(unittest.TestCase):
     def test_ambiguous_tail_lengths_rejected(self):
         cells = _cells()
         base = _base_vector(cells)
-        for bad_extra in (2, 7, 10):
+        for bad_extra in (2, 5, 8):
             with self.assertRaises(ValueError):
                 bs.unpack_parental_income_multicell_estimation_vector(
                     np.concatenate((base, np.zeros(bad_extra))),
@@ -124,10 +124,11 @@ class ProbabilityTests(unittest.TestCase):
         )
 
     def test_matches_the_closed_form(self):
-        a0, a_type, a_debt = MIXTURE_BLOCK[:3]
+        a0, a_type, a_debt, a_type_debt = MIXTURE_BLOCK[:4]
         for loan in (0, 1):
             for debt in (False, True):
-                linear = a0 + a_type * loan + a_debt * debt
+                linear = (a0 + a_type * loan + a_debt * debt
+                          + a_type_debt * loan * debt)
                 self.assertAlmostEqual(
                     bs.mixture_probability(self.spec, loan_type=loan, has_debt=debt),
                     1.0 / (1.0 + np.exp(-linear)),
@@ -144,7 +145,7 @@ class ProbabilityTests(unittest.TestCase):
     def test_extreme_logits_do_not_overflow(self):
         spec = dict(self.spec)
         for a0 in (-800.0, 800.0):
-            spec["mixture_logits"] = np.asarray([a0, 0.0, 0.0])
+            spec["mixture_logits"] = np.asarray([a0, 0.0, 0.0, 0.0])
             with np.errstate(over="raise"):
                 probability = bs.mixture_probability(spec, loan_type=0, has_debt=False)
             self.assertTrue(np.isfinite(probability))
@@ -177,8 +178,8 @@ class RealizationTests(unittest.TestCase):
             mean_need, bs.conditional_mean(self.spec, self.x1, None, **SUPPORT)
         )
         self.assertEqual(sigma_need, bs.conditional_sigma(self.spec, None, **SUPPORT))
-        self.assertEqual(mean_noneed, MIXTURE_BLOCK[3])
-        self.assertEqual(sigma_noneed, MIXTURE_BLOCK[4])
+        self.assertEqual(mean_noneed, MIXTURE_BLOCK[4])
+        self.assertEqual(sigma_noneed, MIXTURE_BLOCK[5])
 
     def test_uniform_draw_selects_the_component(self):
         standard = np.full(4, 0.5)
@@ -200,7 +201,7 @@ class RealizationTests(unittest.TestCase):
 
     def test_certain_need_reproduces_the_single_component_path(self):
         spec = dict(self.spec)
-        spec["mixture_logits"] = np.asarray([50.0, 0.0, 0.0])   # p is one
+        spec["mixture_logits"] = np.asarray([50.0, 0.0, 0.0, 0.0])   # p is one
         standard = np.linspace(-2.0, 2.0, 4)
         np.testing.assert_allclose(
             bs.realization_mixture(
@@ -247,13 +248,13 @@ class ValidateTests(unittest.TestCase):
 
     def test_non_positive_noneed_sigma_rejected(self):
         block = MIXTURE_BLOCK.copy()
-        block[4] = 0.0
+        block[5] = 0.0
         with self.assertRaises(ValueError):
             bs.validate(self._spec(block))
 
     def test_non_finite_logits_rejected(self):
         spec = self._spec(MIXTURE_BLOCK)
-        spec["mixture_logits"] = np.asarray([np.nan, 0.0, 0.0])
+        spec["mixture_logits"] = np.asarray([np.nan, 0.0, 0.0, 0.0])
         with self.assertRaises(ValueError):
             bs.validate(spec)
 

@@ -61,13 +61,18 @@ NEW_BORROWING_COST_TIMING = "one_shot_event_no_multiplier"
 # Two-component budget shock. Each enrolled period the residual shock is drawn
 # from the "need" distribution with probability p and from the "no-need"
 # distribution with probability 1 - p, where
-#     p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0}).
-# The need component reuses the existing per-cell mean blocks, sigma and
-# resource slope; the no-need component has its own shared mean and sigma.
-# Both components and all three logits are estimated. Absent parameters mean
-# the mixture is OFF and every consumer keeps its single-normal behavior.
+#     p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0}
+#                  + a_type_debt * loan_type * 1{current debt > 0}).
+# The interaction a_type_debt (added 2026-07-30, Sergi's decision) SATURATES
+# the logit: four parameters for the four (type x debt-state) participation
+# rates, so all four pooled rate targets are attainable exactly. The need
+# component reuses the existing per-cell mean blocks, sigma and resource
+# slope; the no-need component has its own shared mean and sigma. Both
+# components and all four logits are estimated. Absent parameters mean the
+# mixture is OFF and every consumer keeps its single-normal behavior.
+# Block layout: [a0, a_type, a_debt, a_type_debt, mu_noneed, sigma_noneed].
 NEED_MIXTURE_TIMING = "two_component_loan_type_probability_v1"
-N_MIXTURE_PARAMETERS = 5
+N_MIXTURE_PARAMETERS = 6
 BUDGET_EDUCATION_CELLS = tuple(
     (education, year)
     for education, cap in EDUCATION_BUDGET_YEAR_CAP.items()
@@ -179,7 +184,7 @@ def estimation_vector_size_multicell(
     """Number of SMM parameters in the multicell parental-income vector.
 
     Tail layout (each block optional, in this order): three new-borrowing
-    costs (kappa), five need-mixture parameters, then one loan-type
+    costs (kappa), six need-mixture parameters, then one loan-type
     debt-penalty shift. With ten cells the accepted sizes are 68 (base),
     69 (base + shift), 71 (base + kappa), 72 (base + kappa + shift),
     73 (base + mixture), 74 (base + mixture + shift), 76 (base + kappa +
@@ -204,8 +209,11 @@ def estimation_vector_size_multicell(
 def _decode_multicell_tail(extra: int) -> tuple[bool, bool, bool]:
     """Which optional tail blocks a vector carries, from its extra length.
 
-    The three block sizes (3 kappa, 5 mixture, 1 shift) give eight distinct
-    totals, so the combination is recovered without ambiguity.
+    The three block sizes (3 kappa, 6 mixture, 1 shift) give eight distinct
+    totals {0, 1, 3, 4, 6, 7, 9, 10}, so the combination is recovered
+    without ambiguity. (Pre-2026-07-30 vectors with the 5-entry mixture
+    block decode to sizes this table rejects — they must be restarted, not
+    silently reinterpreted.)
     """
     for has_kappa in (False, True):
         for has_mixture in (False, True):
@@ -367,18 +375,20 @@ def unpack_parental_income_multicell_estimation_vector(
     zero current debt and the shared continuation cost with positive current
     debt.  Legacy vectors without them unpack to zero costs.
 
-    Five further optional entries carry the two-component need mixture:
-    ``[a0, a_type, a_debt, mu_noneed, sigma_noneed]``.  The first three are
-    the logits of the probability of drawing the need component; the last two
-    are the shared mean and standard deviation of the no-need component.  The
-    per-cell blocks above then describe the NEED component.
+    Six further optional entries carry the two-component need mixture:
+    ``[a0, a_type, a_debt, a_type_debt, mu_noneed, sigma_noneed]``.  The
+    first four are the logits of the probability of drawing the need
+    component (a_type_debt is the saturating type-x-debt interaction, added
+    2026-07-30); the last two are the shared mean and standard deviation of
+    the no-need component.  The per-cell blocks above then describe the NEED
+    component.
 
     A further optional tail entry, ALWAYS the last one after whatever kappa
     and mixture tails are active, is ``debt_penalty_loan_type_shift``: the
     additive per-period debt-penalty shift of the debt-averse latent loan type
     (``DEBT_PENALTY_SHIFT_LOAN_TYPE``, the low-borrowing type 0).  Accepted
     sizes are therefore base (68 with ten cells) plus any combination of
-    3 (kappa), 5 (mixture) and 1 (shift).  Vectors without a block unpack to
+    3 (kappa), 6 (mixture) and 1 (shift).  Vectors without a block unpack to
     the neutral value for that block: zero costs, no mixture, a zero shift.
     """
     vector = np.asarray(vector, dtype=np.float64).reshape(-1)
@@ -408,9 +418,9 @@ def unpack_parental_income_multicell_estimation_vector(
         new_borrow_entry = np.zeros(2, dtype=np.float64)
         new_borrow_continuation = 0.0
     if has_mixture:
-        mixture_logits = vector[tail:tail + 3].copy()
-        mixture_noneed_mean = float(vector[tail + 3])
-        mixture_noneed_sigma = float(vector[tail + 4])
+        mixture_logits = vector[tail:tail + 4].copy()
+        mixture_noneed_mean = float(vector[tail + 4])
+        mixture_noneed_sigma = float(vector[tail + 5])
         tail += N_MIXTURE_PARAMETERS
     else:
         mixture_logits = None
@@ -566,9 +576,19 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
         out["mixture_noneed_sigma"] = float(out.get("mixture_noneed_sigma", 0.0))
     else:
         logits = np.asarray(logits, dtype=np.float64).reshape(-1)
-        if logits.shape != (3,):
+        if logits.shape == (3,):
+            # Pre-2026-07-30 bundle without the a_type_debt interaction: zero
+            # is its exact neutral value, so the upgraded bundle reproduces
+            # the saved specification bit for bit.
+            print(
+                "[budget_shock] Upgrading 3-logit mixture bundle: appending "
+                "a_type_debt = 0.0 (neutral)."
+            )
+            logits = np.concatenate((logits, [0.0]))
+        if logits.shape != (4,):
             raise ValueError(
-                "mixture_logits must have three entries [a0, a_type, a_debt]"
+                "mixture_logits must have four entries "
+                "[a0, a_type, a_debt, a_type_debt]"
             )
         if not np.all(np.isfinite(logits)):
             raise ValueError("mixture_logits contains non-finite values")
@@ -889,16 +909,20 @@ def mixture_enabled(spec: dict[str, Any]) -> bool:
 def mixture_probability(spec: dict[str, Any], loan_type=None, has_debt=False):
     """Probability of drawing the NEED component.
 
-    ``p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0})``.
+    ``p = logistic(a0 + a_type * loan_type + a_debt * 1{current debt > 0}
+    + a_type_debt * loan_type * 1{current debt > 0})`` — the interaction
+    saturates the four (type x debt-state) participation rates.
     Broadcasts over ``loan_type`` and ``has_debt``; returns a float when both
     are scalars. Raises if the mixture is not active.
     """
     if not mixture_enabled(spec):
         raise ValueError("Budget-shock specification has no need mixture")
-    a0, a_type, a_debt = (float(value) for value in spec["mixture_logits"])
+    a0, a_type, a_debt, a_type_debt = (
+        float(value) for value in spec["mixture_logits"]
+    )
     loan = 0.0 if loan_type is None else np.asarray(loan_type, dtype=np.float64)
     debt = np.asarray(has_debt, dtype=np.float64)
-    linear = a0 + a_type * loan + a_debt * debt
+    linear = a0 + a_type * loan + a_debt * debt + a_type_debt * loan * debt
     # Stable logistic: exp is evaluated on the non-positive branch only.
     positive = linear >= 0.0
     exp_negative = np.exp(-np.abs(linear))
