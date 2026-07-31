@@ -227,6 +227,14 @@ ESTIMATE_LOAN_TYPE_DEBT_PENALTY = False
 #       reduced graduation block and the pooled loan-type block).
 ESTIMATE_NEED_MIXTURE = True
 FREEZE_DEBT_PENALTY = True
+# Calibrate risk aversion instead of estimating it (Sergi, 2026-07-31):
+# the four shared risk-aversion slots are held at FIXED_RISK_AVERSION for
+# every parental-income group; the SMM estimates only the budget-shock
+# parameters. Weak identification is the reason: estimates swung
+# [0.45,0.31,0.31,2.06] -> [1.64,0.70,1.44,1.07] across runs at comparable
+# loss, and the epsilon-inversion sigma profiles are nearly flat.
+FREEZE_RISK_AVERSION = True
+FIXED_RISK_AVERSION = 2.0
 
 # Warm-start the structural utility parameters g() from the saved
 # param_g.npy of a previous run. Default False (Sergi, 2026-07-28): iteration
@@ -315,6 +323,9 @@ def _print_run_header():
           f"{ESTIMATE_LOAN_TYPE_DEBT_PENALTY}")
     print(f"  ESTIMATE_NEED_MIXTURE         = {ESTIMATE_NEED_MIXTURE}")
     print(f"  FREEZE_DEBT_PENALTY           = {FREEZE_DEBT_PENALTY}")
+    print(f"  FREEZE_RISK_AVERSION          = {FREEZE_RISK_AVERSION}"
+          + (f" (fixed at {FIXED_RISK_AVERSION} for all parinc groups)"
+             if FREEZE_RISK_AVERSION else ""))
     print(f"  RESTART_PARAM_G               = {RESTART_PARAM_G}"
           + ("" if RESTART_PARAM_G else " (g() starts from zeros)"))
     print(f"  N_POOL_WORKERS                = {N_POOL_WORKERS}")
@@ -660,6 +671,8 @@ if __name__ == '__main__':
             mfd.ESTIMATE_LOAN_TYPE_DEBT_PENALTY = ESTIMATE_LOAN_TYPE_DEBT_PENALTY
             mfd.ESTIMATE_NEED_MIXTURE = ESTIMATE_NEED_MIXTURE
             mfd.FREEZE_DEBT_PENALTY = FREEZE_DEBT_PENALTY
+            mfd.FREEZE_RISK_AVERSION = FREEZE_RISK_AVERSION
+            mfd.FIXED_RISK_AVERSION = FIXED_RISK_AVERSION
             smm_result, _ = estimate_budget_shock_all_education(
                 draws=BUDGET_SMM_DRAWS,
                 maxiter=BUDGET_SMM_MAXITER,

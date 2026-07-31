@@ -212,6 +212,15 @@ NEED_MIXTURE_START = (-2.93, 3.19, 2.76, 0.0, 15000.0, 2000.0)
 # ``multicell_free_parameter_mask``). With zero levels the unpacked
 # specification carries ``debt_pen_parinc = zeros(4)``.
 FREEZE_DEBT_PENALTY = False
+# Freeze the four shared risk-aversion parameters at FIXED_RISK_AVERSION
+# (Sergi, 2026-07-31). Rationale: risk aversion is weakly identified by the
+# loan moments — estimates swung [0.45,0.31,0.31,2.06] -> [1.64,0.70,1.44,
+# 1.07] across runs with comparable loss, and the epsilon-inversion sigma
+# profiles are nearly flat — so it is CALIBRATED and the optimizer estimates
+# only the budget-shock parameters. The slots keep their place in the
+# vector, so nothing is renumbered and every consumer sees the fixed value.
+FREEZE_RISK_AVERSION = False
+FIXED_RISK_AVERSION = 2.0
 # Bounds of the four parental-income debt penalties (per-period flow-utility
 # units). Tightened (-1.0e6, 0.0) -> (-100.0, 0.0) on 2026-07-24 (researcher
 # decision): the previous estimation parked the penalties at -0.92e6..-1.0e6,
@@ -3831,6 +3840,11 @@ def multicell_free_parameter_mask(n_parameters, n_cells):
     four-vector in the unpacked specification.
     """
     mask = np.ones(int(n_parameters), dtype=bool)
+    if FREEZE_RISK_AVERSION:
+        risk_start = (
+            int(n_cells) * bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+        )
+        mask[risk_start:risk_start + bs.N_RISK_PARAMETERS] = False
     if FREEZE_DEBT_PENALTY:
         penalty_start = (
             int(n_cells) * bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
@@ -3838,6 +3852,24 @@ def multicell_free_parameter_mask(n_parameters, n_cells):
         )
         mask[penalty_start:penalty_start + bs.N_DEBT_PENALTY_PARAMETERS] = False
     return mask
+
+
+def multicell_frozen_value_vector(n_parameters, n_cells):
+    """The values pinned into frozen slots.
+
+    Zeros everywhere (the debt penalties freeze at zero), except the four
+    shared risk-aversion slots, which freeze at the calibrated
+    FIXED_RISK_AVERSION when FREEZE_RISK_AVERSION is on.
+    """
+    values = np.zeros(int(n_parameters), dtype=np.float64)
+    if FREEZE_RISK_AVERSION:
+        risk_start = (
+            int(n_cells) * bs.PARENTAL_INCOME_MULTICELL_PARAMETERS_PER_CELL
+        )
+        values[risk_start:risk_start + bs.N_RISK_PARAMETERS] = (
+            FIXED_RISK_AVERSION
+        )
+    return values
 
 
 def _split_need_mixture_tail(params, include_need_mixture):
@@ -5100,22 +5132,30 @@ def fit_education_cells(
     # optimizer works in the reduced free space and never spends a dimension
     # on them. With nothing frozen this is the historical vector exactly.
     free_mask = multicell_free_parameter_mask(expected, n_cells)
+    frozen_values = multicell_frozen_value_vector(expected, n_cells)
     freezing = not bool(np.all(free_mask))
     if freezing:
-        initial = np.where(free_mask, initial, 0.0)
+        initial = np.where(free_mask, initial, frozen_values)
         bounds = [pair for pair, free in zip(bounds, free_mask) if free]
+        frozen_notes = []
+        if FREEZE_DEBT_PENALTY:
+            frozen_notes.append("four shared debt penalties at zero")
+        if FREEZE_RISK_AVERSION:
+            frozen_notes.append(
+                f"four shared risk aversions at {FIXED_RISK_AVERSION}"
+            )
         print(
             f"[frozen parameters] optimizing {int(np.sum(free_mask))} of "
-            f"{expected} entries; the four shared debt penalties are held at "
-            "zero in their existing slots."
+            f"{expected} entries; " + "; ".join(frozen_notes)
+            + " in their existing slots."
         )
         initial = initial[free_mask]
 
     def expand_free_parameters(values):
-        """Reinsert the frozen zeros, so consumers see the full vector."""
+        """Reinsert the frozen values, so consumers see the full vector."""
         if not freezing:
             return values
-        full = np.zeros(expected, dtype=np.float64)
+        full = frozen_values.copy()
         full[free_mask] = np.asarray(values, dtype=np.float64).reshape(-1)
         return full
 
@@ -5722,6 +5762,8 @@ def estimate_budget_shock_all_education(
             "smm_estimate_need_mixture": bool(ESTIMATE_NEED_MIXTURE),
             "smm_need_mixture_timing": bs.NEED_MIXTURE_TIMING,
             "smm_freeze_debt_penalty": bool(FREEZE_DEBT_PENALTY),
+            "smm_freeze_risk_aversion": bool(FREEZE_RISK_AVERSION),
+            "smm_fixed_risk_aversion": float(FIXED_RISK_AVERSION),
             "smm_optimizer": optimizer,
             "smm_annealing_maxfun": int(annealing_maxfun),
             "smm_cell_workers": int(result.smm_cell_workers),
