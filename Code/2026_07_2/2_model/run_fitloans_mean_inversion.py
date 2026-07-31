@@ -82,7 +82,7 @@ def _observed_mean_new_borrowing(sample_by_period):
     """Observed mean of max(annual flow, 0) over all enrolled person-periods."""
     flows = np.concatenate(
         [np.asarray(pack["loan_flow"], dtype=np.float64)
-         for pack in sample_by_period]
+         for pack in sample_by_period.values()]
     )
     return float(np.mean(np.clip(flows, 0.0, None)))
 
