@@ -235,6 +235,12 @@ FREEZE_DEBT_PENALTY = True
 # loss, and the epsilon-inversion sigma profiles are nearly flat.
 FREEZE_RISK_AVERSION = True
 FIXED_RISK_AVERSION = 2.0
+# Sigma-grid hook (2026-08-08, Sergi's request): run_sigma_grid.py sweeps the
+# fixed risk aversion by setting this environment variable before launching
+# this script as a subprocess. Without the variable the value above is used
+# unchanged, so ordinary runs are unaffected.
+FIXED_RISK_AVERSION = float(os.environ.get(
+    "SIGMA_GRID_FIXED_RISK_AVERSION", FIXED_RISK_AVERSION))
 
 # Warm-start the structural utility parameters g() from the saved
 # param_g.npy of a previous run. Default False (Sergi, 2026-07-28): iteration
@@ -569,7 +575,9 @@ if __name__ == '__main__':
     # moments) to check that the structural likelihood is finite again and
     # the new fit tables look sane before committing to a full-length run.
     # Set back to 30 for production.
-    iterations = 4
+    # Sigma-grid hook (2026-08-08): run_sigma_grid.py overrides the iteration
+    # count via this environment variable; without it the value is unchanged.
+    iterations = int(os.environ.get("SIGMA_GRID_NPL_ITERATIONS", "4"))
     solution_mode = 0
 
     for it in range(iterations):
